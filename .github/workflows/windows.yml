@@ -1,0 +1,47 @@
+name: Windows builds
+
+# Builds native Windows binaries with the MSVC toolchain, which is what gpui
+# targets (precompiled HLSL shaders via fxc, auto-embedded Common-Controls
+# manifest). This avoids the fragility of cross-compiling gpui's DirectX/
+# DirectWrite path from Linux with the GNU toolchain.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build -p zdb-app --release --target ${{ matrix.target }}
+
+      - name: Stage package
+        shell: pwsh
+        run: |
+          $out = "dist/zdb-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/zdb.exe" "$out/zdb.exe"
+          Copy-Item "README.md" "$out/README.md"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zdb-windows-${{ matrix.arch }}
+          path: dist/zdb-windows-${{ matrix.arch }}

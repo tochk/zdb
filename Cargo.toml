@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = ["crates/zdb-app", "crates/zdb-db", "crates/zdb-config"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# UI stack (pinned per plan — verified on crates.io)
+gpui = "0.2.2"
+gpui-component = "0.5.1"
+gpui-terminal = "0.1"
+portable-pty = "0.9"
+
+# Data layer
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+futures-util = "0.3"
+
+# Shared
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"
+toml = "0.8"
+
+[profile.release]
+strip = true
+# Enables gpui's runtime-shader path so it can be built without a Windows host
+# running fxc. Set in the PROFILE (not RUSTFLAGS) so it also applies to host
+# proc-macros — gpui_macros only compiles `derive_inspector_reflection` under
+# debug_assertions, and gpui (target) uses it under the same cfg.
+debug-assertions = true
+
+[profile.dev]
+# gpui/dependency build is heavy; keep debug builds bearable
+opt-level = 0
+
+[profile.dev.package."*"]
+# optimize deps once, iterate fast on our own crates
+opt-level = 2
+
+# Vendored gpui with a one-line patch: read runtime shaders from next to the
+# executable (bundled) instead of the build-time source path, so the Windows
+# binary is self-contained. See vendor/gpui/src/platform/windows/directx_renderer.rs.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }

@@ -1,0 +1,6 @@
+/* Embed the application manifest. 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID,
+   24 = RT_MANIFEST. Numeric forms avoid needing Windows headers under windres. */
+1 24 "zdb.manifest"
+
+/* Application icon (used by Explorer, the taskbar, and the window). */
+1 ICON "zdb.ico"

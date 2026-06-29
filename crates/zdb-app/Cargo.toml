@@ -1,0 +1,25 @@
+[package]
+name = "zdb-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "zdb"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-terminal.workspace = true
+portable-pty.workspace = true
+zdb-db = { path = "../zdb-db" }
+zdb-config = { path = "../zdb-config" }
+anyhow.workspace = true
+
+[build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
