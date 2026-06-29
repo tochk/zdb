@@ -143,14 +143,17 @@ struct ResultDelegate {
     columns: Vec<Column>,
     rows: Vec<Vec<CellValue>>,
     ws: WeakEntity<Workspace>,
+    /// The tab this grid belongs to; render reads that tab's editing state.
+    tab_id: u64,
 }
 
 impl ResultDelegate {
-    fn new(ws: WeakEntity<Workspace>) -> Self {
+    fn new(ws: WeakEntity<Workspace>, tab_id: u64) -> Self {
         Self {
             columns: Vec::new(),
             rows: Vec::new(),
             ws,
+            tab_id,
         }
     }
 
@@ -192,10 +195,11 @@ impl TableDelegate for ResultDelegate {
             .map(|c| c.name.to_string())
             .unwrap_or_default();
         // Sort arrow for the currently-sorted column.
+        let tab_id = self.tab_id;
         let arrow = self
             .ws
             .upgrade()
-            .and_then(|w| match w.read(cx).sort_state {
+            .and_then(|w| match w.read(cx).tab(tab_id).and_then(|t| t.sort_state) {
                 Some((ci, desc)) if ci == col_ix => Some(if desc { " ▼" } else { " ▲" }),
                 _ => None,
             })
@@ -207,7 +211,7 @@ impl TableDelegate for ResultDelegate {
             .cursor_pointer()
             .child(format!("{name}{arrow}"))
             .on_click(move |_: &ClickEvent, _window, app| {
-                weak.update(app, |w, cx| w.toggle_sort(col_ix, cx)).ok();
+                weak.update(app, |w, cx| w.toggle_sort(tab_id, col_ix, cx)).ok();
             })
     }
 
@@ -221,13 +225,17 @@ impl TableDelegate for ResultDelegate {
         let c = palette(cx);
         let cell = self.rows.get(row_ix).and_then(|r| r.get(col_ix)).cloned();
 
+        let tab_id = self.tab_id;
         let Some(ws_entity) = self.ws.upgrade() else {
             return td_text(cell, c).into_any_element();
         };
         let ws = ws_entity.read(cx);
-        let editing = ws.editing == Some((row_ix, col_ix));
-        let editable = ws.edit_cols.get(col_ix).is_some_and(|o| o.is_some());
-        let edited = ws.edited_cells.contains(&(row_ix, col_ix));
+        let Some(tab) = ws.tab(tab_id) else {
+            return td_text(cell, c).into_any_element();
+        };
+        let editing = tab.editing == Some((row_ix, col_ix));
+        let editable = tab.edit_cols.get(col_ix).is_some_and(|o| o.is_some());
+        let edited = tab.edited_cells.contains(&(row_ix, col_ix));
         let cell_input = ws.cell_input.clone();
 
         if editing {
@@ -271,9 +279,9 @@ impl TableDelegate for ResultDelegate {
                     let double = ev.click_count() >= 2;
                     weak.update(app, |w, cx| {
                         if double {
-                            w.begin_edit(row_ix, col_ix, window, cx);
+                            w.begin_edit(tab_id, row_ix, col_ix, window, cx);
                         } else {
-                            w.set_current_row(row_ix, cx);
+                            w.set_current_row(tab_id, row_ix, cx);
                         }
                     })
                     .ok();
@@ -295,6 +303,170 @@ fn td_text(cell: Option<CellValue>, c: Colors) -> gpui::Div {
     }
 }
 
+// ---- tabs ----------------------------------------------------------------
+
+/// What a center tab shows.
+enum TabKind {
+    /// Ad-hoc SQL editor + results.
+    Query,
+    /// The single auto-saved scratch editor + results.
+    Scratch,
+    /// A table browsed from the schema tree: grid + WHERE filter.
+    Table { schema: String, table: String },
+}
+
+/// One center tab. Owns its editor, results grid, and all editing state, so
+/// switching tabs preserves each tab's rows, selection, and staged edits.
+struct Tab {
+    id: u64,
+    kind: TabKind,
+    title: String,
+    /// SQL editor (Query / Scratch tabs); allocated-but-hidden for Table tabs.
+    editor: Entity<InputState>,
+    /// WHERE filter input (Table tabs).
+    where_input: Entity<InputState>,
+    table: Entity<TableState<ResultDelegate>>,
+
+    // Current result.
+    headers: Vec<String>,
+    rows: Vec<Vec<CellValue>>,
+    orig_rows: Vec<Vec<CellValue>>,
+    base_sql: Option<String>,
+    last_sql: Option<String>,
+    sort_state: Option<(usize, bool)>,
+
+    // Editability (from DbHandle::describe of `base_sql`).
+    edit_target: Option<EditTarget>,
+    edit_cols: Vec<Option<String>>,
+
+    // Inline editing.
+    editing: Option<(usize, usize)>,
+    current_row: Option<usize>,
+    new_row_idx: Option<usize>,
+    pending: Vec<RowEdit>,
+    edited_cells: HashSet<(usize, usize)>,
+
+    running: bool,
+}
+
+fn make_grid(
+    weak: WeakEntity<Workspace>,
+    id: u64,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<TableState<ResultDelegate>> {
+    cx.new(|cx| TableState::new(ResultDelegate::new(weak, id), window, cx).row_selectable(true))
+}
+
+fn make_sql_editor(
+    placeholder: &str,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) -> Entity<InputState> {
+    let ph = placeholder.to_string();
+    cx.new(|cx| {
+        InputState::new(window, cx)
+            .code_editor("sql")
+            .line_number(true)
+            .placeholder(ph)
+    })
+}
+
+impl Tab {
+    fn base(
+        id: u64,
+        kind: TabKind,
+        title: String,
+        editor: Entity<InputState>,
+        where_input: Entity<InputState>,
+        table: Entity<TableState<ResultDelegate>>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            title,
+            editor,
+            where_input,
+            table,
+            headers: Vec::new(),
+            rows: Vec::new(),
+            orig_rows: Vec::new(),
+            base_sql: None,
+            last_sql: None,
+            sort_state: None,
+            edit_target: None,
+            edit_cols: Vec::new(),
+            editing: None,
+            current_row: None,
+            new_row_idx: None,
+            pending: Vec::new(),
+            edited_cells: HashSet::new(),
+            running: false,
+        }
+    }
+
+    /// A blank ad-hoc query tab ("Query N").
+    fn query(id: u64, n: u64, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+        let weak = cx.weak_entity();
+        let editor = make_sql_editor("SELECT * FROM ... ;  (press Run)", window, cx);
+        let where_input = cx.new(|cx| InputState::new(window, cx));
+        let table = make_grid(weak, id, window, cx);
+        Tab::base(id, TabKind::Query, format!("Query {n}"), editor, where_input, table)
+    }
+
+    /// The singleton scratch tab: editor seeded from disk and auto-saved on edit.
+    fn scratch(id: u64, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+        let weak = cx.weak_entity();
+        let editor = cx.new(|cx| {
+            InputState::new(window, cx)
+                .code_editor("sql")
+                .line_number(true)
+                .placeholder("Scratch query — auto-saved")
+                .default_value(zdb_config::load_scratch())
+        });
+        // Persist scratch text to disk on every change.
+        cx.subscribe(&editor, |_this, emitter, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                zdb_config::save_scratch(&emitter.read(cx).value());
+            }
+        })
+        .detach();
+        let where_input = cx.new(|cx| InputState::new(window, cx));
+        let table = make_grid(weak, id, window, cx);
+        Tab::base(id, TabKind::Scratch, "Scratch".into(), editor, where_input, table)
+    }
+
+    /// A table-browse tab; the WHERE input re-runs the query on Enter.
+    fn table(
+        id: u64,
+        schema: String,
+        table_name: String,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
+        let weak = cx.weak_entity();
+        let editor = make_sql_editor("", window, cx);
+        let where_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("WHERE … (Enter to filter)"));
+        cx.subscribe(&where_input, move |this, _i, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                this.apply_where(id, cx);
+            }
+        })
+        .detach();
+        let table = make_grid(weak, id, window, cx);
+        let title = format!("{schema}.{table_name}");
+        Tab::base(
+            id,
+            TabKind::Table { schema, table: table_name },
+            title,
+            editor,
+            where_input,
+            table,
+        )
+    }
+}
+
 // ---- workspace ----------------------------------------------------------
 
 pub struct Workspace {
@@ -302,48 +474,19 @@ pub struct Workspace {
     cfg: Option<ConnectionConfig>,
     conn: Option<ConnId>,
     status: String,
-    running: bool,
     tree: Vec<SchemaNode>,
-    editor: Entity<InputState>,
-    table: Entity<TableState<ResultDelegate>>,
 
-    /// When browsing a table (opened from the tree): (schema, table) + WHERE input.
-    table_view: Option<(String, String)>,
-    where_input: Entity<InputState>,
+    /// Open center tabs and the index of the active one (None = welcome pane).
+    tabs: Vec<Tab>,
+    active: Option<usize>,
+    /// Monotonic id source for tabs + the "Query N" counter.
+    next_tab_id: u64,
+    /// A table to open on the next render (set from windowless async contexts,
+    /// e.g. the selftest, where no `&mut Window` is available).
+    pending_open: Option<(String, String)>,
 
-    /// Auto-saved scratch query editor (separate view).
-    scratch: Entity<InputState>,
-    scratch_open: bool,
-
-    // Current result.
-    headers: Vec<String>,
-    rows: Vec<Vec<CellValue>>,
-    /// Snapshot of the rows as loaded, to detect when a cell is edited back to
-    /// its original value (then the staged edit is dropped).
-    orig_rows: Vec<Vec<CellValue>>,
-    /// Original user query (without any added ORDER BY), for re-sorting/reload.
-    base_sql: Option<String>,
-    /// Effective query last executed (with sort), for reload after an edit.
-    last_sql: Option<String>,
-    /// Current sort: (result column index, descending?).
-    sort_state: Option<(usize, bool)>,
-
-    // Editability (from DbHandle::describe of `base_sql`).
-    edit_target: Option<EditTarget>,
-    /// Result column -> real table column name (None = not editable).
-    edit_cols: Vec<Option<String>>,
-
-    // Inline editing.
-    editing: Option<(usize, usize)>,
-    current_row: Option<usize>,
-    /// Index of an unsaved new row appended to the grid, if any.
-    new_row_idx: Option<usize>,
+    /// Shared inline-cell editor (only the active tab edits a cell at a time).
     cell_input: Entity<InputState>,
-    /// Staged edits, accumulated across the table; all applied in one
-    /// transaction when Apply is pressed. The combined SQL is shown for review.
-    pending: Vec<RowEdit>,
-    /// Grid (row, col) coordinates with a staged edit, for highlighting.
-    edited_cells: HashSet<(usize, usize)>,
 
     // Query log (most recent last).
     log_entries: Vec<LogEntry>,
@@ -380,46 +523,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let editor = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("sql")
-                .line_number(true)
-                .placeholder("SELECT * FROM ... ;  (press Run)")
-        });
-        let weak = cx.weak_entity();
-        let table =
-            cx.new(|cx| TableState::new(ResultDelegate::new(weak), window, cx).row_selectable(true));
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder("Type a command…"));
         let cell_input = cx.new(|cx| InputState::new(window, cx));
-        let where_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("WHERE … (Enter to filter)"));
-        let scratch = cx.new(|cx| {
-            InputState::new(window, cx)
-                .code_editor("sql")
-                .line_number(true)
-                .placeholder("Scratch query — auto-saved")
-                .default_value(zdb_config::load_scratch())
-        });
 
-        // Commit/cancel inline edits on Enter / focus loss.
+        // Commit/cancel inline edits on Enter / focus loss (acts on the active tab).
         cx.subscribe(&cell_input, |this, _input, event: &InputEvent, cx| match event {
             InputEvent::PressEnter { .. } => this.commit_cell_edit(cx),
             InputEvent::Blur => this.cancel_cell_edit(cx),
             _ => {}
-        })
-        .detach();
-        // Re-run the table query when the WHERE filter is submitted.
-        cx.subscribe(&where_input, |this, _i, event: &InputEvent, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.apply_where(cx);
-            }
-        })
-        .detach();
-        // Auto-save the scratch query to disk on every change.
-        cx.subscribe(&scratch, |this, _i, event: &InputEvent, cx| {
-            if let InputEvent::Change = event {
-                zdb_config::save_scratch(&this.scratch.read(cx).value());
-            }
         })
         .detach();
 
@@ -441,28 +552,12 @@ impl Workspace {
             cfg: auto.clone(),
             conn: None,
             status: "Not connected".into(),
-            running: false,
             tree: Vec::new(),
-            editor,
-            table,
-            table_view: None,
-            where_input,
-            scratch,
-            scratch_open: false,
-            headers: Vec::new(),
-            rows: Vec::new(),
-            orig_rows: Vec::new(),
-            base_sql: None,
-            last_sql: None,
-            sort_state: None,
-            edit_target: None,
-            edit_cols: Vec::new(),
-            editing: None,
-            current_row: None,
-            new_row_idx: None,
+            tabs: Vec::new(),
+            active: None,
+            next_tab_id: 1,
+            pending_open: None,
             cell_input,
-            pending: Vec::new(),
-            edited_cells: HashSet::new(),
             log_entries: Vec::new(),
             palette_open: false,
             palette_input,
@@ -491,6 +586,126 @@ impl Workspace {
             this.conn_adding = this.settings.connections.is_empty();
         }
         this
+    }
+
+    // ---- tab management --------------------------------------------------
+
+    fn tab(&self, id: u64) -> Option<&Tab> {
+        self.tabs.iter().find(|t| t.id == id)
+    }
+
+    fn tab_mut(&mut self, id: u64) -> Option<&mut Tab> {
+        self.tabs.iter_mut().find(|t| t.id == id)
+    }
+
+    fn active_tab(&self) -> Option<&Tab> {
+        self.active.and_then(|i| self.tabs.get(i))
+    }
+
+    fn active_tab_mut(&mut self) -> Option<&mut Tab> {
+        match self.active {
+            Some(i) => self.tabs.get_mut(i),
+            None => None,
+        }
+    }
+
+    fn active_id(&self) -> Option<u64> {
+        self.active_tab().map(|t| t.id)
+    }
+
+    /// Make tab `idx` active: cancel any in-flight cell edit and focus its input.
+    fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if idx >= self.tabs.len() {
+            return;
+        }
+        self.cancel_cell_edit(cx);
+        self.active = Some(idx);
+        let focus = match self.tabs[idx].kind {
+            TabKind::Table { .. } => self.tabs[idx].where_input.clone(),
+            _ => self.tabs[idx].editor.clone(),
+        };
+        // Focusing a gpui-component input touches the window's `Root` layer, which
+        // only exists under a real app (not in headless `#[gpui::test]` windows).
+        if window.root::<gpui_component::Root>().flatten().is_some() {
+            focus.read(cx).focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    /// Open a fresh blank "Query N" tab and focus it.
+    fn open_query_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let n = self
+            .tabs
+            .iter()
+            .filter(|t| matches!(t.kind, TabKind::Query))
+            .count() as u64
+            + 1;
+        let tab = Tab::query(id, n, window, cx);
+        self.tabs.push(tab);
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+    }
+
+    /// Open (or focus, if already open) a table-browse tab and run its query.
+    fn open_table_tab(
+        &mut self,
+        schema: String,
+        table: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(idx) = self.tabs.iter().position(
+            |t| matches!(&t.kind, TabKind::Table { schema: s, table: tt } if *s == schema && *tt == table),
+        ) {
+            self.activate_tab(idx, window, cx);
+            return;
+        }
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let tab = Tab::table(id, schema, table, window, cx);
+        self.tabs.push(tab);
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+        let sql = self.table_query(id, cx);
+        self.run_new_query(id, sql, cx);
+    }
+
+    /// Focus the singleton scratch tab, opening it if absent.
+    fn focus_scratch_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(idx) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Scratch)) {
+            self.activate_tab(idx, window, cx);
+            return;
+        }
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let tab = Tab::scratch(id, window, cx);
+        self.tabs.push(tab);
+        self.activate_tab(self.tabs.len() - 1, window, cx);
+    }
+
+    fn close_tab(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let active_id = self.active_id();
+        self.tabs.remove(idx);
+        if self.tabs.is_empty() {
+            self.active = None;
+        } else if active_id == Some(id) {
+            // Closed the active tab: focus the neighbor at the same slot (clamped).
+            self.active = Some(idx.min(self.tabs.len() - 1));
+        } else {
+            // Some other tab closed: keep the same active tab (index may have shifted).
+            self.active = active_id.and_then(|aid| self.tabs.iter().position(|t| t.id == aid));
+        }
+        cx.notify();
+    }
+
+    /// Drop every tab (e.g. on connection switch — old results are invalid).
+    fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
+        self.tabs.clear();
+        self.active = None;
+        cx.notify();
     }
 
     // ---- connections -----------------------------------------------------
@@ -542,7 +757,7 @@ impl Workspace {
             self.db.disconnect(old);
         }
         self.tree.clear();
-        self.clear_result(cx);
+        self.close_all_tabs(cx);
         self.cfg = Some(cfg.clone());
         self.conn_manager_open = false;
         self.start_connect(cfg, cx);
@@ -702,26 +917,15 @@ impl Workspace {
         .detach();
     }
 
-    fn open_relation(
-        &mut self,
-        schema: String,
-        table: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.table_view = Some((schema, table));
-        self.where_input.update(cx, |i, cx| i.set_value("", window, cx));
-        let sql = self.table_query(cx);
-        self.editor.update(cx, |ed, cx| ed.set_value(sql.clone(), window, cx));
-        self.run_new_query(sql, cx);
-    }
-
-    /// `SELECT * FROM <table> [WHERE …] LIMIT n` for the open table view.
-    fn table_query(&self, cx: &App) -> String {
-        let Some((s, t)) = &self.table_view else {
+    /// `SELECT * FROM <table> [WHERE …] LIMIT n` for a table tab.
+    fn table_query(&self, tab_id: u64, cx: &App) -> String {
+        let Some(tab) = self.tab(tab_id) else {
             return String::new();
         };
-        let w = self.where_input.read(cx).value().trim().to_string();
+        let TabKind::Table { schema: s, table: t } = &tab.kind else {
+            return String::new();
+        };
+        let w = tab.where_input.read(cx).value().trim().to_string();
         let filter = if w.is_empty() {
             String::new()
         } else {
@@ -736,75 +940,73 @@ impl Workspace {
         )
     }
 
-    fn apply_where(&mut self, cx: &mut Context<Self>) {
-        if self.table_view.is_none() {
+    fn apply_where(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if !matches!(self.tab(tab_id).map(|t| &t.kind), Some(TabKind::Table { .. })) {
             return;
         }
-        let sql = self.table_query(cx);
-        self.run_new_query(sql, cx);
+        let sql = self.table_query(tab_id, cx);
+        self.run_new_query(tab_id, sql, cx);
     }
 
     // ---- query execution -------------------------------------------------
 
-    /// Run the editor's SQL as a brand-new ad-hoc query (clears the table view).
-    fn run_current(&mut self, cx: &mut Context<Self>) {
-        self.table_view = None;
-        let sql = self.editor.read(cx).value().to_string();
-        self.run_new_query(sql, cx);
-    }
-
-    fn toggle_scratch(&mut self, cx: &mut Context<Self>) {
-        self.scratch_open = !self.scratch_open;
-        cx.notify();
-    }
-
-    /// Re-run the current query/table from the DB (discards staged edits).
-    fn reload_data(&mut self, cx: &mut Context<Self>) {
-        if let Some(sql) = self.base_sql.clone() {
-            self.run_new_query(sql, cx);
+    /// Run the active tab: Query/Scratch run their editor SQL; a Table tab reloads.
+    fn run_active_tab(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        let id = tab.id;
+        let is_table = matches!(tab.kind, TabKind::Table { .. });
+        let sql = tab.editor.read(cx).value().to_string();
+        if is_table {
+            self.reload_data(id, cx);
+        } else {
+            self.run_new_query(id, sql, cx);
         }
     }
 
-    /// Run the scratch query and return to the results view.
-    fn run_scratch(&mut self, cx: &mut Context<Self>) {
-        let sql = self.scratch.read(cx).value().to_string();
-        self.table_view = None;
-        self.scratch_open = false;
-        self.run_new_query(sql, cx);
+    /// Re-run a tab's current query/table from the DB (discards staged edits).
+    fn reload_data(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if let Some(sql) = self.tab(tab_id).and_then(|t| t.base_sql.clone()) {
+            self.run_new_query(tab_id, sql, cx);
+        }
     }
 
-    /// Start a new query: remember it as the sort base, drop stale editability,
-    /// then describe (for editability) and execute it.
-    fn run_new_query(&mut self, base: String, cx: &mut Context<Self>) {
-        self.base_sql = Some(base.clone());
-        self.sort_state = None;
-        self.edit_target = None;
-        self.edit_cols.clear();
-        self.editing = None;
-        self.current_row = None;
+    /// Start a new query for `tab_id`: remember it as the sort base, drop stale
+    /// editability, then describe (for editability) and execute it.
+    fn run_new_query(&mut self, tab_id: u64, base: String, cx: &mut Context<Self>) {
+        let table = {
+            let Some(tab) = self.tab_mut(tab_id) else { return };
+            tab.base_sql = Some(base.clone());
+            tab.sort_state = None;
+            tab.edit_target = None;
+            tab.edit_cols.clear();
+            tab.editing = None;
+            tab.current_row = None;
+            tab.pending.clear();
+            tab.edited_cells.clear();
+            tab.table.clone()
+        };
         // Drop the Table widget's own row highlight; otherwise the previously
-        // selected index stays lit when switching to a different table.
-        self.table.update(cx, |ts, cx| ts.clear_selection(cx));
-        self.pending.clear();
-        self.edited_cells.clear();
-        self.describe_async(base.clone(), cx);
-        self.run_sql(base, cx);
+        // selected index stays lit when switching to a different table / reloading.
+        table.update(cx, |ts, cx| ts.clear_selection(cx));
+        self.describe_async(tab_id, base.clone(), cx);
+        self.run_sql(tab_id, base, cx);
     }
 
-    fn describe_async(&mut self, sql: String, cx: &mut Context<Self>) {
+    fn describe_async(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
         let Some(conn) = self.conn else { return };
         let db = self.db.clone();
         cx.spawn(async move |this, cx| {
             let res = db.describe(conn, sql).await;
             this.update(cx, |this, cx| {
+                let Some(tab) = this.tab_mut(tab_id) else { return };
                 match res {
                     Ok(Some(d)) => {
-                        this.edit_target = Some(d.target);
-                        this.edit_cols = d.columns;
+                        tab.edit_target = Some(d.target);
+                        tab.edit_cols = d.columns;
                     }
                     _ => {
-                        this.edit_target = None;
-                        this.edit_cols.clear();
+                        tab.edit_target = None;
+                        tab.edit_cols.clear();
                     }
                 }
                 cx.notify();
@@ -814,22 +1016,28 @@ impl Workspace {
         .detach();
     }
 
-    /// Execute `sql` for display (does not change editability or the sort base).
-    fn run_sql(&mut self, sql: String, cx: &mut Context<Self>) {
+    /// Execute `sql` for display in `tab_id` (does not change editability or sort base).
+    fn run_sql(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
         let Some(conn) = self.conn else {
             self.status = "Not connected".into();
             cx.notify();
             return;
         };
         if sql.trim().is_empty() {
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.running = false;
+            }
             self.status = "Nothing to run".into();
             cx.notify();
             return;
         }
-        self.running = true;
-        self.editing = None;
-        self.new_row_idx = None;
-        self.last_sql = Some(sql.clone());
+        {
+            let Some(tab) = self.tab_mut(tab_id) else { return };
+            tab.running = true;
+            tab.editing = None;
+            tab.new_row_idx = None;
+            tab.last_sql = Some(sql.clone());
+        }
         self.status = "Running…".into();
         log(format!("run: {sql}"));
         let db = self.db.clone();
@@ -853,36 +1061,44 @@ impl Workspace {
                 }
             }
             this.update(cx, |this, cx| {
-                this.running = false;
-                match error {
+                // The tab may have been closed while the query ran.
+                let Some(tab) = this.tab_mut(tab_id) else { return };
+                tab.running = false;
+                let status = match error {
                     Some(e) => {
-                        this.status = format!("Error: {e}");
+                        let s = format!("Error: {e}");
                         this.push_log(&logged, false);
+                        s
                     }
                     None => {
                         let is_select = !headers.is_empty();
                         let n = rows.len();
-                        this.headers = headers.clone();
-                        this.rows = rows.clone();
-                        this.orig_rows = rows.clone();
-                        // Fresh rows just landed: drop any prior selection so a
-                        // previously-selected index doesn't stay lit on the new
-                        // data (e.g. switching tables, or re-sorting). This is the
-                        // single point every result passes through.
-                        this.current_row = None;
-                        this.table.update(cx, |ts, cx| {
+                        let table = {
+                            let Some(tab) = this.tab_mut(tab_id) else { return };
+                            tab.headers = headers.clone();
+                            tab.rows = rows.clone();
+                            tab.orig_rows = rows.clone();
+                            // Fresh rows just landed: drop any prior selection so a
+                            // previously-selected index doesn't stay lit on the new
+                            // data (switching tables, re-sorting, reload). Single
+                            // point every result passes through.
+                            tab.current_row = None;
+                            tab.table.clone()
+                        };
+                        table.update(cx, |ts, cx| {
                             ts.clear_selection(cx);
                             ts.delegate_mut().set(&headers, rows);
                             ts.refresh(cx);
                         });
-                        this.status = if is_select {
+                        this.push_log(&logged, true);
+                        if is_select {
                             format!("{n} row(s) in {elapsed:?}")
                         } else {
                             format!("{affected} row(s) affected in {elapsed:?}")
-                        };
-                        this.push_log(&logged, true);
+                        }
                     }
-                }
+                };
+                this.status = status;
                 cx.notify();
             })
             .ok();
@@ -909,45 +1125,28 @@ impl Workspace {
         }
     }
 
-    fn clear_result(&mut self, cx: &mut Context<Self>) {
-        self.headers.clear();
-        self.rows.clear();
-        self.orig_rows.clear();
-        self.base_sql = None;
-        self.last_sql = None;
-        self.sort_state = None;
-        self.edit_target = None;
-        self.edit_cols.clear();
-        self.editing = None;
-        self.current_row = None;
-        self.new_row_idx = None;
-        self.pending.clear();
-        self.edited_cells.clear();
-        self.table.update(cx, |ts, cx| {
-            ts.clear_selection(cx);
-            ts.delegate_mut().set(&[], Vec::new());
-            ts.refresh(cx);
-        });
-    }
-
     // ---- sorting ---------------------------------------------------------
 
     /// Clicking a header cycles its sort: none → ascending → descending → none,
     /// re-running the query ordered by that column.
-    fn toggle_sort(&mut self, col_ix: usize, cx: &mut Context<Self>) {
-        let next = match self.sort_state {
-            Some((c, false)) if c == col_ix => Some((col_ix, true)),
-            Some((c, true)) if c == col_ix => None,
-            _ => Some((col_ix, false)),
+    fn toggle_sort(&mut self, tab_id: u64, col_ix: usize, cx: &mut Context<Self>) {
+        let (next, base, headers) = {
+            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let next = match tab.sort_state {
+                Some((c, false)) if c == col_ix => Some((col_ix, true)),
+                Some((c, true)) if c == col_ix => None,
+                _ => Some((col_ix, false)),
+            };
+            tab.sort_state = next;
+            (next, tab.base_sql.clone(), tab.headers.clone())
         };
-        self.sort_state = next;
-        let Some(base) = self.base_sql.clone() else {
+        let Some(base) = base else {
             log("sort: no base query");
             return;
         };
         let sql = match next {
             Some((c, desc)) => {
-                let col = self.headers.get(c).cloned().unwrap_or_default();
+                let col = headers.get(c).cloned().unwrap_or_default();
                 let dir = if desc {
                     ColumnSort::Descending
                 } else {
@@ -958,26 +1157,39 @@ impl Workspace {
             None => base,
         };
         log(format!("sort: {sql}"));
-        self.run_sql(sql, cx);
+        self.run_sql(tab_id, sql, cx);
     }
 
-    fn set_current_row(&mut self, row: usize, cx: &mut Context<Self>) {
-        self.current_row = Some(row);
+    fn set_current_row(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.current_row = Some(row);
+        }
         cx.notify();
     }
 
     // ---- inline editing --------------------------------------------------
 
-    fn begin_edit(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.edit_cols.get(col).map_or(true, |o| o.is_none()) {
-            return;
-        }
-        let text = match self.rows.get(row).and_then(|r| r.get(col)) {
-            Some(CellValue::Text(s)) => s.clone(),
-            _ => String::new(),
+    fn begin_edit(
+        &mut self,
+        tab_id: u64,
+        row: usize,
+        col: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = {
+            let Some(tab) = self.tab_mut(tab_id) else { return };
+            if tab.edit_cols.get(col).map_or(true, |o| o.is_none()) {
+                return;
+            }
+            let text = match tab.rows.get(row).and_then(|r| r.get(col)) {
+                Some(CellValue::Text(s)) => s.clone(),
+                _ => String::new(),
+            };
+            tab.editing = Some((row, col));
+            tab.current_row = Some(row);
+            text
         };
-        self.editing = Some((row, col));
-        self.current_row = Some(row);
         self.cell_input.update(cx, |inp, cx| inp.set_value(text, window, cx));
         let handle = self.cell_input.read(cx).focus_handle(cx);
         handle.focus(window);
@@ -985,14 +1197,19 @@ impl Workspace {
     }
 
     fn cancel_cell_edit(&mut self, cx: &mut Context<Self>) {
-        if self.editing.take().is_some() {
-            cx.notify();
+        if let Some(tab) = self.active_tab_mut() {
+            if tab.editing.take().is_some() {
+                cx.notify();
+            }
         }
     }
 
-    /// Stage the cell edit (build the UPDATE and show it for review).
+    /// Stage the active tab's cell edit (build the UPDATE and show it for review).
     fn commit_cell_edit(&mut self, cx: &mut Context<Self>) {
-        let Some((row, col)) = self.editing.take() else { return };
+        let Some(tab_id) = self.active_id() else { return };
+        let Some((row, col)) = self.tab_mut(tab_id).and_then(|t| t.editing.take()) else {
+            return;
+        };
         let text = self.cell_input.read(cx).value().to_string();
         let value = if text.is_empty() {
             CellValue::Null
@@ -1001,32 +1218,45 @@ impl Workspace {
         };
 
         // The unsaved new row accumulates in memory until "Save row".
-        if Some(row) == self.new_row_idx {
-            if let Some(c) = self.rows.get_mut(row).and_then(|r| r.get_mut(col)) {
-                *c = value;
+        if Some(row) == self.tab(tab_id).and_then(|t| t.new_row_idx) {
+            if let Some(tab) = self.tab_mut(tab_id) {
+                if let Some(c) = tab.rows.get_mut(row).and_then(|r| r.get_mut(col)) {
+                    *c = value;
+                }
             }
-            self.refresh_table(cx);
+            self.refresh_table(tab_id, cx);
             cx.notify();
             return;
         }
 
-        let Some(target) = self.edit_target.clone() else { return };
-        let Some(real_col) = self.edit_cols.get(col).and_then(|o| o.clone()) else { return };
+        let Some(target) = self.tab(tab_id).and_then(|t| t.edit_target.clone()) else { return };
+        let Some(real_col) = self
+            .tab(tab_id)
+            .and_then(|t| t.edit_cols.get(col).and_then(|o| o.clone()))
+        else {
+            return;
+        };
         // PK must be read from the original row value before the optimistic update.
-        let Some(pk) = self.row_pk(row, &target) else { return };
+        let Some(pk) = self.row_pk(tab_id, row, &target) else { return };
 
         // Drop any earlier staged change for this same cell, so re-editing a cell
         // replaces (not stacks) its UPDATE and reverting clears it cleanly.
-        self.remove_pending_update(&pk, &real_col);
+        self.remove_pending_update(tab_id, &pk, &real_col);
 
-        let original = self.orig_rows.get(row).and_then(|r| r.get(col));
-        if original == Some(&value) {
+        let reverted = self
+            .tab(tab_id)
+            .and_then(|t| t.orig_rows.get(row).and_then(|r| r.get(col)))
+            == Some(&value);
+        if reverted {
             // Edited back to the original value: nothing to save. Drop the marker
             // and the staged edit (already removed above).
-            self.edited_cells.remove(&(row, col));
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.edited_cells.remove(&(row, col));
+            }
             self.status = "Reverted to original".into();
         } else {
             self.stage(
+                tab_id,
                 RowEdit::Update {
                     pk,
                     set: vec![(real_col, value.clone())],
@@ -1034,21 +1264,26 @@ impl Workspace {
                 &target,
                 cx,
             );
-            self.edited_cells.insert((row, col));
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.edited_cells.insert((row, col));
+            }
         }
         // Reflect the value in the grid immediately. Cancel/Apply both reload the
         // authoritative rows.
-        if let Some(c) = self.rows.get_mut(row).and_then(|r| r.get_mut(col)) {
-            *c = value;
+        if let Some(tab) = self.tab_mut(tab_id) {
+            if let Some(c) = tab.rows.get_mut(row).and_then(|r| r.get_mut(col)) {
+                *c = value;
+            }
         }
-        self.refresh_table(cx);
+        self.refresh_table(tab_id, cx);
         cx.notify();
     }
 
     /// Remove any staged `Update` for the given PK that sets `col` (used to
     /// dedup re-edits and to drop an edit reverted to its original value).
-    fn remove_pending_update(&mut self, pk: &[(String, CellValue)], col: &str) {
-        self.pending.retain_mut(|e| match e {
+    fn remove_pending_update(&mut self, tab_id: u64, pk: &[(String, CellValue)], col: &str) {
+        let Some(tab) = self.tab_mut(tab_id) else { return };
+        tab.pending.retain_mut(|e| match e {
             RowEdit::Update { pk: p, set } if p.as_slice() == pk => {
                 set.retain(|(c, _)| c != col);
                 !set.is_empty()
@@ -1058,85 +1293,101 @@ impl Workspace {
     }
 
     /// Append a blank editable row; cells are filled by double-clicking.
-    fn add_row(&mut self, cx: &mut Context<Self>) {
-        if self.edit_target.is_none() {
-            return;
+    fn add_row(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        {
+            let Some(tab) = self.tab_mut(tab_id) else { return };
+            if tab.edit_target.is_none() {
+                return;
+            }
+            let blank = vec![CellValue::Null; tab.headers.len()];
+            tab.rows.push(blank);
+            let idx = tab.rows.len() - 1;
+            tab.new_row_idx = Some(idx);
+            tab.current_row = Some(idx);
         }
-        let blank = vec![CellValue::Null; self.headers.len()];
-        self.rows.push(blank);
-        let idx = self.rows.len() - 1;
-        self.new_row_idx = Some(idx);
-        self.current_row = Some(idx);
         self.status = "New row — double-click cells to fill, then Save row.".into();
-        self.refresh_table(cx);
+        self.refresh_table(tab_id, cx);
         cx.notify();
     }
 
     /// Stage an INSERT from the new row's filled (non-null) columns.
-    fn save_new_row(&mut self, cx: &mut Context<Self>) {
-        let (Some(idx), Some(target)) = (self.new_row_idx, self.edit_target.clone()) else {
-            return;
+    fn save_new_row(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let (target, values) = {
+            let Some(tab) = self.tab(tab_id) else { return };
+            let (Some(idx), Some(target)) = (tab.new_row_idx, tab.edit_target.clone()) else {
+                return;
+            };
+            let Some(row) = tab.rows.get(idx).cloned() else { return };
+            let values: Vec<(String, CellValue)> = tab
+                .edit_cols
+                .iter()
+                .enumerate()
+                .filter_map(|(i, real)| {
+                    let name = real.clone()?;
+                    match row.get(i) {
+                        Some(CellValue::Text(s)) => Some((name, CellValue::Text(s.clone()))),
+                        _ => None, // skip nulls so DB defaults apply
+                    }
+                })
+                .collect();
+            (target, values)
         };
-        let Some(row) = self.rows.get(idx).cloned() else { return };
-        let values: Vec<(String, CellValue)> = self
-            .edit_cols
-            .iter()
-            .enumerate()
-            .filter_map(|(i, real)| {
-                let name = real.clone()?;
-                match row.get(i) {
-                    Some(CellValue::Text(s)) => Some((name, CellValue::Text(s.clone()))),
-                    _ => None, // skip nulls so DB defaults apply
-                }
-            })
-            .collect();
         if values.is_empty() {
             self.status = "Fill at least one column".into();
             cx.notify();
             return;
         }
-        self.stage(RowEdit::Insert { values }, &target, cx);
+        self.stage(tab_id, RowEdit::Insert { values }, &target, cx);
     }
 
     /// Stage a DELETE for the selected row, or discard the unsaved new row.
-    fn delete_current_row(&mut self, cx: &mut Context<Self>) {
-        let Some(row) = self.current_row else { return };
-        if Some(row) == self.new_row_idx {
-            if row < self.rows.len() {
-                self.rows.remove(row);
+    fn delete_current_row(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(row) = self.tab(tab_id).and_then(|t| t.current_row) else { return };
+        if Some(row) == self.tab(tab_id).and_then(|t| t.new_row_idx) {
+            if let Some(tab) = self.tab_mut(tab_id) {
+                if row < tab.rows.len() {
+                    tab.rows.remove(row);
+                }
+                tab.new_row_idx = None;
+                tab.current_row = None;
             }
-            self.new_row_idx = None;
-            self.current_row = None;
             self.status = "New row discarded".into();
-            self.refresh_table(cx);
+            self.refresh_table(tab_id, cx);
             cx.notify();
             return;
         }
-        let Some(target) = self.edit_target.clone() else { return };
-        let Some(pk) = self.row_pk(row, &target) else { return };
-        self.stage(RowEdit::Delete { pk }, &target, cx);
+        let Some(target) = self.tab(tab_id).and_then(|t| t.edit_target.clone()) else { return };
+        let Some(pk) = self.row_pk(tab_id, row, &target) else { return };
+        self.stage(tab_id, RowEdit::Delete { pk }, &target, cx);
     }
 
-    fn refresh_table(&mut self, cx: &mut Context<Self>) {
-        let headers = self.headers.clone();
-        let rows = self.rows.clone();
-        self.table.update(cx, |ts, cx| {
+    fn refresh_table(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some((headers, rows, table)) = self
+            .tab(tab_id)
+            .map(|t| (t.headers.clone(), t.rows.clone(), t.table.clone()))
+        else {
+            return;
+        };
+        table.update(cx, |ts, cx| {
             ts.delegate_mut().set(&headers, rows);
             ts.refresh(cx);
         });
     }
 
-    /// Add an edit to the staged batch. Edits accumulate across the table and
-    /// are all applied in one transaction on Apply.
-    fn stage(&mut self, edit: RowEdit, target: &EditTarget, cx: &mut Context<Self>) {
+    /// Add an edit to the tab's staged batch. Edits accumulate across the table
+    /// and are all applied in one transaction on Apply.
+    fn stage(&mut self, tab_id: u64, edit: RowEdit, target: &EditTarget, cx: &mut Context<Self>) {
         // Validate the statement builds before queueing it.
         if let Err(e) = edit.to_sql(target) {
             self.status = format!("Cannot build statement: {e}");
             cx.notify();
             return;
         }
-        self.pending.push(edit);
-        let n = self.pending.len();
+        let n = {
+            let Some(tab) = self.tab_mut(tab_id) else { return };
+            tab.pending.push(edit);
+            tab.pending.len()
+        };
         self.status = format!(
             "{n} change{} staged — review, then Apply.",
             if n == 1 { "" } else { "s" }
@@ -1144,58 +1395,76 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Combined SQL for all staged edits (shown in the review pane).
-    fn pending_sql(&self) -> Option<String> {
-        let target = self.edit_target.as_ref()?;
-        zdb_db::build_batch(target, &self.pending).ok().flatten()
+    /// Combined SQL for a tab's staged edits (shown in the review pane).
+    fn pending_sql(&self, tab_id: u64) -> Option<String> {
+        let tab = self.tab(tab_id)?;
+        let target = tab.edit_target.as_ref()?;
+        zdb_db::build_batch(target, &tab.pending).ok().flatten()
     }
 
-    fn cancel_pending(&mut self, cx: &mut Context<Self>) {
-        self.pending.clear();
-        self.edited_cells.clear();
+    fn cancel_pending(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let reload = {
+            let Some(tab) = self.tab_mut(tab_id) else { return };
+            tab.pending.clear();
+            tab.edited_cells.clear();
+            tab.last_sql.clone()
+        };
         self.status = "Edits discarded".into();
         // Discard optimistic in-grid changes by reloading the original rows.
-        if let Some(s) = self.last_sql.clone() {
-            self.run_sql(s, cx);
+        if let Some(s) = reload {
+            self.run_sql(tab_id, s, cx);
         }
         cx.notify();
     }
 
-    /// Execute all staged edits in a single transaction, then reload the query.
-    fn apply_pending(&mut self, cx: &mut Context<Self>) {
-        if self.pending.is_empty() {
-            return;
-        }
-        let (Some(target), Some(conn)) = (self.edit_target.clone(), self.conn) else {
+    /// Execute a tab's staged edits in a single transaction, then reload it.
+    fn apply_pending(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let (target, edits, reload) = {
+            let Some(tab) = self.tab_mut(tab_id) else { return };
+            if tab.pending.is_empty() {
+                return;
+            }
+            let Some(target) = tab.edit_target.clone() else { return };
+            let edits = std::mem::take(&mut tab.pending);
+            (target, edits, tab.last_sql.clone())
+        };
+        let Some(conn) = self.conn else {
+            // No connection: put the edits back so they aren't lost.
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.pending = edits;
+            }
             return;
         };
-        let edits = std::mem::take(&mut self.pending);
         let sql = zdb_db::build_batch(&target, &edits)
             .ok()
             .flatten()
             .unwrap_or_default();
         self.status = "Applying…".into();
         let db = self.db.clone();
-        let reload = self.last_sql.clone();
         cx.spawn(async move |this, cx| {
             let res = db.apply_edits(conn, &target, &edits).await;
             this.update(cx, |this, cx| {
-                match res {
+                let status = match res {
                     Ok(()) => {
                         this.push_log(&sql, true);
-                        this.status = format!("Applied {} change(s)", edits.len());
-                        this.edited_cells.clear();
-                        if let Some(s) = reload {
-                            this.run_sql(s, cx);
+                        if let Some(tab) = this.tab_mut(tab_id) {
+                            tab.edited_cells.clear();
                         }
+                        if let Some(s) = reload {
+                            this.run_sql(tab_id, s, cx);
+                        }
+                        format!("Applied {} change(s)", edits.len())
                     }
                     Err(e) => {
                         // Keep the edits staged so the user can fix and retry.
-                        this.pending = edits;
+                        if let Some(tab) = this.tab_mut(tab_id) {
+                            tab.pending = edits;
+                        }
                         this.push_log(&sql, false);
-                        this.status = format!("Apply failed: {e}");
+                        format!("Apply failed: {e}")
                     }
-                }
+                };
+                this.status = status;
                 cx.notify();
             })
             .ok();
@@ -1204,14 +1473,20 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Primary-key (name, original value) pairs for a result row.
-    fn row_pk(&self, row: usize, target: &EditTarget) -> Option<Vec<(String, CellValue)>> {
-        let r = self.rows.get(row)?;
+    /// Primary-key (name, original value) pairs for a result row in `tab_id`.
+    fn row_pk(
+        &self,
+        tab_id: u64,
+        row: usize,
+        target: &EditTarget,
+    ) -> Option<Vec<(String, CellValue)>> {
+        let tab = self.tab(tab_id)?;
+        let r = tab.rows.get(row)?;
         target
             .pk_columns
             .iter()
             .map(|pk| {
-                let idx = self.edit_cols.iter().position(|c| c.as_deref() == Some(pk.as_str()))?;
+                let idx = tab.edit_cols.iter().position(|c| c.as_deref() == Some(pk.as_str()))?;
                 Some((pk.clone(), r.get(idx).cloned().unwrap_or(CellValue::Null)))
             })
             .collect()
@@ -1232,10 +1507,10 @@ impl Workspace {
                 while rx.recv().await.is_some() {}
             }
             this.update(cx, |this, cx| {
-                this.table_view = Some(("public".into(), "zdb_selftest".into()));
-                let sql = this.table_query(cx);
-                this.run_new_query(sql, cx);
-                log("selftest: table view opened");
+                // Opening a tab needs the window; defer to the next render (which
+                // has it) via `pending_open`.
+                this.pending_open = Some(("public".into(), "zdb_selftest".into()));
+                log("selftest: table tab requested");
                 cx.notify();
             })
             .ok();
@@ -1258,7 +1533,7 @@ impl Workspace {
     fn run_command(&mut self, cmd: PaletteCmd, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = false;
         match cmd {
-            PaletteCmd::Run => self.run_current(cx),
+            PaletteCmd::Run => self.run_active_tab(cx),
             PaletteCmd::Cancel => self.cancel(cx),
             PaletteCmd::Refresh => self.connect_or_refresh(cx),
             PaletteCmd::Terminal => self.toggle_terminal(window, cx),
@@ -1351,7 +1626,7 @@ impl Workspace {
                                     .child(tree_icon(rel_icon(rel.kind), c.fg_dim))
                                     .child(rel.name.clone())
                                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                        this.open_relation(s.clone(), t.clone(), window, cx)
+                                        this.open_table_tab(s.clone(), t.clone(), window, cx)
                                     })),
                             );
                         }
@@ -1440,10 +1715,101 @@ impl Workspace {
 
     fn render_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
-        let editable = self.edit_target.is_some();
+        let strip = self.render_tab_strip(c, cx);
+        let body = match self.active {
+            Some(idx) if idx < self.tabs.len() => {
+                Self::render_tab_body(&self.tabs[idx], c, cx).into_any_element()
+            }
+            _ => welcome_pane(c).into_any_element(),
+        };
+        v_flex().size_full().bg(c.center).child(strip).child(body)
+    }
+
+    /// The Zed-style tab strip: one chip per open tab + `+` (new query) and a
+    /// scratch button.
+    fn render_tab_strip(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut strip = h_flex()
+            .h(px(34.))
+            .flex_shrink_0()
+            .items_center()
+            .bg(c.header)
+            .border_b_1()
+            .border_color(c.border)
+            .overflow_hidden();
+        for (idx, tab) in self.tabs.iter().enumerate() {
+            let is_active = self.active == Some(idx);
+            let id = tab.id;
+            let kind_icon = match tab.kind {
+                TabKind::Table { .. } => "icons/table.svg",
+                _ => "icons/file.svg",
+            };
+            let tint = if is_active { c.fg } else { c.fg_dim };
+            // Separate clickable regions (title = activate, x = close) so a close
+            // click doesn't also re-activate a just-removed tab.
+            let label = h_flex()
+                .id(SharedString::from(format!("tab-{id}")))
+                .h_full()
+                .pl_2()
+                .pr_1()
+                .gap_1p5()
+                .items_center()
+                .cursor_pointer()
+                .text_sm()
+                .text_color(tint)
+                .when(!is_active, |d| d.hover(|s| s.bg(c.hover)))
+                .child(tree_icon(kind_icon, tint))
+                .child(div().max_w(px(160.)).truncate().child(tab.title.clone()))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.activate_tab(idx, window, cx)
+                }));
+            let close = div()
+                .id(SharedString::from(format!("tabx-{id}")))
+                .h_full()
+                .px_1()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .hover(|s| s.bg(c.hover))
+                .child(tree_icon("icons/close.svg", c.fg_dim))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.close_tab(id, cx)));
+            strip = strip.child(
+                h_flex()
+                    .h_full()
+                    .items_center()
+                    .flex_shrink_0()
+                    .border_r_1()
+                    .border_color(c.border)
+                    .when(is_active, |d| d.bg(c.center))
+                    .child(label)
+                    .child(close),
+            );
+        }
+        strip
+            .child(
+                Button::new("tab-add")
+                    .icon(IconName::Plus)
+                    .tooltip("New query")
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| this.open_query_tab(window, cx)),
+                    ),
+            )
+            .child(
+                Button::new("tab-scratch")
+                    .icon(IconName::File)
+                    .tooltip("Scratch (Ctrl/Cmd+Shift+E)")
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.focus_scratch_tab(window, cx)
+                    })),
+            )
+    }
+
+    /// The body of one tab: the action toolbar + (editor split | table grid).
+    fn render_tab_body(tab: &Tab, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab_id = tab.id;
+        let editable = tab.edit_target.is_some();
 
         // Run toggles to Stop while a query is in flight.
-        let run_btn = if self.running {
+        let run_btn = if tab.running {
             Button::new("run")
                 .icon(Icon::empty().path("icons/circle-x.svg").text_color(rgba(0xef4444ff)))
                 .tooltip("Stop")
@@ -1452,18 +1818,18 @@ impl Workspace {
             Button::new("run")
                 .icon(Icon::empty().path("icons/play.svg").text_color(rgba(0x22c55eff)))
                 .tooltip("Run (Ctrl/Cmd+Enter)")
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.run_current(cx)))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.run_active_tab(cx)))
         };
 
-        // +/- live on the top toolbar, always visible; disabled when the result
-        // isn't editable / no row is selected. Save-row appears only mid-insert.
-        let del_tip = if self.current_row.is_some() && self.current_row == self.new_row_idx {
+        // +/- always visible; disabled when the result isn't editable / no row is
+        // selected. Save-row appears only mid-insert.
+        let del_tip = if tab.current_row.is_some() && tab.current_row == tab.new_row_idx {
             "Discard row"
         } else {
             "Delete row"
         };
         // Red only when actionable; neutral (theme fg) when disabled.
-        let del_enabled = editable && self.current_row.is_some();
+        let del_enabled = editable && tab.current_row.is_some();
         let del_color: Hsla = if del_enabled {
             rgba(0xef4444ff).into()
         } else {
@@ -1483,42 +1849,40 @@ impl Workspace {
                     .icon(IconName::Plus)
                     .tooltip("Add row")
                     .disabled(!editable)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_row(cx))),
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.add_row(tab_id, cx))),
             )
             .child(
                 Button::new("del-row")
                     .icon(Icon::empty().path("icons/minus.svg").text_color(del_color))
                     .tooltip(del_tip)
                     .disabled(!del_enabled)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.delete_current_row(cx)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.delete_current_row(tab_id, cx)
                     })),
             )
             .child(
                 Button::new("reload")
                     .icon(Icon::empty().path("icons/refresh-cw.svg").text_color(c.fg))
                     .tooltip("Refresh data")
-                    .disabled(self.base_sql.is_none())
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.reload_data(cx))),
+                    .disabled(tab.base_sql.is_none())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.reload_data(tab_id, cx)
+                    })),
             );
-        if self.new_row_idx.is_some() {
+        if tab.new_row_idx.is_some() {
             toolbar = toolbar.child(
                 Button::new("save-row")
                     .icon(IconName::Check)
                     .tooltip("Save row")
                     .primary()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_new_row(cx))),
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.save_new_row(tab_id, cx)
+                    })),
             );
         }
-        let toolbar = toolbar.child(
-            Button::new("scratch")
-                .icon(IconName::File)
-                .tooltip("Scratch editor")
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_scratch(cx))),
-        );
 
         let mut results = v_flex().size_full();
-        if let Some((s, t)) = &self.table_view {
+        if let TabKind::Table { schema, table } = &tab.kind {
             results = results.child(
                 h_flex()
                     .px_2()
@@ -1533,78 +1897,34 @@ impl Workspace {
                             .flex_none()
                             .text_xs()
                             .text_color(c.fg_dim)
-                            .child(format!("{s}.{t}  WHERE")),
+                            .child(format!("{schema}.{table}  WHERE")),
                     )
-                    .child(div().flex_grow().child(Input::new(&self.where_input))),
+                    .child(div().flex_grow().child(Input::new(&tab.where_input))),
             );
         }
         results = results.child(
             div()
                 .size_full()
-                .child(Table::new(&self.table).stripe(true).bordered(true)),
+                .child(Table::new(&tab.table).stripe(true).bordered(true)),
         );
 
-        // When browsing a table (opened from the schema tree) the generated
-        // `SELECT * FROM …` is redundant, so the SQL editor is hidden and the rows
-        // fill the pane. Ad-hoc query mode keeps the editor above the results.
-        let body = if self.table_view.is_some() {
+        // Table tabs hide the redundant generated `SELECT *` editor and let the
+        // rows fill the pane; Query / Scratch keep the editor above the results.
+        let body = if matches!(tab.kind, TabKind::Table { .. }) {
             results.into_any_element()
         } else {
-            v_resizable("zdb-center")
+            v_resizable(SharedString::from(format!("center-{tab_id}")))
                 .child(
                     resizable_panel()
                         .size(px(170.))
                         .size_range(px(60.)..px(600.))
-                        .child(div().size_full().child(Input::new(&self.editor).h_full())),
+                        .child(div().size_full().child(Input::new(&tab.editor).h_full())),
                 )
                 .child(resizable_panel().child(results))
                 .into_any_element()
         };
 
         v_flex().size_full().bg(c.center).child(toolbar).child(body)
-    }
-
-    /// The separate, auto-saved scratch query view (replaces the center).
-    fn render_scratch(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let c = palette(cx);
-        let toolbar = h_flex()
-            .px_2()
-            .py_1()
-            .gap_2()
-            .items_center()
-            .bg(c.header)
-            .border_b_1()
-            .border_color(c.border)
-            .child(
-                Button::new("scratch-run")
-                    .icon(Icon::empty().path("icons/play.svg").text_color(rgba(0x22c55eff)))
-                    .tooltip("Run scratch (Ctrl/Cmd+Enter)")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.run_scratch(cx))),
-            )
-            .child(
-                Button::new("scratch-close")
-                    .icon(IconName::Close)
-                    .tooltip("Close scratch")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_scratch(cx))),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(c.fg_dim)
-                    .child("scratch · auto-saved"),
-            );
-        v_flex()
-            .size_full()
-            .bg(c.center)
-            .child(toolbar)
-            .child(
-                // The Input element defaults to content height (one line); `.h_full()`
-                // (multi-line only) makes the code editor fill its container.
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .child(Input::new(&self.scratch).h_full()),
-            )
     }
 
     fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1640,12 +1960,14 @@ impl Workspace {
                     .child(log_list),
             );
 
-        // When edits are staged, the bottom-right pane shows the combined SQL for
-        // review (readable fg color — the old accent color was nearly invisible);
-        // otherwise it shows status messages.
-        let right = if !self.pending.is_empty() {
-            let n = self.pending.len();
-            let sql = self.pending_sql().unwrap_or_default();
+        // When the active tab has staged edits, the bottom-right pane shows the
+        // combined SQL for review; otherwise it shows status messages.
+        let pending_tab = self
+            .active_tab()
+            .filter(|t| !t.pending.is_empty())
+            .map(|t| (t.id, t.pending.len()));
+        let right = if let Some((tab_id, n)) = pending_tab {
+            let sql = self.pending_sql(tab_id).unwrap_or_default();
             v_flex()
                 .flex_grow()
                 .h_full()
@@ -1675,12 +1997,14 @@ impl Workspace {
                             Button::new("apply")
                                 .label("Apply")
                                 .primary()
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.apply_pending(cx)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.apply_pending(tab_id, cx)
                                 })),
                         )
                         .child(Button::new("cancel-edit").label("Cancel").on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_pending(cx)),
+                            cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.cancel_pending(tab_id, cx)
+                            }),
                         )),
                 )
                 .into_any_element()
@@ -2186,11 +2510,12 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
-        let center = if self.scratch_open {
-            self.render_scratch(cx).into_any_element()
-        } else {
-            self.render_center(cx).into_any_element()
-        };
+        // A table requested from a windowless context (e.g. the selftest) opens
+        // here, where the window is available.
+        if let Some((schema, table)) = self.pending_open.take() {
+            self.open_table_tab(schema, table, window, cx);
+        }
+        let center = self.render_center(cx).into_any_element();
         let mut top = h_resizable("zdb-top")
             .child(
                 resizable_panel()
@@ -2254,15 +2579,11 @@ impl Render for Workspace {
             // is otherwise transparent).
             .text_color(c.fg)
             .key_context("zdb")
-            .on_action(cx.listener(|this, _: &RunQuery, _, cx| {
-                if this.scratch_open {
-                    this.run_scratch(cx)
-                } else {
-                    this.run_current(cx)
-                }
-            }))
+            .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_active_tab(cx)))
             .on_action(cx.listener(|this, _: &CancelQuery, _, cx| this.cancel(cx)))
-            .on_action(cx.listener(|this, _: &ToggleScratch, _, cx| this.toggle_scratch(cx)))
+            .on_action(cx.listener(|this, _: &ToggleScratch, window, cx| {
+                this.focus_scratch_tab(window, cx)
+            }))
             .on_action(cx.listener(|this, _: &TogglePalette, _, cx| this.toggle_palette(cx)))
             .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
                 this.close_palette(cx);
@@ -2310,6 +2631,23 @@ fn section_header(label: impl Into<SharedString>, c: Colors) -> impl IntoElement
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .child(label.into())
+}
+
+/// Centered placeholder shown when no tab is open.
+fn welcome_pane(c: Colors) -> impl IntoElement {
+    v_flex()
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .bg(c.center)
+        .child(div().text_sm().text_color(c.fg_dim).child("No tab open"))
+        .child(
+            div()
+                .text_xs()
+                .text_color(c.fg_dim)
+                .child("Open a table from the sidebar, or press + for a new query"),
+        )
 }
 
 /// A small tree icon (chevron / database / table / view) tinted to `color`.
@@ -2462,20 +2800,46 @@ mod tests {
             .unwrap();
     }
 
+    /// Open a blank Query tab and return its id (for tests needing a result grid).
+    fn seed_query_tab(
+        ws: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> u64 {
+        ws.open_query_tab(window, cx);
+        ws.active_id().expect("active tab")
+    }
+
+    /// Make `tab_id` an editable result over `public.widget(id pk, …)`.
+    fn editable_tab(ws: &mut Workspace, tab_id: u64, headers: Vec<&str>) {
+        let tab = ws.tab_mut(tab_id).expect("tab");
+        tab.headers = headers.iter().map(|s| s.to_string()).collect();
+        tab.edit_target = Some(EditTarget {
+            schema: "public".into(),
+            table: "widget".into(),
+            pk_columns: vec!["id".into()],
+        });
+        tab.edit_cols = headers.iter().map(|s| Some(s.to_string())).collect();
+    }
+
     #[gpui::test]
     fn header_click_cycles_sort(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window
-            .update(cx, |ws, _w, cx| {
-                ws.base_sql = Some("SELECT * FROM t".into());
-                ws.headers = vec!["qty".into()];
-                assert_eq!(ws.sort_state, None);
-                ws.toggle_sort(0, cx);
-                assert_eq!(ws.sort_state, Some((0, false))); // ascending
-                ws.toggle_sort(0, cx);
-                assert_eq!(ws.sort_state, Some((0, true))); // descending
-                ws.toggle_sort(0, cx);
-                assert_eq!(ws.sort_state, None); // cleared
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.base_sql = Some("SELECT * FROM t".into());
+                    tab.headers = vec!["qty".into()];
+                }
+                assert_eq!(ws.tab(id).unwrap().sort_state, None);
+                ws.toggle_sort(id, 0, cx);
+                assert_eq!(ws.tab(id).unwrap().sort_state, Some((0, false))); // ascending
+                ws.toggle_sort(id, 0, cx);
+                assert_eq!(ws.tab(id).unwrap().sort_state, Some((0, true))); // descending
+                ws.toggle_sort(id, 0, cx);
+                assert_eq!(ws.tab(id).unwrap().sort_state, None); // cleared
             })
             .unwrap();
     }
@@ -2485,15 +2849,17 @@ mod tests {
         let window = new_workspace(cx);
         window
             .update(cx, |ws, window, cx| {
-                ws.table_view = Some(("public".into(), "users".into()));
-                ws.where_input.update(cx, |i, cx| i.set_value("id > 5", window, cx));
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                let input = ws.tab(id).unwrap().where_input.clone();
+                input.update(cx, |i, cx| i.set_value("id > 5", window, cx));
                 assert_eq!(
-                    ws.table_query(cx),
+                    ws.table_query(id, cx),
                     "SELECT * FROM \"public\".\"users\" WHERE id > 5 LIMIT 500"
                 );
-                ws.where_input.update(cx, |i, cx| i.set_value("", window, cx));
+                input.update(cx, |i, cx| i.set_value("", window, cx));
                 assert_eq!(
-                    ws.table_query(cx),
+                    ws.table_query(id, cx),
                     "SELECT * FROM \"public\".\"users\" LIMIT 500"
                 );
             })
@@ -2501,27 +2867,47 @@ mod tests {
     }
 
     #[gpui::test]
-    fn ad_hoc_run_clears_table_view(cx: &mut TestAppContext) {
+    fn new_query_tab_titles_increment(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window
-            .update(cx, |ws, _w, cx| {
-                ws.table_view = Some(("a".into(), "b".into()));
-                ws.run_current(cx);
-                assert!(ws.table_view.is_none());
+            .update(cx, |ws, window, cx| {
+                assert!(ws.active.is_none());
+                ws.open_query_tab(window, cx);
+                ws.open_query_tab(window, cx);
+                assert_eq!(ws.tabs.len(), 2);
+                assert_eq!(ws.tabs[0].title, "Query 1");
+                assert_eq!(ws.tabs[1].title, "Query 2");
+                assert_eq!(ws.active, Some(1));
             })
             .unwrap();
     }
 
     #[gpui::test]
-    fn scratch_view_toggles(cx: &mut TestAppContext) {
+    fn close_last_tab_shows_welcome(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window
-            .update(cx, |ws, _w, cx| {
-                assert!(!ws.scratch_open);
-                ws.toggle_scratch(cx);
-                assert!(ws.scratch_open);
-                ws.toggle_scratch(cx);
-                assert!(!ws.scratch_open);
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                ws.close_tab(id, cx);
+                assert!(ws.tabs.is_empty());
+                assert_eq!(ws.active, None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn scratch_tab_is_singleton(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.focus_scratch_tab(window, cx);
+                ws.focus_scratch_tab(window, cx);
+                let n = ws
+                    .tabs
+                    .iter()
+                    .filter(|t| matches!(t.kind, TabKind::Scratch))
+                    .count();
+                assert_eq!(n, 1);
             })
             .unwrap();
     }
@@ -2530,43 +2916,52 @@ mod tests {
     fn single_click_selects_row(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window
-            .update(cx, |ws, _w, cx| {
-                ws.set_current_row(3, cx);
-                assert_eq!(ws.current_row, Some(3));
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                ws.set_current_row(id, 3, cx);
+                assert_eq!(ws.tab(id).unwrap().current_row, Some(3));
             })
             .unwrap();
     }
 
     #[gpui::test]
-    fn switching_table_clears_row_selection(cx: &mut TestAppContext) {
+    fn switching_tables_preserves_state(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window
-            .update(cx, |ws, w, cx| {
-                // The blue row highlight is the Table *widget's* own selection
-                // (set by its internal click handler), separate from our
-                // `current_row`. Simulate both being set on the open table.
-                ws.table.update(cx, |ts, cx| ts.set_selected_row(4, cx));
-                ws.set_current_row(4, cx);
-                assert_eq!(ws.table.read(cx).selected_row(), Some(4));
-                assert_eq!(ws.current_row, Some(4));
-                // Open a different table via the real UI entry point. It must
-                // drop BOTH the widget highlight and our selection, so row 5 of
-                // the new table isn't left lit.
-                ws.open_relation("public".into(), "other".into(), w, cx);
-                assert_eq!(ws.current_row, None);
-                assert_eq!(ws.table.read(cx).selected_row(), None);
+            .update(cx, |ws, window, cx| {
+                // Open table A and select a row (both the widget's own highlight
+                // and our `current_row`).
+                ws.open_table_tab("public".into(), "aaa".into(), window, cx);
+                let a = ws.active_id().unwrap();
+                let a_table = ws.tab(a).unwrap().table.clone();
+                a_table.update(cx, |ts, cx| ts.set_selected_row(4, cx));
+                ws.set_current_row(a, 4, cx);
+                assert_eq!(ws.tab(a).unwrap().current_row, Some(4));
+
+                // Open table B: a brand-new tab with its own (empty) selection.
+                ws.open_table_tab("public".into(), "bbb".into(), window, cx);
+                let b = ws.active_id().unwrap();
+                assert_ne!(a, b);
+                assert_eq!(ws.tab(b).unwrap().current_row, None);
+                assert_eq!(ws.tab(b).unwrap().table.read(cx).selected_row(), None);
+
+                // Switch back to A: its selection is intact (tabs keep their state).
+                let a_idx = ws.tabs.iter().position(|t| t.id == a).unwrap();
+                ws.activate_tab(a_idx, window, cx);
+                assert_eq!(ws.tab(a).unwrap().current_row, Some(4));
+                assert_eq!(ws.tab(a).unwrap().table.read(cx).selected_row(), Some(4));
+
+                // Re-opening A's table focuses the SAME tab (focus-if-open, no dup).
+                ws.open_table_tab("public".into(), "aaa".into(), window, cx);
+                assert_eq!(ws.active_id(), Some(a));
+                let n = ws
+                    .tabs
+                    .iter()
+                    .filter(|t| matches!(&t.kind, TabKind::Table { table, .. } if table == "aaa"))
+                    .count();
+                assert_eq!(n, 1);
             })
             .unwrap();
-    }
-
-    fn editable_ws(ws: &mut Workspace, headers: Vec<&str>) {
-        ws.headers = headers.iter().map(|s| s.to_string()).collect();
-        ws.edit_target = Some(EditTarget {
-            schema: "public".into(),
-            table: "widget".into(),
-            pk_columns: vec!["id".into()],
-        });
-        ws.edit_cols = headers.iter().map(|s| Some(s.to_string())).collect();
     }
 
     #[gpui::test]
@@ -2574,23 +2969,25 @@ mod tests {
         let window = new_workspace(cx);
         window
             .update(cx, |ws, window, cx| {
-                editable_ws(ws, vec!["id", "name"]);
-                ws.add_row(cx);
-                let idx = ws.new_row_idx.expect("new row");
+                let id = seed_query_tab(ws, window, cx);
+                editable_tab(ws, id, vec!["id", "name"]);
+                ws.add_row(id, cx);
+                let idx = ws.tab(id).unwrap().new_row_idx.expect("new row");
 
                 // Editing the new row updates memory, not a staged statement.
-                ws.begin_edit(idx, 0, window, cx);
+                ws.begin_edit(id, idx, 0, window, cx);
                 ws.cell_input.update(cx, |i, cx| i.set_value("7", window, cx));
                 ws.commit_cell_edit(cx);
-                assert!(ws.pending.is_empty());
+                assert!(ws.tab(id).unwrap().pending.is_empty());
 
-                ws.begin_edit(idx, 1, window, cx);
+                ws.begin_edit(id, idx, 1, window, cx);
                 ws.cell_input.update(cx, |i, cx| i.set_value("zed", window, cx));
                 ws.commit_cell_edit(cx);
 
-                ws.save_new_row(cx);
-                assert_eq!(ws.pending.len(), 1);
-                let sql = ws.pending[0].to_sql(ws.edit_target.as_ref().unwrap()).unwrap();
+                ws.save_new_row(id, cx);
+                assert_eq!(ws.tab(id).unwrap().pending.len(), 1);
+                let target = ws.tab(id).unwrap().edit_target.clone().unwrap();
+                let sql = ws.tab(id).unwrap().pending[0].to_sql(&target).unwrap();
                 assert_eq!(
                     sql,
                     r#"INSERT INTO "public"."widget" ("id", "name") VALUES ('7', 'zed')"#
@@ -2603,15 +3000,16 @@ mod tests {
     fn discard_unsaved_new_row(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window
-            .update(cx, |ws, _w, cx| {
-                editable_ws(ws, vec!["id"]);
-                ws.rows = vec![vec![CellValue::Text("1".into())]];
-                ws.add_row(cx);
-                assert_eq!(ws.rows.len(), 2);
-                ws.delete_current_row(cx); // current row is the new one → discard
-                assert_eq!(ws.rows.len(), 1);
-                assert!(ws.new_row_idx.is_none());
-                assert!(ws.pending.is_empty());
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                editable_tab(ws, id, vec!["id"]);
+                ws.tab_mut(id).unwrap().rows = vec![vec![CellValue::Text("1".into())]];
+                ws.add_row(id, cx);
+                assert_eq!(ws.tab(id).unwrap().rows.len(), 2);
+                ws.delete_current_row(id, cx); // current row is the new one → discard
+                assert_eq!(ws.tab(id).unwrap().rows.len(), 1);
+                assert!(ws.tab(id).unwrap().new_row_idx.is_none());
+                assert!(ws.tab(id).unwrap().pending.is_empty());
             })
             .unwrap();
     }
@@ -2620,10 +3018,11 @@ mod tests {
     fn run_without_connection_is_guarded(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window
-            .update(cx, |ws, _w, cx| {
-                ws.run_sql("SELECT 1".into(), cx);
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                ws.run_sql(id, "SELECT 1".into(), cx);
                 assert_eq!(ws.status, "Not connected");
-                assert!(!ws.running);
+                assert!(!ws.tab(id).unwrap().running);
             })
             .unwrap();
     }
@@ -2632,16 +3031,20 @@ mod tests {
     fn new_query_resets_editability(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window
-            .update(cx, |ws, _w, cx| {
-                ws.edit_target = Some(EditTarget {
-                    schema: "public".into(),
-                    table: "t".into(),
-                    pk_columns: vec!["id".into()],
-                });
-                ws.edit_cols = vec![Some("id".into())];
-                ws.run_new_query("SELECT 1".into(), cx);
-                assert!(ws.edit_target.is_none());
-                assert!(ws.edit_cols.is_empty());
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.edit_target = Some(EditTarget {
+                        schema: "public".into(),
+                        table: "t".into(),
+                        pk_columns: vec!["id".into()],
+                    });
+                    tab.edit_cols = vec![Some("id".into())];
+                }
+                ws.run_new_query(id, "SELECT 1".into(), cx);
+                assert!(ws.tab(id).unwrap().edit_target.is_none());
+                assert!(ws.tab(id).unwrap().edit_cols.is_empty());
             })
             .unwrap();
     }
@@ -2661,31 +3064,36 @@ mod tests {
         let window = new_workspace(cx);
         window
             .update(cx, |ws, window, cx| {
-                ws.headers = vec!["id".into(), "name".into()];
-                ws.rows = vec![vec![
-                    CellValue::Text("1".into()),
-                    CellValue::Text("alpha".into()),
-                ]];
-                ws.edit_target = Some(EditTarget {
-                    schema: "public".into(),
-                    table: "widget".into(),
-                    pk_columns: vec!["id".into()],
-                });
-                ws.edit_cols = vec![Some("id".into()), Some("name".into())];
+                let id = seed_query_tab(ws, window, cx);
+                {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.headers = vec!["id".into(), "name".into()];
+                    tab.rows = vec![vec![
+                        CellValue::Text("1".into()),
+                        CellValue::Text("alpha".into()),
+                    ]];
+                    tab.edit_target = Some(EditTarget {
+                        schema: "public".into(),
+                        table: "widget".into(),
+                        pk_columns: vec!["id".into()],
+                    });
+                    tab.edit_cols = vec![Some("id".into()), Some("name".into())];
+                }
 
-                ws.begin_edit(0, 1, window, cx);
-                assert_eq!(ws.editing, Some((0, 1)));
+                ws.begin_edit(id, 0, 1, window, cx);
+                assert_eq!(ws.tab(id).unwrap().editing, Some((0, 1)));
                 ws.cell_input.update(cx, |inp, cx| inp.set_value("beta", window, cx));
                 ws.commit_cell_edit(cx);
 
-                assert_eq!(ws.pending.len(), 1);
-                let sql = ws.pending[0].to_sql(ws.edit_target.as_ref().unwrap()).unwrap();
+                assert_eq!(ws.tab(id).unwrap().pending.len(), 1);
+                let target = ws.tab(id).unwrap().edit_target.clone().unwrap();
+                let sql = ws.tab(id).unwrap().pending[0].to_sql(&target).unwrap();
                 assert_eq!(
                     sql,
                     r#"UPDATE "public"."widget" SET "name" = 'beta' WHERE "id" = '1'"#
                 );
                 // Optimistic update reflects in the grid before Apply.
-                assert_eq!(ws.rows[0][1], CellValue::Text("beta".into()));
+                assert_eq!(ws.tab(id).unwrap().rows[0][1], CellValue::Text("beta".into()));
             })
             .unwrap();
     }
@@ -2695,28 +3103,32 @@ mod tests {
         let window = new_workspace(cx);
         window
             .update(cx, |ws, window, cx| {
-                ws.headers = vec!["id".into(), "name".into()];
-                ws.rows = vec![
-                    vec![CellValue::Text("1".into()), CellValue::Text("a".into())],
-                    vec![CellValue::Text("2".into()), CellValue::Text("b".into())],
-                ];
-                ws.edit_target = Some(EditTarget {
-                    schema: "public".into(),
-                    table: "widget".into(),
-                    pk_columns: vec!["id".into()],
-                });
-                ws.edit_cols = vec![Some("id".into()), Some("name".into())];
+                let id = seed_query_tab(ws, window, cx);
+                {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.headers = vec!["id".into(), "name".into()];
+                    tab.rows = vec![
+                        vec![CellValue::Text("1".into()), CellValue::Text("a".into())],
+                        vec![CellValue::Text("2".into()), CellValue::Text("b".into())],
+                    ];
+                    tab.edit_target = Some(EditTarget {
+                        schema: "public".into(),
+                        table: "widget".into(),
+                        pk_columns: vec!["id".into()],
+                    });
+                    tab.edit_cols = vec![Some("id".into()), Some("name".into())];
+                }
 
                 // Edit two different rows; both stage without replacing each other.
-                ws.begin_edit(0, 1, window, cx);
+                ws.begin_edit(id, 0, 1, window, cx);
                 ws.cell_input.update(cx, |i, cx| i.set_value("x", window, cx));
                 ws.commit_cell_edit(cx);
-                ws.begin_edit(1, 1, window, cx);
+                ws.begin_edit(id, 1, 1, window, cx);
                 ws.cell_input.update(cx, |i, cx| i.set_value("y", window, cx));
                 ws.commit_cell_edit(cx);
 
-                assert_eq!(ws.pending.len(), 2);
-                let batch = ws.pending_sql().expect("combined sql");
+                assert_eq!(ws.tab(id).unwrap().pending.len(), 2);
+                let batch = ws.pending_sql(id).expect("combined sql");
                 assert!(batch.starts_with("BEGIN;"));
                 assert!(batch.trim_end().ends_with("COMMIT;"));
                 assert!(batch.contains(r#"SET "name" = 'x' WHERE "id" = '1'"#));
@@ -2730,34 +3142,38 @@ mod tests {
         let window = new_workspace(cx);
         window
             .update(cx, |ws, window, cx| {
-                ws.headers = vec!["id".into(), "name".into()];
-                ws.rows = vec![vec![
-                    CellValue::Text("1".into()),
-                    CellValue::Text("alpha".into()),
-                ]];
-                ws.orig_rows = ws.rows.clone();
-                ws.edit_target = Some(EditTarget {
-                    schema: "public".into(),
-                    table: "widget".into(),
-                    pk_columns: vec!["id".into()],
-                });
-                ws.edit_cols = vec![Some("id".into()), Some("name".into())];
+                let id = seed_query_tab(ws, window, cx);
+                {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.headers = vec!["id".into(), "name".into()];
+                    tab.rows = vec![vec![
+                        CellValue::Text("1".into()),
+                        CellValue::Text("alpha".into()),
+                    ]];
+                    tab.orig_rows = tab.rows.clone();
+                    tab.edit_target = Some(EditTarget {
+                        schema: "public".into(),
+                        table: "widget".into(),
+                        pk_columns: vec!["id".into()],
+                    });
+                    tab.edit_cols = vec![Some("id".into()), Some("name".into())];
+                }
 
                 // Edit to a new value: stages + marks the cell.
-                ws.begin_edit(0, 1, window, cx);
+                ws.begin_edit(id, 0, 1, window, cx);
                 ws.cell_input.update(cx, |i, cx| i.set_value("beta", window, cx));
                 ws.commit_cell_edit(cx);
-                assert_eq!(ws.pending.len(), 1);
-                assert!(ws.edited_cells.contains(&(0, 1)));
+                assert_eq!(ws.tab(id).unwrap().pending.len(), 1);
+                assert!(ws.tab(id).unwrap().edited_cells.contains(&(0, 1)));
 
                 // Edit back to the original value: the staged edit is dropped and
                 // the cell is no longer marked.
-                ws.begin_edit(0, 1, window, cx);
+                ws.begin_edit(id, 0, 1, window, cx);
                 ws.cell_input.update(cx, |i, cx| i.set_value("alpha", window, cx));
                 ws.commit_cell_edit(cx);
-                assert!(ws.pending.is_empty(), "edit reverted → no pending");
-                assert!(!ws.edited_cells.contains(&(0, 1)));
-                assert_eq!(ws.rows[0][1], CellValue::Text("alpha".into()));
+                assert!(ws.tab(id).unwrap().pending.is_empty(), "edit reverted → no pending");
+                assert!(!ws.tab(id).unwrap().edited_cells.contains(&(0, 1)));
+                assert_eq!(ws.tab(id).unwrap().rows[0][1], CellValue::Text("alpha".into()));
             })
             .unwrap();
     }

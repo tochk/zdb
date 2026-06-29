@@ -177,10 +177,11 @@ The WSL host can run Windows exes directly:
   `current_row` in the ONE place every result lands — the async query-result
   handler in `run_sql` (right where `delegate_mut().set(...)` swaps the rows).
   That covers table switch, re-sort, reload, and edit-reload in a single spot.
-- The top-of-results toolbar (`render_center`): Run toggles to a red Stop while
+- The per-tab toolbar (`render_tab_body`): Run toggles to a red Stop while the tab is
   `running`; `+`/`-`/refresh are ALWAYS shown and disabled when N/A (`+` needs an
   editable result; `-` needs a selected row — its glyph is red only when enabled,
-  else neutral `c.fg`; refresh needs `base_sql`). `reload_data` re-runs `base_sql`.
+  else neutral `c.fg`; refresh needs the tab's `base_sql`). `reload_data(tab_id)` re-runs
+  it. (`render_center` = tab strip + active tab body | welcome pane.)
 - **Live theme switch / Settings modal** (`render_settings`, gear in the sidebar
   header or Ctrl/Cmd+,): `gpui_component::Theme::change(mode, Some(window), cx)` swaps
   the theme at runtime; persist with `self.settings.save()`. List/row UIs (schema
@@ -188,5 +189,33 @@ The WSL host can run Windows exes directly:
   .list_hover` and `.bg(c.active)` (`theme.list_active`) for the selected row; the
   schema tree is Zed-explorer-style (chevron-right/down + database/table/eye icons +
   a `border_l_1` indent guide on each expanded schema's children).
+
+- **Center is TABBED (Zed-style)** — `Workspace.tabs: Vec<Tab>` + `active: Option<usize>`
+  (`None` = welcome pane). Each `Tab` (id, `TabKind::{Query,Scratch,Table}`, title) OWNS
+  its `editor`/`where_input`/`table` Entities + ALL result+edit state (headers/rows/
+  orig_rows/base_sql/last_sql/sort_state/edit_target/edit_cols/editing/current_row/
+  new_row_idx/pending/edited_cells/running) so switching tabs preserves each one's grid,
+  selection, and staged edits. Key rules baked in:
+  - The flat result fields were REMOVED from `Workspace`; every result/edit method takes a
+    `tab_id` and looks up `tab_mut(id)`. Toolbar/action callers pass `active_id()`.
+    `cell_input` stays SHARED on `Workspace` (only the active tab edits one cell at a time;
+    `commit/cancel_cell_edit` act on the active tab).
+  - **Async query handlers re-look-up the tab by id** — `run_sql`/`describe_async`/
+    `apply_pending` capture `tab_id` and do `this.tab_mut(tab_id)` inside the result closure,
+    bailing if the tab was closed mid-query. DON'T assume the active tab is still the one
+    that issued the query. The per-result selection clear lives here, scoped to that tab's
+    widget.
+  - `ResultDelegate` carries a `tab_id`; `render_th`/`render_td` resolve `ws.tab(tab_id)`
+    for editing/sort/edited-cell state (NOT global fields).
+  - Tables open focus-if-open-else-new (`open_table_tab`); scratch is a SINGLETON
+    auto-saved tab (`focus_scratch_tab`, also `ToggleScratch`/Ctrl+Shift+E); `+` →
+    `open_query_tab` ("Query N"). The tab-strip close `x` is a SEPARATE clickable sibling
+    of the activate region (nesting two `on_click`s would fire both → activate a
+    just-removed tab).
+  - `activate_tab` focuses the tab's input only when `window.root::<gpui_component::Root>()`
+    exists — headless `#[gpui::test]` windows have no `Root`, and focusing a code-editor
+    input there panics (`root.rs` "window first layer should be a Root").
+  - Opening a tab needs `&mut Window`; from windowless async contexts (the selftest) set
+    `pending_open` and let `render()` consume it next frame.
 
 See the auto-memory under the Claude projects dir for the running phase log.
