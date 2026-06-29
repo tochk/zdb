@@ -29,10 +29,6 @@ pub struct DescribedResult {
 }
 
 impl EditTarget {
-    pub fn is_editable(&self) -> bool {
-        !self.pk_columns.is_empty()
-    }
-
     fn qualified(&self) -> String {
         format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.table))
     }

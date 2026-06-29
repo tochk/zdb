@@ -18,8 +18,12 @@ crates/
                rustls(ring) TLS.
   zdb-config/  JSON settings (connections, theme, keymap) + OS-keychain passwords
                (secret.rs, keyring; per-OS backend).
-  zdb-app/     gpui app (bin `zdb`): workspace.rs (the whole UI), terminal.rs,
-               main.rs (entry, WSL X11 guard, keybindings, theme).
+  zdb-app/     gpui app (bin `zdb`): workspace/ (the UI, split into mod.rs =
+               Workspace struct + logic methods + tests; view.rs = all render_*
+               + impl Render (child module, reaches Workspace privates, no
+               visibility bumps); grid.rs = Tab/TabKind + ResultDelegate;
+               colors.rs = Colors/palette; util.rs = pure SQL/config helpers),
+               terminal.rs, main.rs (entry, WSL X11 guard, keybindings, theme).
 vendor/gpui/   PATCHED copy of gpui 0.2.2 (see Windows notes). [patch.crates-io].
 ```
 
