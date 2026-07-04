@@ -13,10 +13,12 @@ use gpui_component::{
     Sizable as _,
 };
 use std::collections::HashSet;
+use std::rc::Rc;
 use zdb_db::{CellValue, EditTarget, RowEdit};
 
 use super::colors::{palette, Colors};
 use super::Workspace;
+use crate::lsp::{LspSlot, SqlCompletion};
 
 /// Translucent blue fill for a cell with a staged (unsaved) edit, plus a solid
 /// blue left bar. Fixed so it reads on both light and dark themes.
@@ -248,15 +250,21 @@ pub(crate) fn make_grid(
 
 pub(crate) fn make_sql_editor(
     placeholder: &str,
+    slot: LspSlot,
+    tab_id: u64,
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<InputState> {
     let ph = placeholder.to_string();
     cx.new(|cx| {
-        InputState::new(window, cx)
+        let mut state = InputState::new(window, cx)
             .code_editor("sql")
             .line_number(true)
-            .placeholder(ph)
+            .placeholder(ph);
+        // Schema-aware completion via the shared `sqls` handle (no-op until a
+        // server is running).
+        state.lsp.completion_provider = Some(Rc::new(SqlCompletion::new(slot, tab_id)));
+        state
     })
 }
 
@@ -294,23 +302,36 @@ impl Tab {
     }
 
     /// A blank ad-hoc query tab ("Query N").
-    pub(crate) fn query(id: u64, n: u64, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+    pub(crate) fn query(
+        id: u64,
+        n: u64,
+        slot: LspSlot,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
         let weak = cx.weak_entity();
-        let editor = make_sql_editor("SELECT * FROM ... ;  (press Run)", window, cx);
+        let editor = make_sql_editor("SELECT * FROM ... ;  (press Run)", slot, id, window, cx);
         let where_input = cx.new(|cx| InputState::new(window, cx));
         let table = make_grid(weak, id, window, cx);
         Tab::base(id, TabKind::Query, format!("Query {n}"), editor, where_input, table)
     }
 
     /// The singleton scratch tab: editor seeded from disk and auto-saved on edit.
-    pub(crate) fn scratch(id: u64, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+    pub(crate) fn scratch(
+        id: u64,
+        slot: LspSlot,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Self {
         let weak = cx.weak_entity();
         let editor = cx.new(|cx| {
-            InputState::new(window, cx)
+            let mut state = InputState::new(window, cx)
                 .code_editor("sql")
                 .line_number(true)
                 .placeholder("Scratch query — auto-saved")
-                .default_value(zdb_config::load_scratch())
+                .default_value(zdb_config::load_scratch());
+            state.lsp.completion_provider = Some(Rc::new(SqlCompletion::new(slot, id)));
+            state
         });
         // Persist scratch text to disk on every change.
         cx.subscribe(&editor, |_this, emitter, event: &InputEvent, cx| {
@@ -329,11 +350,12 @@ impl Tab {
         id: u64,
         schema: String,
         table_name: String,
+        slot: LspSlot,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Self {
         let weak = cx.weak_entity();
-        let editor = make_sql_editor("", window, cx);
+        let editor = make_sql_editor("", slot, id, window, cx);
         let where_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("WHERE … (Enter to filter)"));
         cx.subscribe(&where_input, move |this, _i, event: &InputEvent, cx| {

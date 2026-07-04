@@ -40,35 +40,29 @@ impl Workspace {
                     None => v_flex()
                         .child(tree_leaf_text("loading…", c))
                         .into_any_element(),
-                    Some(rels) if rels.is_empty() => v_flex()
-                        .child(tree_leaf_text("(no tables)", c))
-                        .into_any_element(),
                     Some(rels) => {
                         let schema = node.name.clone();
                         let mut kids = v_flex().gap(px(1.));
+                        if rels.is_empty() {
+                            kids = kids.child(tree_leaf_text("(no tables)", c));
+                        }
                         for (rix, rel) in rels.iter().enumerate() {
-                            let s = schema.clone();
-                            let t = rel.name.clone();
-                            kids = kids.child(
-                                div()
-                                    .id(SharedString::from(format!("rel-{ix}-{rix}")))
-                                    .flex()
-                                    .items_center()
-                                    .pl_2()
-                                    .pr_1()
-                                    .py(px(3.))
-                                    .gap_1p5()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .text_sm()
-                                    .text_color(c.fg)
-                                    .hover(|s| s.bg(c.hover))
-                                    .child(tree_icon(rel_icon(rel.kind), c.fg_dim))
-                                    .child(rel.name.clone())
-                                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                        this.open_table_tab(s.clone(), t.clone(), window, cx)
-                                    })),
-                            );
+                            kids = kids.child(rel_node_view(ix, rix, rel, &schema, c, cx));
+                        }
+                        // Schema-level objects below the relations.
+                        if let Some(objs) = &node.objects {
+                            if !objs.sequences.is_empty() {
+                                kids = kids.child(sub_label("SEQUENCES", c));
+                                for name in &objs.sequences {
+                                    kids = kids.child(detail_leaf(c, name.clone(), String::new()));
+                                }
+                            }
+                            if !objs.functions.is_empty() {
+                                kids = kids.child(sub_label("FUNCTIONS", c));
+                                for sig in &objs.functions {
+                                    kids = kids.child(detail_leaf(c, sig.clone(), String::new()));
+                                }
+                            }
                         }
                         kids.into_any_element()
                     }
@@ -247,6 +241,12 @@ impl Workspace {
     fn render_tab_body(tab: &Tab, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
         let tab_id = tab.id;
         let editable = tab.edit_target.is_some();
+        let is_editor = !matches!(tab.kind, TabKind::Table { .. });
+        let has_result = !tab.headers.is_empty();
+        let has_sql = match &tab.kind {
+            TabKind::Table { .. } => true,
+            _ => !tab.editor.read(cx).value().trim().is_empty(),
+        };
 
         // Run toggles to Stop while a query is in flight.
         let run_btn = if tab.running {
@@ -308,7 +308,45 @@ impl Workspace {
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.reload_data(tab_id, cx)
                     })),
+            )
+            // EXPLAIN the current statement (plan shown in the grid).
+            .child(
+                Button::new("explain")
+                    .label("Explain")
+                    .tooltip("EXPLAIN this query")
+                    .disabled(!has_sql)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.explain_active(false, cx)
+                    })),
+            )
+            // Export / copy the current result.
+            .child(
+                Button::new("export-csv")
+                    .label("Export")
+                    .tooltip("Export result to CSV (more formats in the palette)")
+                    .disabled(!has_result)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.export_active(ExportFormat::Csv, cx)
+                    })),
+            )
+            .child(
+                Button::new("copy-tsv")
+                    .label("Copy")
+                    .tooltip("Copy result to clipboard (TSV)")
+                    .disabled(!has_result)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.copy_active_tsv(cx))),
             );
+        if is_editor {
+            toolbar = toolbar.child(
+                Button::new("format-sql")
+                    .label("Format")
+                    .tooltip("Format SQL")
+                    .disabled(!has_sql)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.format_active(window, cx)
+                    })),
+            );
+        }
         if tab.new_row_idx.is_some() {
             toolbar = toolbar.child(
                 Button::new("save-row")
@@ -1098,4 +1136,151 @@ fn tree_icon(path: &'static str, color: Hsla) -> impl IntoElement {
 /// Muted placeholder leaf text ("loading…", "(no tables)") inside a schema.
 fn tree_leaf_text(s: &'static str, c: Colors) -> impl IntoElement {
     div().pl_2().py(px(2.)).text_sm().text_color(c.fg_dim).child(s)
+}
+
+/// One relation row: a clickable chevron (expand → columns/indexes/constraints)
+/// and a clickable name (open the table in a tab). When expanded, the detail
+/// leaves render indented below.
+fn rel_node_view(
+    schema_ix: usize,
+    rel_ix: usize,
+    rel: &RelNode,
+    schema: &str,
+    c: Colors,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let chevron = if rel.expanded {
+        "icons/chevron-down.svg"
+    } else {
+        "icons/chevron-right.svg"
+    };
+    let s_open = schema.to_string();
+    let t_open = rel.name.clone();
+    let row = div()
+        .flex()
+        .items_center()
+        .pl_1()
+        .pr_1()
+        .py(px(3.))
+        .gap_1p5()
+        .rounded_md()
+        .text_sm()
+        .text_color(c.fg)
+        .hover(|s| s.bg(c.hover))
+        // Chevron toggles the detail; a separate sibling from the open target so
+        // a click resolves to exactly one action.
+        .child(
+            div()
+                .id(SharedString::from(format!("rel-tog-{schema_ix}-{rel_ix}")))
+                .cursor_pointer()
+                .child(tree_icon(chevron, c.fg_dim))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.toggle_relation(schema_ix, rel_ix, cx)
+                })),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("rel-open-{schema_ix}-{rel_ix}")))
+                .flex()
+                .flex_1()
+                .items_center()
+                .gap_1p5()
+                .cursor_pointer()
+                .child(tree_icon(rel_icon(rel.kind), c.fg_dim))
+                .child(rel.name.clone())
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.open_table_tab(s_open.clone(), t_open.clone(), window, cx)
+                })),
+        );
+
+    if !rel.expanded {
+        return v_flex().child(row).into_any_element();
+    }
+    // Indent the detail under the relation, with its own guide line.
+    let detail = div()
+        .pl(px(12.))
+        .child(
+            div()
+                .pl(px(6.))
+                .border_l_1()
+                .border_color(c.border)
+                .child(detail_block(rel.detail.as_ref(), c)),
+        );
+    v_flex().child(row).child(detail).into_any_element()
+}
+
+/// The columns / indexes / constraints leaves under an expanded relation.
+fn detail_block(detail: Option<&zdb_db::RelationDetail>, c: Colors) -> impl IntoElement {
+    let mut col = v_flex().gap(px(1.));
+    let Some(d) = detail else {
+        return col.child(tree_leaf_text("loading…", c)).into_any_element();
+    };
+    if !d.columns.is_empty() {
+        col = col.child(sub_label("COLUMNS", c));
+        for c0 in &d.columns {
+            let mut ty = c0.type_name.clone();
+            if !c0.nullable {
+                ty.push_str("  NOT NULL");
+            }
+            if c0.is_primary_key {
+                ty.push_str("  PK");
+            }
+            col = col.child(detail_leaf(c, c0.name.clone(), ty));
+        }
+    }
+    if !d.indexes.is_empty() {
+        col = col.child(sub_label("INDEXES", c));
+        for ix in &d.indexes {
+            let tag = if ix.is_primary {
+                "PRIMARY"
+            } else if ix.is_unique {
+                "UNIQUE"
+            } else {
+                ""
+            };
+            col = col.child(detail_leaf(c, ix.name.clone(), tag.to_string()));
+        }
+    }
+    if !d.constraints.is_empty() {
+        col = col.child(sub_label("CONSTRAINTS", c));
+        for con in &d.constraints {
+            let kind = match con.kind {
+                'p' => "PRIMARY KEY",
+                'f' => "FOREIGN KEY",
+                'u' => "UNIQUE",
+                'c' => "CHECK",
+                'x' => "EXCLUDE",
+                _ => "",
+            };
+            col = col.child(detail_leaf(c, con.name.clone(), kind.to_string()));
+        }
+    }
+    col.into_any_element()
+}
+
+/// A small uppercase group header inside the tree ("COLUMNS", "INDEXES", …).
+fn sub_label(text: &'static str, c: Colors) -> impl IntoElement {
+    div()
+        .pl_1()
+        .pt_1()
+        .pb(px(1.))
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(c.fg_dim)
+        .child(text)
+}
+
+/// A tree detail leaf: `main` (foreground) followed by dimmed `meta` (type / tag).
+fn detail_leaf(c: Colors, main: String, meta: String) -> impl IntoElement {
+    div()
+        .pl_1()
+        .py(px(1.))
+        .flex()
+        .items_baseline()
+        .gap_1p5()
+        .text_sm()
+        .child(div().text_color(c.fg).child(main))
+        .when(!meta.is_empty(), |d| {
+            d.child(div().text_xs().text_color(c.fg_dim).child(meta))
+        })
 }

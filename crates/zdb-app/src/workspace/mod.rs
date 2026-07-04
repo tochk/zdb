@@ -23,10 +23,14 @@ use gpui_component::{
     table::{ColumnSort, Table},
     v_flex, Disableable, Icon, IconName, Sizable,
 };
+use crate::lsp::{self, LspSlot};
+use gpui::ClipboardItem;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use zdb_config::{ConnectionEntry, Settings};
 use zdb_db::{
-    CellValue, ConnId, ConnectionConfig, DbHandle, EditTarget, QueryEvent, RelationKind, RowEdit,
+    CellValue, ConnId, ConnectionConfig, DbHandle, EditTarget, ExportFormat, QueryEvent,
+    RelationDetail, RelationKind, RowEdit, SchemaObjects,
 };
 
 mod colors;
@@ -59,15 +63,29 @@ const LOG_CAP: usize = 500;
 #[derive(Clone, Copy)]
 enum PaletteCmd {
     Run,
+    Explain,
+    ExplainAnalyze,
     Cancel,
     Refresh,
     Terminal,
     Connections,
     Settings,
+    ExportCsv,
+    ExportJson,
+    ExportInserts,
+    CopyTsv,
+    Format,
 }
 
 const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
     ("Run query", PaletteCmd::Run),
+    ("Explain query", PaletteCmd::Explain),
+    ("Explain analyze (runs query)", PaletteCmd::ExplainAnalyze),
+    ("Format SQL", PaletteCmd::Format),
+    ("Export result as CSV", PaletteCmd::ExportCsv),
+    ("Export result as JSON", PaletteCmd::ExportJson),
+    ("Export result as SQL INSERTs", PaletteCmd::ExportInserts),
+    ("Copy result (TSV) to clipboard", PaletteCmd::CopyTsv),
     ("Cancel query", PaletteCmd::Cancel),
     ("Refresh schemas", PaletteCmd::Refresh),
     ("Manage connections", PaletteCmd::Connections),
@@ -82,15 +100,58 @@ fn log(msg: impl AsRef<str>) {
     }
 }
 
+/// Best-effort starting directory for the export save dialog (home, else cwd).
+fn export_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Qualified `"schema"."table"` target for exported INSERTs: the Table tab's
+/// relation, else the described edit target, else the literal `result`.
+fn export_table_name(tab: &Tab) -> String {
+    let q = |s: &str| s.replace('"', "\"\"");
+    if let TabKind::Table { schema, table } = &tab.kind {
+        format!("\"{}\".\"{}\"", q(schema), q(table))
+    } else if let Some(t) = &tab.edit_target {
+        format!("\"{}\".\"{}\"", q(&t.schema), q(&t.table))
+    } else {
+        "result".to_string()
+    }
+}
+
+/// A filesystem-safe default file name for an exported result.
+fn export_basename(tab: &Tab) -> String {
+    let raw = match &tab.kind {
+        TabKind::Table { schema, table } => format!("{schema}.{table}"),
+        _ => tab.title.clone(),
+    };
+    let name: String = raw
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if name.is_empty() {
+        "export".to_string()
+    } else {
+        name
+    }
+}
+
 struct SchemaNode {
     name: String,
     expanded: bool,
     relations: Option<Vec<RelNode>>,
+    /// Sequences + functions, loaded alongside relations on first expand.
+    objects: Option<SchemaObjects>,
 }
 
 struct RelNode {
     name: String,
     kind: RelationKind,
+    expanded: bool,
+    /// Columns + indexes + constraints, loaded when this relation is expanded.
+    detail: Option<RelationDetail>,
 }
 
 struct LogEntry {
@@ -118,6 +179,10 @@ pub struct Workspace {
 
     /// Shared inline-cell editor (only the active tab edits a cell at a time).
     cell_input: Entity<InputState>,
+
+    /// Running `sqls` LSP handle (schema-aware completion), filled on connect.
+    /// Shared with every SQL editor's completion provider.
+    lsp_slot: LspSlot,
 
     // Query log (most recent last).
     log_entries: Vec<LogEntry>,
@@ -189,6 +254,7 @@ impl Workspace {
             next_tab_id: 1,
             pending_open: None,
             cell_input,
+            lsp_slot: lsp::new_slot(),
             log_entries: Vec::new(),
             palette_open: false,
             palette_input,
@@ -273,7 +339,7 @@ impl Workspace {
             .filter(|t| matches!(t.kind, TabKind::Query))
             .count() as u64
             + 1;
-        let tab = Tab::query(id, n, window, cx);
+        let tab = Tab::query(id, n, self.lsp_slot.clone(), window, cx);
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
     }
@@ -294,7 +360,7 @@ impl Workspace {
         }
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let tab = Tab::table(id, schema, table, window, cx);
+        let tab = Tab::table(id, schema, table, self.lsp_slot.clone(), window, cx);
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
         let sql = self.table_query(id, cx);
@@ -309,7 +375,7 @@ impl Workspace {
         }
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let tab = Tab::scratch(id, window, cx);
+        let tab = Tab::scratch(id, self.lsp_slot.clone(), window, cx);
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
     }
@@ -456,6 +522,8 @@ impl Workspace {
     fn start_connect(&mut self, cfg: ConnectionConfig, cx: &mut Context<Self>) {
         self.status = format!("Connecting to {}…", cfg.name);
         let db = self.db.clone();
+        // Keep a copy to configure the completion server after a successful connect.
+        let lsp_cfg = cfg.clone();
         cx.spawn(async move |this, cx| {
             let result = db.connect(cfg).await;
             this.update(cx, |this, cx| {
@@ -464,6 +532,7 @@ impl Workspace {
                         log(format!("connected (conn={conn})"));
                         this.conn = Some(conn);
                         this.status = "Connected. Loading schemas…".into();
+                        this.start_lsp(&lsp_cfg);
                         this.load_schemas(cx);
                     }
                     Err(e) => {
@@ -476,6 +545,32 @@ impl Workspace {
             .ok();
         })
         .detach();
+    }
+
+    /// (Re)start the bundled `sqls` server for the just-connected database, so
+    /// SQL editors get schema-aware completion. Best-effort: if `sqls` isn't
+    /// bundled/installed we log and carry on with no completion.
+    fn start_lsp(&mut self, cfg: &ConnectionConfig) {
+        // Drop any previous server (kills the process) before starting a new one.
+        *self.lsp_slot.borrow_mut() = None;
+        let Some(exe) = lsp::sqls_path() else {
+            log("sqls not found; SQL completion disabled");
+            return;
+        };
+        let config_path = match lsp::write_config(cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                log(format!("sqls config write failed: {e}"));
+                return;
+            }
+        };
+        match lsp::LspHandle::spawn(&exe, config_path, cfg.password.clone()) {
+            Ok(h) => {
+                *self.lsp_slot.borrow_mut() = Some(h);
+                log("sqls started");
+            }
+            Err(e) => log(format!("sqls spawn failed: {e}")),
+        }
     }
 
     fn load_schemas(&mut self, cx: &mut Context<Self>) {
@@ -492,6 +587,7 @@ impl Workspace {
                                 name: s.name,
                                 expanded: false,
                                 relations: None,
+                                objects: None,
                             })
                             .collect();
                         log(format!("schemas loaded: {}", this.tree.len()));
@@ -524,9 +620,10 @@ impl Workspace {
         let Some(conn) = self.conn else { return };
         let db = self.db.clone();
         cx.spawn(async move |this, cx| {
-            let result = db.relations(conn, schema).await;
+            let rels = db.relations(conn, schema.clone()).await;
+            let objects = db.schema_objects(conn, schema).await;
             this.update(cx, |this, cx| {
-                match result {
+                match rels {
                     Ok(rels) => {
                         if let Some(node) = this.tree.get_mut(ix) {
                             node.relations = Some(
@@ -534,12 +631,70 @@ impl Workspace {
                                     .map(|r| RelNode {
                                         name: r.name,
                                         kind: r.kind,
+                                        expanded: false,
+                                        detail: None,
                                     })
                                     .collect(),
                             );
+                            node.objects = objects.ok();
                         }
                     }
                     Err(e) => this.status = format!("Failed to load relations: {e}"),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Expand/collapse a relation node, lazily loading its columns / indexes /
+    /// constraints on first expand.
+    fn toggle_relation(&mut self, schema_ix: usize, rel_ix: usize, cx: &mut Context<Self>) {
+        let Some(schema) = self.tree.get(schema_ix) else { return };
+        let schema_name = schema.name.clone();
+        let Some(node) = self
+            .tree
+            .get_mut(schema_ix)
+            .and_then(|s| s.relations.as_mut())
+            .and_then(|r| r.get_mut(rel_ix))
+        else {
+            return;
+        };
+        node.expanded = !node.expanded;
+        let need_load = node.expanded && node.detail.is_none();
+        let table = node.name.clone();
+        if need_load {
+            self.load_relation_detail(schema_ix, rel_ix, schema_name, table, cx);
+        }
+        cx.notify();
+    }
+
+    fn load_relation_detail(
+        &mut self,
+        schema_ix: usize,
+        rel_ix: usize,
+        schema: String,
+        table: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.conn else { return };
+        let db = self.db.clone();
+        cx.spawn(async move |this, cx| {
+            let result = db.relation_detail(conn, schema, table).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(detail) => {
+                        if let Some(node) = this
+                            .tree
+                            .get_mut(schema_ix)
+                            .and_then(|s| s.relations.as_mut())
+                            .and_then(|r| r.get_mut(rel_ix))
+                        {
+                            node.detail = Some(detail);
+                        }
+                    }
+                    Err(e) => this.status = format!("Failed to load relation detail: {e}"),
                 }
                 cx.notify();
             })
@@ -581,17 +736,64 @@ impl Workspace {
 
     // ---- query execution -------------------------------------------------
 
-    /// Run the active tab: Query/Scratch run their editor SQL; a Table tab reloads.
+    /// Run the active tab: a Table tab reloads; a Query/Scratch tab runs the
+    /// single statement under the cursor (or the whole editor if there's one
+    /// statement).
     fn run_active_tab(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_tab() else { return };
-        let id = tab.id;
-        let is_table = matches!(tab.kind, TabKind::Table { .. });
-        let sql = tab.editor.read(cx).value().to_string();
+        let (id, is_table, full, cursor) = {
+            let Some(tab) = self.active_tab() else { return };
+            let ed = tab.editor.read(cx);
+            (
+                tab.id,
+                matches!(tab.kind, TabKind::Table { .. }),
+                ed.value().to_string(),
+                ed.cursor(),
+            )
+        };
         if is_table {
             self.reload_data(id, cx);
         } else {
-            self.run_new_query(id, sql, cx);
+            self.run_new_query(id, util::statement_at(&full, cursor), cx);
         }
+    }
+
+    /// The SQL the active tab would run: a Table tab's generated `SELECT *`
+    /// (with WHERE filter), else the editor text.
+    fn active_sql(&self, cx: &App) -> String {
+        let Some(tab) = self.active_tab() else {
+            return String::new();
+        };
+        if matches!(tab.kind, TabKind::Table { .. }) {
+            self.table_query(tab.id, cx)
+        } else {
+            tab.editor.read(cx).value().to_string()
+        }
+    }
+
+    /// Run `EXPLAIN` (or `EXPLAIN (ANALYZE, BUFFERS)`) on the active tab's SQL and
+    /// show the text plan in the grid. Plain EXPLAIN does not execute the query;
+    /// ANALYZE does. Marks the result read-only (plan rows aren't editable).
+    fn explain_active(&mut self, analyze: bool, cx: &mut Context<Self>) {
+        let sql = self.active_sql(cx).trim().trim_end_matches(';').to_string();
+        if sql.is_empty() {
+            self.status = "Nothing to explain".into();
+            cx.notify();
+            return;
+        }
+        let Some(id) = self.active_id() else { return };
+        let prefix = if analyze {
+            "EXPLAIN (ANALYZE, BUFFERS) "
+        } else {
+            "EXPLAIN "
+        };
+        // Plan rows are not editable; drop stale editability so render_td can't
+        // offer to edit a "QUERY PLAN" cell.
+        if let Some(tab) = self.tab_mut(id) {
+            tab.edit_target = None;
+            tab.edit_cols.clear();
+            tab.editing = None;
+        }
+        self.run_sql(id, format!("{prefix}{sql}"), cx);
     }
 
     /// Re-run a tab's current query/table from the DB (discards staged edits).
@@ -744,6 +946,88 @@ impl Workspace {
             self.status = "Cancel requested".into();
             cx.notify();
         }
+    }
+
+    // ---- export ----------------------------------------------------------
+
+    /// Serialize the active tab's result in `fmt` and save it via a native
+    /// file dialog (no-op with a status message when the result is empty).
+    fn export_active(&mut self, fmt: ExportFormat, cx: &mut Context<Self>) {
+        // Build the bytes + default name while borrowing the tab, then drop the
+        // borrow before touching `self.status` / spawning.
+        let prepared = self
+            .active_tab()
+            .filter(|t| !t.headers.is_empty())
+            .map(|tab| {
+                let data = match fmt {
+                    ExportFormat::Csv => zdb_db::to_csv(&tab.headers, &tab.rows),
+                    ExportFormat::Json => zdb_db::to_json(&tab.headers, &tab.rows),
+                    ExportFormat::Inserts => {
+                        zdb_db::to_inserts(&export_table_name(tab), &tab.headers, &tab.rows)
+                    }
+                };
+                (data, export_basename(tab))
+            });
+        let Some((data, base)) = prepared else {
+            self.status = "No result to export".into();
+            cx.notify();
+            return;
+        };
+        let suggested = format!("{base}.{}", fmt.extension());
+        let dir = export_dir();
+        let save = cx.prompt_for_new_path(&dir, Some(&suggested));
+        cx.spawn(async move |this, cx| {
+            let path = match save.await {
+                Ok(Ok(Some(p))) => p,
+                _ => return, // cancelled or dialog unavailable
+            };
+            let status = match std::fs::write(&path, data) {
+                Ok(()) => format!("Exported to {}", path.display()),
+                Err(e) => format!("Export failed: {e}"),
+            };
+            this.update(cx, |this, cx| {
+                this.status = status;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Copy the active tab's result to the clipboard as TSV (spreadsheet paste).
+    fn copy_active_tsv(&mut self, cx: &mut Context<Self>) {
+        let payload = self
+            .active_tab()
+            .filter(|t| !t.headers.is_empty())
+            .map(|t| (zdb_db::to_tsv(&t.headers, &t.rows), t.rows.len()));
+        match payload {
+            Some((tsv, rows)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+                self.status = format!("Copied {rows} row(s) to clipboard");
+            }
+            None => self.status = "No result to copy".into(),
+        }
+        cx.notify();
+    }
+
+    // ---- formatting ------------------------------------------------------
+
+    /// Pretty-print the active editor's SQL in place (Query / Scratch tabs).
+    fn format_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else { return };
+        if matches!(tab.kind, TabKind::Table { .. }) {
+            self.status = "Nothing to format".into();
+            cx.notify();
+            return;
+        }
+        let editor = tab.editor.clone();
+        let sql = editor.read(cx).value().to_string();
+        if sql.trim().is_empty() {
+            return;
+        }
+        let pretty = util::format_sql(&sql);
+        editor.update(cx, |state, cx| state.set_value(pretty, window, cx));
+        cx.notify();
     }
 
     fn push_log(&mut self, sql: &str, ok: bool) {
@@ -1165,6 +1449,13 @@ impl Workspace {
         self.palette_open = false;
         match cmd {
             PaletteCmd::Run => self.run_active_tab(cx),
+            PaletteCmd::Explain => self.explain_active(false, cx),
+            PaletteCmd::ExplainAnalyze => self.explain_active(true, cx),
+            PaletteCmd::Format => self.format_active(window, cx),
+            PaletteCmd::ExportCsv => self.export_active(ExportFormat::Csv, cx),
+            PaletteCmd::ExportJson => self.export_active(ExportFormat::Json, cx),
+            PaletteCmd::ExportInserts => self.export_active(ExportFormat::Inserts, cx),
+            PaletteCmd::CopyTsv => self.copy_active_tsv(cx),
             PaletteCmd::Cancel => self.cancel(cx),
             PaletteCmd::Refresh => self.connect_or_refresh(cx),
             PaletteCmd::Terminal => self.toggle_terminal(window, cx),

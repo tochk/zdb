@@ -1,0 +1,101 @@
+name: build
+
+# Build zdb natively on every OS × arch. GitHub now offers native runners for
+# all six combinations, so nothing is cross-compiled — each job builds on the
+# arch it targets (which sidesteps the macOS SDK / Apple-framework wall that
+# blocks cross-building macOS from Linux).
+#
+# Runner labels used:
+#   linux  x64   -> ubuntu-latest        arm64 -> ubuntu-24.04-arm
+#   windows x64  -> windows-latest        arm64 -> windows-11-arm
+#   macos  x64   -> macos-13 (Intel)      arm64 -> macos-14 (Apple Silicon)
+# The arm64 Linux/Windows runners are GA; a private repo needs them enabled.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64,     os: ubuntu-latest,    goos: linux,   goarch: amd64, sqls: sqls-linux-amd64,      bin: zdb }
+          - { name: linux-arm64,   os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, sqls: sqls-linux-arm64,      bin: zdb }
+          - { name: windows-x64,   os: windows-latest,   goos: windows, goarch: amd64, sqls: sqls-windows-amd64.exe, bin: zdb.exe }
+          - { name: windows-arm64, os: windows-11-arm,   goos: windows, goarch: arm64, sqls: sqls-windows-arm64.exe, bin: zdb.exe }
+          - { name: macos-x64,     os: macos-13,         goos: darwin,  goarch: amd64, sqls: sqls-darwin-amd64,     bin: zdb }
+          - { name: macos-arm64,   os: macos-14,         goos: darwin,  goarch: arm64, sqls: sqls-darwin-arm64,     bin: zdb }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # gpui (blade/Vulkan) build + link deps on Linux. macOS/Windows ship theirs.
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libfontconfig1-dev libvulkan-dev libgl1-mesa-dev
+
+      # `ring` (via rustls) assembles with nasm on Windows x64.
+      - name: Install nasm (Windows x64)
+        if: matrix.name == 'windows-x64'
+        uses: ilammy/setup-nasm@v1
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Go toolchain (for sqls)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      # Cross-builds sqls for all arches into dist/sqls/ (Go, fast). Uniform via
+      # bash on every runner (Git Bash on Windows).
+      - name: Build sqls
+        shell: bash
+        run: bash scripts/build-sqls.sh
+
+      - name: Build zdb (release)
+        run: cargo build -p zdb-app --release
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="zdb-${{ matrix.name }}"
+          mkdir -p "dist/$out"
+          cp "target/release/${{ matrix.bin }}" "dist/$out/"
+          # sqls next to the executable (zdb finds it there).
+          sqls_dst="sqls"; [ "${{ matrix.goos }}" = windows ] && sqls_dst="sqls.exe"
+          cp "dist/sqls/${{ matrix.sqls }}" "dist/$out/$sqls_dst"
+          chmod +x "dist/$out/$sqls_dst" || true
+          # Windows needs the runtime HLSL shaders next to the exe (vendored gpui
+          # reads them from <exe_dir>/shaders under our debug-assertions profile).
+          if [ "${{ matrix.goos }}" = windows ]; then
+            mkdir -p "dist/$out/shaders"
+            cp vendor/gpui/src/platform/windows/*.hlsl "dist/$out/shaders/"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zdb-${{ matrix.name }}
+          path: dist/zdb-${{ matrix.name }}
+          if-no-files-found: error

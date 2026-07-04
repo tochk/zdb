@@ -8,6 +8,7 @@ mod actor;
 mod config;
 mod edit;
 mod error;
+mod export;
 mod introspect;
 mod query;
 mod tls;
@@ -17,5 +18,9 @@ pub use actor::DbHandle;
 pub use config::{ConnectionConfig, SslMode};
 pub use edit::{build_batch, DescribedResult, EditTarget, RowEdit};
 pub use error::DbError;
-pub use introspect::{ColumnInfo, RelationInfo, RelationKind, SchemaInfo};
+pub use export::{to_csv, to_inserts, to_json, to_tsv, ExportFormat};
+pub use introspect::{
+    ColumnInfo, ConstraintInfo, IndexInfo, RelationDetail, RelationInfo, RelationKind, SchemaInfo,
+    SchemaObjects,
+};
 pub use types::{CellValue, ColumnMeta, ConnId, QueryEvent, Row};

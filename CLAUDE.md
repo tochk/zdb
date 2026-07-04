@@ -222,4 +222,66 @@ The WSL host can run Windows exes directly:
   - Opening a tab needs `&mut Window`; from windowless async contexts (the selftest) set
     `pending_open` and let `render()` consume it next frame.
 
+- **Schema tree is lazily nested** (`workspace/mod.rs` `SchemaNode`/`RelNode`, render in
+  `view.rs::render_sidebar` + `rel_node_view`/`detail_block`). Schema expand loads relations
+  **and** `schema_objects` (sequences + functions) via `DbHandle::schema_objects`. A relation
+  row has TWO click targets (like the tab strip): a chevron (`toggle_relation` → lazily
+  `load_relation_detail` = `DbHandle::relation_detail`, one round-trip doing columns + indexes
+  + constraints via `tokio::try_join!`) and the name (opens the table tab). New pg_catalog
+  queries live in `zdb-db/src/introspect.rs` (`INDEXES_SQL`/`CONSTRAINTS_SQL`/`SEQUENCES_SQL`/
+  `FUNCTIONS_SQL`); `RelationDetail`/`SchemaObjects`/`IndexInfo`/`ConstraintInfo` are the new
+  types, threaded through `actor.rs` (`IntrospectKind`/`Introspection`).
+
+- **Result export** (`zdb-db/src/export.rs`, pure fns `to_csv`/`to_json`/`to_inserts`/`to_tsv`
+  + `ExportFormat`): CSV/JSON/SQL-INSERTs to a file via the native save dialog
+  (`cx.prompt_for_new_path`), TSV to the clipboard (`cx.write_to_clipboard`). Toolbar
+  Export(=CSV)/Copy buttons + all formats in the palette. `export_active`/`copy_active_tsv`
+  read the ACTIVE tab; build the bytes while the tab is borrowed, then drop the borrow before
+  touching `self.status` (borrow-conflict trap). INSERT target = the Table tab's relation, else
+  `edit_target`, else `result` (`export_table_name`, a free fn).
+
+- **EXPLAIN** (`explain_active`): prefixes the active tab's SQL with `EXPLAIN ` /
+  `EXPLAIN (ANALYZE, BUFFERS) ` and runs via `run_sql` (NOT `run_new_query`, so it doesn't
+  clobber `base_sql`/sort). Clears `edit_target`/`edit_cols` first so plan rows aren't editable.
+  Toolbar "Explain" + palette (plain + analyze). ANALYZE actually executes the query.
+
+- **SQL editor extras**: `Format` button/palette → `sqlformat` crate (`util::format_sql`,
+  2-space, uppercased keywords) rewrites the editor via `InputState::set_value` (needs
+  `&mut Window`). Run / Ctrl+Enter runs the **statement under the cursor**, not the whole
+  editor: `util::statement_at(sql, cursor_byte_offset)` splits on top-level `;` honoring
+  `'`/`"` quotes, `--`/`/* */` comments, and `$tag$` dollar-quoting (`InputState::cursor()`
+  gives the byte offset). Keyword highlight is already provided by `code_editor("sql")`.
+
+- **Schema-aware completion = the bundled `sqls` LSP server, driven in-process** (`src/lsp.rs`).
+  NOT a homegrown completer and NOT a hand-rolled protocol server — it's a real LSP client to
+  the real `sqls` (Go) subprocess. Key points:
+  - gpui-component's `Input` has a built-in `CompletionProvider` trait (lsp_types-typed) + a
+    completion popup. We implement `SqlCompletion` and set it on every SQL editor's
+    `InputState` via `state.lsp.completion_provider = Some(Rc::new(...))` (a **pub** field).
+  - `LspHandle` (mirrors `DbHandle`): spawns `sqls -config <tmpfile>` with a **blocking reader
+    thread** (no tokio in zdb-app) that parses `Content-Length`-framed JSON-RPC and completes a
+    `futures_channel::oneshot` per request; the provider `.await`s that in `cx.background_spawn`.
+    Reader holds a `Weak<Inner>` so it never keeps the process alive (Drop kills the child →
+    stdout EOF → reader exits — avoids a kill/EOF deadlock). Handshake is **pipelined** (don't
+    block on the `initialize` reply; sqls processes in order). Full-text `didOpen`/`didChange`
+    sync, one URI per tab.
+  - `LspSlot = Rc<RefCell<Option<LspHandle>>>` on `Workspace`, shared into every editor's
+    provider; `start_lsp` fills it on connect (and switch), `None` = no completion (degrades
+    silently). sqls opens its **own** Postgres connection to introspect (a 2nd connection).
+  - **Password is NOT written to disk**: the temp config has host/port/user/db only; the
+    password goes to the subprocess via `PGPASSWORD` env (verified pgx honors it). Matches the
+    keychain policy.
+  - **Binary**: `scripts/build-sqls.sh` clones sqls and cross-builds all arches with Go
+    (`CGO_ENABLED=0`) — must first drop the two CGO-only blank imports (`godror` Oracle,
+    `mattn/go-sqlite3`); we only speak Postgres. Official releases are x86-64 only, hence
+    build-from-source (native Windows ARM64, the target). zdb finds `sqls[.exe]` next to its
+    own exe, else on PATH; `package-windows.sh` bundles `sqls.exe`.
+  - **Version trap**: gpui-component 0.5.1 pins `ropey = "=2.0.0-beta.1"` (its text engine —
+    already in the tree for every input). Do NOT add a direct `ropey` dep (it's a beta): name
+    the type via the re-export `gpui_component::Rope` in the `CompletionProvider` impl.
+    `lsp-types = "=0.97.0"` (stable) must match gpui-component's exactly. `background_spawn`
+    needs `use gpui::AppContext`.
+  - End-to-end test: `lsp::tests::completion_end_to_end`, gated on `ZDB_TEST_SQLS` (path to the
+    binary) + the `ZDB_TEST_*` Postgres env; polls the oneshot with `try_recv` (no executor).
+
 See the auto-memory under the Claude projects dir for the running phase log.

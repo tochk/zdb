@@ -6,7 +6,9 @@
 //! directly. Replies use channels that are runtime-agnostic to poll, so the
 //! GPUI side can `await` them from its own executor.
 
-use crate::introspect::{self, ColumnInfo, RelationInfo, SchemaInfo};
+use crate::introspect::{
+    self, ColumnInfo, RelationDetail, RelationInfo, SchemaInfo, SchemaObjects,
+};
 use crate::tls::make_connector;
 use crate::{
     edit, query, ConnectionConfig, ConnId, DbError, DescribedResult, EditTarget, QueryEvent, RowEdit,
@@ -21,6 +23,8 @@ enum IntrospectKind {
     Schemas,
     Relations { schema: String },
     Columns { schema: String, table: String },
+    RelationDetail { schema: String, table: String },
+    SchemaObjects { schema: String },
 }
 
 /// Result of an introspection request (variant matches the request kind).
@@ -28,6 +32,8 @@ enum Introspection {
     Schemas(Vec<SchemaInfo>),
     Relations(Vec<RelationInfo>),
     Columns(Vec<ColumnInfo>),
+    RelationDetail(RelationDetail),
+    SchemaObjects(SchemaObjects),
 }
 
 enum Command {
@@ -165,6 +171,43 @@ impl DbHandle {
             .await?
         {
             Introspection::Columns(v) => Ok(v),
+            _ => Err(DbError::WorkerGone),
+        }
+    }
+
+    /// Columns + indexes + constraints of a relation (one round-trip).
+    pub async fn relation_detail(
+        &self,
+        conn: ConnId,
+        schema: impl Into<String>,
+        table: impl Into<String>,
+    ) -> Result<RelationDetail, DbError> {
+        match self
+            .introspect(
+                conn,
+                IntrospectKind::RelationDetail {
+                    schema: schema.into(),
+                    table: table.into(),
+                },
+            )
+            .await?
+        {
+            Introspection::RelationDetail(d) => Ok(d),
+            _ => Err(DbError::WorkerGone),
+        }
+    }
+
+    /// Sequences + functions of a schema.
+    pub async fn schema_objects(
+        &self,
+        conn: ConnId,
+        schema: impl Into<String>,
+    ) -> Result<SchemaObjects, DbError> {
+        match self
+            .introspect(conn, IntrospectKind::SchemaObjects { schema: schema.into() })
+            .await?
+        {
+            Introspection::SchemaObjects(o) => Ok(o),
             _ => Err(DbError::WorkerGone),
         }
     }
@@ -321,6 +364,12 @@ async fn run_introspect(client: &Client, kind: IntrospectKind) -> Result<Introsp
         }
         IntrospectKind::Columns { schema, table } => {
             Introspection::Columns(introspect::columns(client, &schema, &table).await?)
+        }
+        IntrospectKind::RelationDetail { schema, table } => Introspection::RelationDetail(
+            introspect::relation_detail(client, &schema, &table).await?,
+        ),
+        IntrospectKind::SchemaObjects { schema } => {
+            Introspection::SchemaObjects(introspect::schema_objects(client, &schema).await?)
         }
     })
 }

@@ -36,6 +36,23 @@ cp "$EXE" "$OUT/zdb.exe"
 mkdir -p "$OUT/shaders"
 cp "$ROOT"/vendor/gpui/src/platform/windows/*.hlsl "$OUT/shaders/"
 
+# Bundle the `sqls` SQL language server (built by scripts/build-sqls.sh) for
+# schema-aware completion. zdb finds it next to zdb.exe. Optional — the app runs
+# fine without it, just with no completion.
+case "$ARCH" in
+  arm64) SQLS_NAME=sqls-windows-arm64.exe ;;
+  x64)   SQLS_NAME=sqls-windows-amd64.exe ;;
+  *)     SQLS_NAME="" ;;
+esac
+SQLS_BIN="$ROOT/dist/sqls/$SQLS_NAME"
+if [ -n "$SQLS_NAME" ] && [ -f "$SQLS_BIN" ]; then
+  cp "$SQLS_BIN" "$OUT/sqls.exe"
+  echo "bundled sqls: $SQLS_NAME -> sqls.exe"
+else
+  echo "NOTE: sqls binary not found ($SQLS_BIN) — SQL completion will be disabled."
+  echo "      Run scripts/build-sqls.sh first to bundle it."
+fi
+
 # Bundle any required runtime DLLs from the matching llvm-mingw arch directory.
 if [ -n "$THIRD_PARTY" ]; then
   case "$TARGET" in
@@ -72,11 +89,19 @@ CONNECT
 
 USE
   - Schema tree on the left: expand a schema, double-click a table to open its
-    rows. The WHERE bar filters; click a column header to ORDER BY it.
-  - Query editor up top: Ctrl+Enter runs. Ctrl+Shift+E opens the auto-saved
-    scratch editor. Ctrl+Shift+P opens the command palette. Ctrl+` opens a
-    terminal. Edit a cell by double-clicking; "Add row" inserts. Pending edits
-    show the generated SQL before applying.
+    rows. Expand a table (chevron) to see its columns, indexes and constraints;
+    schemas also list their sequences and functions. The WHERE bar filters;
+    click a column header to ORDER BY it.
+  - Query editor up top: Ctrl+Enter runs the statement under the cursor. Type to
+    get schema-aware completion (needs sqls.exe, bundled here). "Explain" shows
+    the query plan; "Format" pretty-prints; "Export" writes CSV/JSON/SQL and
+    "Copy" puts the result on the clipboard (more formats in the palette).
+    Ctrl+Shift+E opens the auto-saved scratch editor. Ctrl+Shift+P opens the
+    command palette. Ctrl+` opens a terminal. Edit a cell by double-clicking;
+    "Add row" inserts. Pending edits show the generated SQL before applying.
+
+  sqls.exe (bundled) is the SQL language server that powers completion; it opens
+  its own read connection to your database. Delete it to disable completion.
 EOF
 
 ( cd "$ROOT/dist" && zip -r -q "zdb-windows-$ARCH.zip" "zdb-windows-$ARCH" )

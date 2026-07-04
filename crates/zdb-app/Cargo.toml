@@ -17,6 +17,13 @@ portable-pty.workspace = true
 zdb-db = { path = "../zdb-db" }
 zdb-config = { path = "../zdb-config" }
 anyhow.workspace = true
+sqlformat.workspace = true
+# lsp-types 0.97.0 (stable) matches gpui-component's, so our CompletionProvider
+# impl names the same types. The Rope type comes via gpui-component's re-export
+# (`gpui_component::Rope`) so we don't declare its beta `ropey` ourselves.
+lsp-types = "=0.97.0"
+serde_json.workspace = true
+futures-channel = "0.3"
 
 [build-dependencies]
 embed-resource = "3"
