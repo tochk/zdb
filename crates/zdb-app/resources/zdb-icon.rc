@@ -1,0 +1,6 @@
+/* Icon only. On a NATIVE Windows build gpui embeds its own Common-Controls
+   manifest (its build script's windows-manifest path runs on a Windows host);
+   embedding a second manifest here collides (CVT1100 "duplicate resource" under
+   MSVC's CVTRES). We still want the app icon, so this variant carries just that.
+   The manifest-bearing zdb.rc is used when cross-compiling, where gpui skips it. */
+1 ICON "zdb.ico"

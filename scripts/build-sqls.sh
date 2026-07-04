@@ -24,9 +24,11 @@ fi
 cd "$SRC"
 
 # Drop the CGO-only drivers we don't use so a static, cross-compilable build is
-# possible. Idempotent (sed no-ops if the lines are already gone).
-sed -i '/_ "github.com\/godror\/godror"/d' internal/database/oracle.go
-sed -i '/_ "github.com\/mattn\/go-sqlite3"/d' internal/database/sqlite3.go
+# possible. `perl -i` (not `sed -i`) so this works identically on GNU/Linux, BSD
+# sed's host (macOS), and Git Bash — macOS `sed -i` needs a backup-suffix arg and
+# would otherwise fail. Idempotent (removes matching lines, no-op if already gone).
+perl -i -ne 'print unless m{_ "github.com/godror/godror"}' internal/database/oracle.go
+perl -i -ne 'print unless m{_ "github.com/mattn/go-sqlite3"}' internal/database/sqlite3.go
 
 mkdir -p "$OUT"
 # os arch outname

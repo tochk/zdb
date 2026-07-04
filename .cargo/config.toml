@@ -12,3 +12,14 @@ ar = "x86_64-w64-mingw32-ar"
 linker = "/home/tochk/.local/llvm-mingw/bin/aarch64-w64-mingw32-clang"
 ar = "/home/tochk/.local/llvm-mingw/bin/llvm-ar"
 rustflags = ["-C", "link-arg=-static"]
+
+# Native MSVC builds (used by CI). `build.rs` (embed-resource) already embeds our
+# Common-Controls v6 manifest as a resource; MSVC's `link.exe` also auto-embeds a
+# default manifest, and the two collide (CVT1100 "duplicate resource" -> LNK1123).
+# `/MANIFEST:NO` stops the linker adding its own, keeping only ours. (The local
+# gnullvm/lld path doesn't add a default manifest, so it never hit this.)
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/MANIFEST:NO"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/MANIFEST:NO"]
