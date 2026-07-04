@@ -26,7 +26,10 @@ use futures_channel::oneshot;
 use gpui::{AppContext as _, Context, Task, Window};
 use gpui_component::input::{CompletionProvider, InputState};
 use gpui_component::{Rope, RopeExt};
-use lsp_types::{CompletionContext, CompletionResponse};
+use lsp_types::{
+    CompletionContext, CompletionItem, CompletionResponse, CompletionTextEdit, Position, Range,
+    TextEdit,
+};
 use serde_json::{json, Value};
 use zdb_db::{ConnectionConfig, SslMode};
 
@@ -91,6 +94,14 @@ impl LspHandle {
             .stderr(Stdio::null());
         if let Some(pw) = password {
             cmd.env("PGPASSWORD", pw);
+        }
+        // sqls is a console subprocess; without this a GUI-subsystem zdb.exe pops
+        // a visible console window for it on Windows. CREATE_NO_WINDOW hides it.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
         }
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
@@ -264,6 +275,42 @@ pub fn write_config(cfg: &ConnectionConfig) -> std::io::Result<PathBuf> {
 
 // ---- completion provider -------------------------------------------------
 
+/// Byte offset of the start of the identifier (`[A-Za-z0-9_]`) ending at
+/// `offset`. Returns `offset` when the char before the cursor isn't an
+/// identifier char (empty word).
+fn word_start(text: &str, offset: usize) -> usize {
+    let b = text.as_bytes();
+    let mut i = offset.min(b.len());
+    while i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_') {
+        i -= 1;
+    }
+    i
+}
+
+/// Give every completion item an explicit `textEdit` replacing `start..end`
+/// (the typed word) with the completion text, so the editor replaces the prefix
+/// instead of inserting after it. Uses the item's `insert_text` if present, else
+/// its `label`.
+fn with_word_range(resp: CompletionResponse, start: Position, end: Position) -> CompletionResponse {
+    let fix = |item: &mut CompletionItem| {
+        let new_text = item.insert_text.take().unwrap_or_else(|| item.label.clone());
+        item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+            range: Range { start, end },
+            new_text,
+        }));
+    };
+    match resp {
+        CompletionResponse::Array(mut items) => {
+            items.iter_mut().for_each(fix);
+            CompletionResponse::Array(items)
+        }
+        CompletionResponse::List(mut list) => {
+            list.items.iter_mut().for_each(fix);
+            CompletionResponse::List(list)
+        }
+    }
+}
+
 /// A per-editor `CompletionProvider` that forwards to the shared `sqls` handle.
 /// Each editor gets a unique document URI so the server tracks them separately.
 pub struct SqlCompletion {
@@ -300,6 +347,13 @@ impl CompletionProvider for SqlCompletion {
         };
         let pos = rope.offset_to_position(offset);
         let text = rope.to_string();
+        // The span the completion should replace = the identifier being typed
+        // (word start .. cursor). sqls returns bare `label`s with no textEdit, so
+        // gpui-component would fall back to its own trigger-offset range — which
+        // mis-replaces and duplicates/eats characters. We attach an explicit
+        // textEdit over this range so insertion is deterministic.
+        let start_pos = rope.offset_to_position(word_start(&text, offset));
+        let end_pos = pos;
         // Full-text sync: open once, then change on every request.
         if self.opened.swap(true, Ordering::Relaxed) {
             handle.did_change(&self.uri, &text);
@@ -308,11 +362,12 @@ impl CompletionProvider for SqlCompletion {
         }
         let rx = handle.completion(&self.uri, pos.line, pos.character);
         cx.background_spawn(async move {
-            match rx.await {
-                Ok(v) => Ok(serde_json::from_value::<CompletionResponse>(v)
-                    .unwrap_or(CompletionResponse::Array(vec![]))),
-                Err(_) => Ok(CompletionResponse::Array(vec![])),
-            }
+            let resp = match rx.await {
+                Ok(v) => serde_json::from_value::<CompletionResponse>(v)
+                    .unwrap_or(CompletionResponse::Array(vec![])),
+                Err(_) => CompletionResponse::Array(vec![]),
+            };
+            Ok(with_word_range(resp, start_pos, end_pos))
         })
     }
 
@@ -382,6 +437,63 @@ mod tests {
                 }
                 Err(_) => panic!("completion channel cancelled"),
             }
+        }
+    }
+
+    #[test]
+    fn word_start_finds_identifier_start() {
+        assert_eq!(word_start("SELECT * FROM zdb_sel", 21), 14); // "zdb_sel"
+        assert_eq!(word_start("abc", 3), 0);
+        assert_eq!(word_start("a.b", 3), 2); // '.' breaks the word
+        assert_eq!(word_start("SELECT ", 7), 7); // trailing space -> empty word
+        assert_eq!(word_start("", 0), 0);
+        assert_eq!(word_start("id123", 5), 0);
+    }
+
+    fn pos(line: u32, character: u32) -> Position {
+        Position { line, character }
+    }
+
+    #[test]
+    fn with_word_range_rewrites_label_items() {
+        // A bare label item (what sqls sends) must come back with a textEdit that
+        // replaces the typed word — otherwise the editor duplicates the prefix.
+        let start = pos(0, 14);
+        let end = pos(0, 21);
+        let items = vec![CompletionItem {
+            label: "zdb_selftest".into(),
+            ..Default::default()
+        }];
+        let resp = with_word_range(CompletionResponse::Array(items), start, end);
+        let CompletionResponse::Array(items) = resp else {
+            panic!("expected array");
+        };
+        let it = &items[0];
+        assert!(it.insert_text.is_none());
+        match it.text_edit.as_ref().expect("text_edit set") {
+            CompletionTextEdit::Edit(e) => {
+                assert_eq!(e.new_text, "zdb_selftest");
+                assert_eq!(e.range.start, start);
+                assert_eq!(e.range.end, end);
+            }
+            other => panic!("expected Edit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_word_range_prefers_insert_text() {
+        let items = vec![CompletionItem {
+            label: "display".into(),
+            insert_text: Some("insert_me".into()),
+            ..Default::default()
+        }];
+        let resp = with_word_range(CompletionResponse::Array(items), pos(0, 0), pos(0, 3));
+        let CompletionResponse::Array(items) = resp else {
+            panic!("expected array");
+        };
+        match items[0].text_edit.as_ref().unwrap() {
+            CompletionTextEdit::Edit(e) => assert_eq!(e.new_text, "insert_me"),
+            _ => panic!("expected Edit"),
         }
     }
 }

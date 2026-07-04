@@ -222,15 +222,19 @@ The WSL host can run Windows exes directly:
   - Opening a tab needs `&mut Window`; from windowless async contexts (the selftest) set
     `pending_open` and let `render()` consume it next frame.
 
-- **Schema tree is lazily nested** (`workspace/mod.rs` `SchemaNode`/`RelNode`, render in
-  `view.rs::render_sidebar` + `rel_node_view`/`detail_block`). Schema expand loads relations
-  **and** `schema_objects` (sequences + functions) via `DbHandle::schema_objects`. A relation
-  row has TWO click targets (like the tab strip): a chevron (`toggle_relation` → lazily
-  `load_relation_detail` = `DbHandle::relation_detail`, one round-trip doing columns + indexes
-  + constraints via `tokio::try_join!`) and the name (opens the table tab). New pg_catalog
-  queries live in `zdb-db/src/introspect.rs` (`INDEXES_SQL`/`CONSTRAINTS_SQL`/`SEQUENCES_SQL`/
-  `FUNCTIONS_SQL`); `RelationDetail`/`SchemaObjects`/`IndexInfo`/`ConstraintInfo` are the new
-  types, threaded through `actor.rs` (`IntrospectKind`/`Introspection`).
+- **Schema tree is a lazily-loaded hierarchy** database → schema → relation → columns
+  (`workspace/mod.rs` `SchemaNode`/`RelNode` + `db_expanded`; render in
+  `view.rs::render_sidebar` + `rel_node_view`/`columns_block`). A `db_expanded` **database
+  root** node (the connection's `dbname`) holds the schemas. A relation row has TWO click
+  targets (like the tab strip, to avoid the nested-`on_click`-fires-both trap): a leading
+  chevron/spacer and the name (opens the tab). **Only tables expand** (`toggle_relation` bails
+  unless `RelationKind::Table`); expanding lazily loads columns via `DbHandle::relation_detail`
+  (`tokio::try_join!` of columns+indexes+constraints — indexes/constraints are fetched but not
+  currently rendered) and shows them as `column_leaf` rows (name + dim type + `PK`). Shared row
+  helpers: `tree_row`/`indent_guide`/`chevron_icon`. New pg_catalog queries + types
+  (`RelationDetail`/`SchemaObjects`/`IndexInfo`/`ConstraintInfo`) live in
+  `zdb-db/src/introspect.rs`, threaded through `actor.rs`. (`schema_objects` = sequences +
+  functions is still fetched but no longer shown — kept for a future object tree.)
 
 - **Result export** (`zdb-db/src/export.rs`, pure fns `to_csv`/`to_json`/`to_inserts`/`to_tsv`
   + `ExportFormat`): CSV/JSON/SQL-INSERTs to a file via the native save dialog
@@ -268,6 +272,13 @@ The WSL host can run Windows exes directly:
   - `LspSlot = Rc<RefCell<Option<LspHandle>>>` on `Workspace`, shared into every editor's
     provider; `start_lsp` fills it on connect (and switch), `None` = no completion (degrades
     silently). sqls opens its **own** Postgres connection to introspect (a 2nd connection).
+  - **Hide the console**: sqls is a console subprocess; spawn sets `CREATE_NO_WINDOW`
+    (`0x0800_0000`) via `creation_flags` on Windows, else a console window pops next to the app.
+  - **Insertion fix (dup/eaten chars)**: sqls returns bare `label`s (no `insertText`/`textEdit`),
+    so gpui-component's menu falls back to its own trigger-offset range and duplicates/eats the
+    typed prefix. `with_word_range` rewrites every item with an explicit `textEdit` over
+    `word_start(text,cursor)..cursor`, so the editor replaces the typed word deterministically.
+    Tested by `word_start`/`with_word_range` units + the `completion_end_to_end` gate.
   - **Password is NOT written to disk**: the temp config has host/port/user/db only; the
     password goes to the subprocess via `PGPASSWORD` env (verified pgx honors it). Matches the
     keychain policy.

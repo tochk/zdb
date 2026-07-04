@@ -167,6 +167,8 @@ pub struct Workspace {
     conn: Option<ConnId>,
     status: String,
     tree: Vec<SchemaNode>,
+    /// Whether the database root node in the schema tree is expanded.
+    db_expanded: bool,
 
     /// Open center tabs and the index of the active one (None = welcome pane).
     tabs: Vec<Tab>,
@@ -249,6 +251,7 @@ impl Workspace {
             conn: None,
             status: "Not connected".into(),
             tree: Vec::new(),
+            db_expanded: true,
             tabs: Vec::new(),
             active: None,
             next_tab_id: 1,
@@ -648,8 +651,14 @@ impl Workspace {
         .detach();
     }
 
-    /// Expand/collapse a relation node, lazily loading its columns / indexes /
-    /// constraints on first expand.
+    /// Toggle the database root node (schemas hang under it).
+    fn toggle_db_root(&mut self, cx: &mut Context<Self>) {
+        self.db_expanded = !self.db_expanded;
+        cx.notify();
+    }
+
+    /// Expand/collapse a table node, lazily loading its columns on first expand.
+    /// Only tables expand (columns are shown for tables only).
     fn toggle_relation(&mut self, schema_ix: usize, rel_ix: usize, cx: &mut Context<Self>) {
         let Some(schema) = self.tree.get(schema_ix) else { return };
         let schema_name = schema.name.clone();
@@ -661,6 +670,9 @@ impl Workspace {
         else {
             return;
         };
+        if node.kind != RelationKind::Table {
+            return;
+        }
         node.expanded = !node.expanded;
         let need_load = node.expanded && node.detail.is_none();
         let table = node.name.clone();
@@ -771,8 +783,8 @@ impl Workspace {
     }
 
     /// Run `EXPLAIN` (or `EXPLAIN (ANALYZE, BUFFERS)`) on the active tab's SQL and
-    /// show the text plan in the grid. Plain EXPLAIN does not execute the query;
-    /// ANALYZE does. Marks the result read-only (plan rows aren't editable).
+    /// show the text plan in a dedicated plan view (not the results grid). Plain
+    /// EXPLAIN does not execute the query; ANALYZE does.
     fn explain_active(&mut self, analyze: bool, cx: &mut Context<Self>) {
         let sql = self.active_sql(cx).trim().trim_end_matches(';').to_string();
         if sql.is_empty() {
@@ -786,14 +798,72 @@ impl Workspace {
         } else {
             "EXPLAIN "
         };
-        // Plan rows are not editable; drop stale editability so render_td can't
-        // offer to edit a "QUERY PLAN" cell.
-        if let Some(tab) = self.tab_mut(id) {
-            tab.edit_target = None;
-            tab.edit_cols.clear();
-            tab.editing = None;
+        self.run_explain(id, format!("{prefix}{sql}"), cx);
+    }
+
+    /// Execute an `EXPLAIN …` query and collect the `QUERY PLAN` text into the
+    /// tab's plan view (leaves the grid untouched).
+    fn run_explain(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
+        let Some(conn) = self.conn else {
+            self.status = "Not connected".into();
+            cx.notify();
+            return;
+        };
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.running = true;
         }
-        self.run_sql(id, format!("{prefix}{sql}"), cx);
+        self.status = "Explaining…".into();
+        log(format!("explain: {sql}"));
+        let db = self.db.clone();
+        let logged = sql.clone();
+        cx.spawn(async move |this, cx| {
+            let mut rx = db.query(conn, sql);
+            let mut lines: Vec<String> = Vec::new();
+            let mut error: Option<String> = None;
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    QueryEvent::Rows(rows) => {
+                        for row in rows {
+                            // Single "QUERY PLAN" column of text.
+                            if let Some(CellValue::Text(s)) = row.into_iter().next() {
+                                lines.push(s);
+                            }
+                        }
+                    }
+                    QueryEvent::Failed(e) => error = Some(e.to_string()),
+                    _ => {}
+                }
+            }
+            this.update(cx, |this, cx| {
+                let Some(tab) = this.tab_mut(tab_id) else { return };
+                tab.running = false;
+                match error {
+                    Some(e) => {
+                        tab.plan = Some(format!("Error: {e}"));
+                        this.push_log(&logged, false);
+                        this.status = format!("Error: {e}");
+                    }
+                    None => {
+                        let n = lines.len();
+                        tab.plan = Some(lines.join("\n"));
+                        this.push_log(&logged, true);
+                        this.status = format!("Plan: {n} line(s)");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Dismiss the plan view, back to the tab's normal editor / results.
+    fn close_plan(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.plan = None;
+        }
+        cx.notify();
     }
 
     /// Re-run a tab's current query/table from the DB (discards staged edits).
@@ -816,6 +886,7 @@ impl Workspace {
             tab.current_row = None;
             tab.pending.clear();
             tab.edited_cells.clear();
+            tab.plan = None;
             tab.table.clone()
         };
         // Drop the Table widget's own row highlight; otherwise the previously
