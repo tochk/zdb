@@ -13,7 +13,6 @@ name: build
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -84,12 +83,6 @@ jobs:
           sqls_dst="sqls"; [ "${{ matrix.goos }}" = windows ] && sqls_dst="sqls.exe"
           cp "dist/sqls/${{ matrix.sqls }}" "dist/$out/$sqls_dst"
           chmod +x "dist/$out/$sqls_dst" || true
-          # Windows needs the runtime HLSL shaders next to the exe (vendored gpui
-          # reads them from <exe_dir>/shaders under our debug-assertions profile).
-          if [ "${{ matrix.goos }}" = windows ]; then
-            mkdir -p "dist/$out/shaders"
-            cp vendor/gpui/src/platform/windows/*.hlsl "dist/$out/shaders/"
-          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

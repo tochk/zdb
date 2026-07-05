@@ -237,6 +237,9 @@ pub(crate) struct Tab {
     pub(crate) edited_cells: HashSet<(usize, usize)>,
 
     pub(crate) running: bool,
+
+    /// When set, an EXPLAIN plan to show in its own text view instead of the grid.
+    pub(crate) plan: Option<String>,
 }
 
 pub(crate) fn make_grid(
@@ -298,6 +301,7 @@ impl Tab {
             pending: Vec::new(),
             edited_cells: HashSet::new(),
             running: false,
+            plan: None,
         }
     }
 

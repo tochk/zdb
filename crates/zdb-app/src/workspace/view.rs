@@ -4,84 +4,15 @@
 //! directly — no visibility bumps needed.
 
 use super::*;
+use gpui::{AnyElement, MouseButton, MouseDownEvent, WeakEntity};
+use gpui_component::list::ListItem;
+use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_component::tree::{tree, TreeEntry};
+use gpui_component::ActiveTheme;
 
 impl Workspace {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
-        let mut list = v_flex().p_1().gap(px(1.));
-        for (ix, node) in self.tree.iter().enumerate() {
-            let chevron = if node.expanded {
-                "icons/chevron-down.svg"
-            } else {
-                "icons/chevron-right.svg"
-            };
-            list = list.child(
-                div()
-                    .id(SharedString::from(format!("schema-{ix}")))
-                    .flex()
-                    .items_center()
-                    .px_1()
-                    .py(px(3.))
-                    .gap_1p5()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_color(c.fg)
-                    .text_sm()
-                    .hover(|s| s.bg(c.hover))
-                    .child(tree_icon(chevron, c.fg_dim))
-                    .child(tree_icon("icons/database.svg", c.accent))
-                    .child(node.name.clone())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.toggle_schema(ix, cx)
-                    })),
-            );
-            if node.expanded {
-                let children = match &node.relations {
-                    None => v_flex()
-                        .child(tree_leaf_text("loading…", c))
-                        .into_any_element(),
-                    Some(rels) => {
-                        let schema = node.name.clone();
-                        let mut kids = v_flex().gap(px(1.));
-                        if rels.is_empty() {
-                            kids = kids.child(tree_leaf_text("(no tables)", c));
-                        }
-                        for (rix, rel) in rels.iter().enumerate() {
-                            kids = kids.child(rel_node_view(ix, rix, rel, &schema, c, cx));
-                        }
-                        // Schema-level objects below the relations.
-                        if let Some(objs) = &node.objects {
-                            if !objs.sequences.is_empty() {
-                                kids = kids.child(sub_label("SEQUENCES", c));
-                                for name in &objs.sequences {
-                                    kids = kids.child(detail_leaf(c, name.clone(), String::new()));
-                                }
-                            }
-                            if !objs.functions.is_empty() {
-                                kids = kids.child(sub_label("FUNCTIONS", c));
-                                for sig in &objs.functions {
-                                    kids = kids.child(detail_leaf(c, sig.clone(), String::new()));
-                                }
-                            }
-                        }
-                        kids.into_any_element()
-                    }
-                };
-                // Indent + vertical guide line, like Zed's file explorer.
-                list = list.child(
-                    div()
-                        .pl(px(10.))
-                        .child(
-                            div()
-                                .pl(px(8.))
-                                .border_l_1()
-                                .border_color(c.border)
-                                .child(children),
-                        ),
-                );
-            }
-        }
-
         let connected = self.conn.is_some();
         let title = self
             .cfg
@@ -132,19 +63,52 @@ impl Workspace {
             )
             .child(actions);
 
+        // Zed-style filter box: narrows the tree to matching relations.
+        let filter = connected.then(|| {
+            h_flex()
+                .px_2()
+                .py_1()
+                .gap_1p5()
+                .items_center()
+                .border_b_1()
+                .border_color(c.border)
+                .child(tree_icon("icons/search.svg", c.fg_dim))
+                .child(
+                    div()
+                        .flex_1()
+                        .child(Input::new(&self.filter_input).appearance(false).small()),
+                )
+        });
+
+        let body: AnyElement = if connected {
+            let weak = cx.weak_entity();
+            div()
+                .flex_grow()
+                .min_h(px(0.))
+                .on_action(cx.listener(|this, _: &TreeOpenSelected, window, cx| {
+                    this.open_selected_tree_node(window, cx)
+                }))
+                .child(tree(&self.tree_state, move |ix, entry, selected, window, cx| {
+                    schema_tree_row(ix, entry, selected, &weak, window, cx)
+                }))
+                .into_any_element()
+        } else {
+            div()
+                .p_3()
+                .text_sm()
+                .text_color(c.fg_dim)
+                .child("Not connected")
+                .into_any_element()
+        };
+
         v_flex()
             .size_full()
             .bg(c.sidebar)
             .border_r_1()
             .border_color(c.border)
             .child(header)
-            .child(
-                div()
-                    .id("schema-scroll")
-                    .flex_grow()
-                    .overflow_y_scroll()
-                    .child(list),
-            )
+            .children(filter)
+            .child(body)
     }
 
     fn render_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -380,11 +344,17 @@ impl Workspace {
                     .child(div().flex_grow().child(Input::new(&tab.where_input))),
             );
         }
-        results = results.child(
-            div()
-                .size_full()
-                .child(Table::new(&tab.table).stripe(true).bordered(true)),
-        );
+        // The results area shows the grid, or — after EXPLAIN — the plan text in
+        // that same place (query data vs. plan, same spot).
+        results = if let Some(plan) = &tab.plan {
+            results.child(Self::plan_view(tab_id, plan, c, cx))
+        } else {
+            results.child(
+                div()
+                    .size_full()
+                    .child(Table::new(&tab.table).stripe(true).bordered(true)),
+            )
+        };
 
         // Table tabs hide the redundant generated `SELECT *` editor and let the
         // rows fill the pane; Query / Scratch keep the editor above the results.
@@ -403,6 +373,61 @@ impl Workspace {
         };
 
         v_flex().size_full().bg(c.center).child(toolbar).child(body)
+    }
+
+    /// The EXPLAIN plan view: a header with a close button and a scrollable
+    /// monospace body (one row per plan line, horizontally scrollable so long
+    /// lines aren't clipped).
+    fn plan_view(tab_id: u64, plan: &str, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let mono = cx.theme().mono_font_family.clone();
+        let mut lines = v_flex().p_2().gap(px(1.));
+        for line in plan.lines() {
+            lines = lines.child(
+                div()
+                    .whitespace_nowrap()
+                    .text_color(c.fg)
+                    .child(line.to_string()),
+            );
+        }
+        v_flex()
+            .size_full()
+            .bg(c.center)
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .items_center()
+                    .justify_between()
+                    .bg(c.header)
+                    .border_b_1()
+                    .border_color(c.border)
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(c.fg_dim)
+                            .child("QUERY PLAN"),
+                    )
+                    .child(
+                        Button::new("close-plan")
+                            .icon(Icon::empty().path("icons/close.svg").text_color(c.fg))
+                            .tooltip("Close plan")
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.close_plan(tab_id, cx)
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("plan-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_x_scroll()
+                    .overflow_y_scroll()
+                    .text_sm()
+                    .font_family(mono)
+                    .child(lines),
+            )
     }
 
     fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -993,6 +1018,12 @@ impl Render for Workspace {
         if let Some((schema, table)) = self.pending_open.take() {
             self.open_table_tab(schema, table, window, cx);
         }
+        // Filter cleared from a window-less context (connection switch).
+        if self.pending_clear_filter {
+            self.pending_clear_filter = false;
+            self.filter_input
+                .update(cx, |i, cx| i.set_value("", window, cx));
+        }
         let center = self.render_center(cx).into_any_element();
         let mut top = h_resizable("zdb-top")
             .child(
@@ -1133,154 +1164,191 @@ fn tree_icon(path: &'static str, color: Hsla) -> impl IntoElement {
     Icon::empty().path(path).text_color(color).small()
 }
 
-/// Muted placeholder leaf text ("loading…", "(no tables)") inside a schema.
-fn tree_leaf_text(s: &'static str, c: Colors) -> impl IntoElement {
-    div().pl_2().py(px(2.)).text_sm().text_color(c.fg_dim).child(s)
-}
-
-/// One relation row: a clickable chevron (expand → columns/indexes/constraints)
-/// and a clickable name (open the table in a tab). When expanded, the detail
-/// leaves render indented below.
-fn rel_node_view(
-    schema_ix: usize,
-    rel_ix: usize,
-    rel: &RelNode,
-    schema: &str,
-    c: Colors,
-    cx: &mut Context<Workspace>,
-) -> impl IntoElement {
-    let chevron = if rel.expanded {
+fn chevron_icon(expanded: bool) -> &'static str {
+    if expanded {
         "icons/chevron-down.svg"
     } else {
         "icons/chevron-right.svg"
+    }
+}
+
+/// One virtualized row of the schema tree, Zed project-panel style: an indent
+/// guide per ancestor depth, chevron for folders, kind icon, dim meta text.
+/// Relation rows open in a tab from a name mouse-down (its own target that
+/// stops propagation, so it doesn't also fire the widget's select+toggle);
+/// right-click opens a per-kind context menu.
+fn schema_tree_row(
+    ix: usize,
+    entry: &TreeEntry,
+    _selected: bool,
+    weak: &WeakEntity<Workspace>,
+    _window: &mut Window,
+    cx: &mut App,
+) -> ListItem {
+    let c = palette(cx);
+    let item = entry.item();
+    let (meta, tree_state) = match weak.upgrade() {
+        Some(ws) => {
+            let ws = ws.read(cx);
+            (ws.node_meta.get(&item.id).cloned(), Some(ws.tree_state.clone()))
+        }
+        None => (None, None),
     };
-    let s_open = schema.to_string();
-    let t_open = rel.name.clone();
-    let row = div()
-        .flex()
+
+    // Continuous vertical guides: one 12px column per ancestor depth (rows are
+    // uniform-height so the 1px rules line up across rows).
+    let mut guides = h_flex().h_full().flex_shrink_0();
+    for _ in 0..entry.depth() {
+        guides = guides.child(
+            div()
+                .w(px(12.))
+                .h_full()
+                .flex_shrink_0()
+                .child(div().w(px(1.)).h_full().ml(px(5.)).bg(c.border)),
+        );
+    }
+
+    let mut row = h_flex()
+        .h_full()
+        .flex_1()
+        .min_w(px(0.))
         .items_center()
-        .pl_1()
-        .pr_1()
-        .py(px(3.))
         .gap_1p5()
-        .rounded_md()
-        .text_sm()
-        .text_color(c.fg)
-        .hover(|s| s.bg(c.hover))
-        // Chevron toggles the detail; a separate sibling from the open target so
-        // a click resolves to exactly one action.
-        .child(
-            div()
-                .id(SharedString::from(format!("rel-tog-{schema_ix}-{rel_ix}")))
-                .cursor_pointer()
-                .child(tree_icon(chevron, c.fg_dim))
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.toggle_relation(schema_ix, rel_ix, cx)
-                })),
-        )
-        .child(
-            div()
-                .id(SharedString::from(format!("rel-open-{schema_ix}-{rel_ix}")))
-                .flex()
-                .flex_1()
-                .items_center()
-                .gap_1p5()
-                .cursor_pointer()
-                .child(tree_icon(rel_icon(rel.kind), c.fg_dim))
-                .child(rel.name.clone())
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.open_table_tab(s_open.clone(), t_open.clone(), window, cx)
-                })),
-        );
+        .overflow_hidden();
+    row = row.child(if entry.is_folder() {
+        tree_icon(chevron_icon(entry.is_expanded()), c.fg_dim).into_any_element()
+    } else {
+        div().w(px(14.)).flex_shrink_0().into_any_element()
+    });
 
-    if !rel.expanded {
-        return v_flex().child(row).into_any_element();
-    }
-    // Indent the detail under the relation, with its own guide line.
-    let detail = div()
-        .pl(px(12.))
-        .child(
+    row = match &meta {
+        Some(NodeMeta::Db) => row
+            .child(tree_icon("icons/database.svg", c.accent))
+            .child(div().truncate().child(item.label.clone())),
+        Some(NodeMeta::Schema { .. }) => row
+            .child(tree_icon("icons/table.svg", c.fg_dim))
+            .child(div().truncate().child(item.label.clone())),
+        Some(NodeMeta::Rel { schema, name, kind }) => {
+            let open = {
+                let weak = weak.clone();
+                let ts = tree_state.clone();
+                let (s, t) = (schema.clone(), name.clone());
+                move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                    // Keep the widget's row handler (select+toggle) from also
+                    // firing; select manually, then open the tab.
+                    cx.stop_propagation();
+                    if let Some(ts) = &ts {
+                        ts.update(cx, |ts, cx| ts.set_selected_index(Some(ix), cx));
+                    }
+                    weak.update(cx, |this, cx| {
+                        this.open_table_tab(s.clone(), t.clone(), window, cx)
+                    })
+                    .ok();
+                }
+            };
+            row.child(
+                h_flex()
+                    .id(("rel-open", ix))
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .items_center()
+                    .gap_1p5()
+                    .cursor_pointer()
+                    .child(tree_icon(rel_icon(*kind), c.fg_dim))
+                    .child(div().truncate().child(name.clone()))
+                    .on_mouse_down(MouseButton::Left, open),
+            )
+        }
+        Some(NodeMeta::Group) => row.child(
             div()
-                .pl(px(6.))
-                .border_l_1()
-                .border_color(c.border)
-                .child(detail_block(rel.detail.as_ref(), c)),
-        );
-    v_flex().child(row).child(detail).into_any_element()
-}
-
-/// The columns / indexes / constraints leaves under an expanded relation.
-fn detail_block(detail: Option<&zdb_db::RelationDetail>, c: Colors) -> impl IntoElement {
-    let mut col = v_flex().gap(px(1.));
-    let Some(d) = detail else {
-        return col.child(tree_leaf_text("loading…", c)).into_any_element();
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(c.fg_dim)
+                .child(item.label.clone()),
+        ),
+        // Name must not be squeezed out by a long meta ("timestamp without
+        // time zone NOT NULL"): name keeps its content width, meta shrinks
+        // with an ellipsis.
+        Some(NodeMeta::Leaf { name, meta }) => row
+            .child(div().text_color(c.fg).flex_shrink_0().child(name.clone()))
+            .when(!meta.is_empty(), |d| {
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .min_w(px(0.))
+                        .truncate()
+                        .child(meta.clone()),
+                )
+            }),
+        // Placeholder ("loading…") or unknown: the label, dimmed by the
+        // widget's disabled styling.
+        _ => row.child(item.label.clone()),
     };
-    if !d.columns.is_empty() {
-        col = col.child(sub_label("COLUMNS", c));
-        for c0 in &d.columns {
-            let mut ty = c0.type_name.clone();
-            if !c0.nullable {
-                ty.push_str("  NOT NULL");
-            }
-            if c0.is_primary_key {
-                ty.push_str("  PK");
-            }
-            col = col.child(detail_leaf(c, c0.name.clone(), ty));
-        }
-    }
-    if !d.indexes.is_empty() {
-        col = col.child(sub_label("INDEXES", c));
-        for ix in &d.indexes {
-            let tag = if ix.is_primary {
-                "PRIMARY"
-            } else if ix.is_unique {
-                "UNIQUE"
-            } else {
-                ""
-            };
-            col = col.child(detail_leaf(c, ix.name.clone(), tag.to_string()));
-        }
-    }
-    if !d.constraints.is_empty() {
-        col = col.child(sub_label("CONSTRAINTS", c));
-        for con in &d.constraints {
-            let kind = match con.kind {
-                'p' => "PRIMARY KEY",
-                'f' => "FOREIGN KEY",
-                'u' => "UNIQUE",
-                'c' => "CHECK",
-                'x' => "EXCLUDE",
-                _ => "",
-            };
-            col = col.child(detail_leaf(c, con.name.clone(), kind.to_string()));
-        }
-    }
-    col.into_any_element()
-}
 
-/// A small uppercase group header inside the tree ("COLUMNS", "INDEXES", …).
-fn sub_label(text: &'static str, c: Colors) -> impl IntoElement {
-    div()
-        .pl_1()
-        .pt_1()
-        .pb(px(1.))
-        .text_xs()
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(c.fg_dim)
-        .child(text)
-}
+    let content = h_flex().h(px(24.)).items_center().child(guides).child(row);
 
-/// A tree detail leaf: `main` (foreground) followed by dimmed `meta` (type / tag).
-fn detail_leaf(c: Colors, main: String, meta: String) -> impl IntoElement {
-    div()
-        .pl_1()
-        .py(px(1.))
-        .flex()
-        .items_baseline()
-        .gap_1p5()
+    // Per-kind right-click menu.
+    let content: AnyElement = match &meta {
+        Some(NodeMeta::Rel { schema, name, .. }) => {
+            let (s, t, weak) = (schema.clone(), name.clone(), weak.clone());
+            div()
+                .w_full()
+                .child(content)
+                .context_menu(move |menu, _, _| {
+                    let (s1, t1, w1) = (s.clone(), t.clone(), weak.clone());
+                    let (s2, t2) = (s.clone(), t.clone());
+                    menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
+                        w1.update(cx, |this, cx| {
+                            this.open_table_tab(s1.clone(), t1.clone(), window, cx)
+                        })
+                        .ok();
+                    }))
+                    .item(PopupMenuItem::new("Copy name").on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(format!("{s2}.{t2}")));
+                    }))
+                })
+                .into_any_element()
+        }
+        Some(NodeMeta::Schema { name }) => {
+            let (n, weak) = (name.clone(), weak.clone());
+            div()
+                .w_full()
+                .child(content)
+                .context_menu(move |menu, _, _| {
+                    let (n1, w1) = (n.clone(), weak.clone());
+                    let n2 = n.clone();
+                    menu.item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
+                        w1.update(cx, |this, cx| this.load_relations(n1.clone(), cx)).ok();
+                    }))
+                    .item(PopupMenuItem::new("Copy name").on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(n2.clone()));
+                    }))
+                })
+                .into_any_element()
+        }
+        Some(NodeMeta::Leaf { name, .. }) => {
+            let n = name.clone();
+            div()
+                .w_full()
+                .child(content)
+                .context_menu(move |menu, _, _| {
+                    let n1 = n.clone();
+                    menu.item(PopupMenuItem::new("Copy name").on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(n1.clone()));
+                    }))
+                })
+                .into_any_element()
+        }
+        _ => content.into_any_element(),
+    };
+
+    ListItem::new(ix)
+        .h(px(24.))
+        .py_0()
+        .px_1()
         .text_sm()
-        .child(div().text_color(c.fg).child(main))
-        .when(!meta.is_empty(), |d| {
-            d.child(div().text_xs().text_color(c.fg_dim).child(meta))
-        })
+        .rounded_md()
+        .child(content)
 }
