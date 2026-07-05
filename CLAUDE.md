@@ -18,15 +18,31 @@ crates/
                rustls(ring) TLS.
   zdb-config/  JSON settings (connections, theme, keymap) + OS-keychain passwords
                (secret.rs, keyring; per-OS backend).
-  zdb-app/     gpui app (bin `zdb`): workspace/ (the UI, split into mod.rs =
-               Workspace struct + logic methods + tests; view.rs = all render_*
-               + impl Render (child module, reaches Workspace privates, no
-               visibility bumps); grid.rs = Tab/TabKind + ResultDelegate;
-               colors.rs = Colors/palette; util.rs = pure SQL/config helpers),
-               terminal.rs, main.rs (entry, WSL X11 guard, keybindings, theme).
+  zdb-app/     gpui app (bin `zdb`): workspace/ (the UI — ONE `Workspace` gpui
+               entity, split by concern into child modules; each file holds an
+               `impl Workspace` block + its own tests):
+                 mod.rs     struct def + new(), actions!, palette/terminal/
+                            selftest, and `spawn_db` (the one async-result
+                            helper every DB call funnels through)
+                 conn.rs    connect/switch/save + `ConnForm` (add-form inputs)
+                 tabs.rs    tab accessors/lifecycle + table_query/apply_where
+                 tree.rs    schema sidebar: `SchemaTree` (all tree state, incl.
+                            reset()), model types, pure build/sync fns, loaders
+                 query.rs   run/explain/sort/format, `QueryLog`, `drain_query`
+                 edit.rs    inline-edit staging/apply, row add/delete
+                 export.rs  CSV/JSON/INSERTs/TSV export
+                 view.rs    all render_* + impl Render
+                 grid.rs    Tab/TabKind + ResultDelegate
+                 colors.rs / util.rs   palette / pure SQL+config helpers
+                 test_support.rs       shared #[cfg(test)] fixtures
+               Child modules see Workspace's private fields (defined in the
+               parent module) — methods moved out of mod.rs are `pub(super)`
+               so siblings/tests can call them. No visibility bumps beyond that.
+               Also terminal.rs, main.rs (entry, WSL X11 guard, keybindings, theme).
 ```
 
-The UI talks to the DB only through `DbHandle` channels; it never touches Tokio.
+The UI talks to the DB only through `DbHandle` channels; it never touches Tokio
+(`zdb_db::QueryStream` names the query-event receiver so the UI needn't).
 
 ## Build / run / test
 

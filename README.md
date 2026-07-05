@@ -83,8 +83,3 @@ cargo test                       # unit + UI tests (no DB needed)
 ZDB_TEST_HOST=127.0.0.1 ZDB_TEST_USER=zdb ZDB_TEST_DB=zdb ZDB_TEST_PASSWORD=zdb cargo test
 ```
 
-## Windows
-
-Built for Windows (incl. ARM64) — see `BUILDING-WINDOWS.md` and `CLAUDE.md`. Windows
-binaries are built natively (locally or by CI); the packaged folder is self-contained:
-keep `zdb.exe` together with `sqls.exe` and any bundled `.dll`.

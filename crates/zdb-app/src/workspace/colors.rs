@@ -38,3 +38,23 @@ pub(crate) fn palette(cx: &App) -> Colors {
         active: t.list_active,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use gpui_component::{Theme, ThemeMode};
+
+    #[gpui::test]
+    fn theme_switch_changes_palette(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            Theme::change(ThemeMode::Light, None, cx);
+        });
+        let light = cx.read(palette);
+        cx.update(|cx| Theme::change(ThemeMode::Dark, None, cx));
+        let dark = cx.read(palette);
+        assert_ne!(light.center, dark.center);
+        assert_ne!(light.fg, dark.fg);
+    }
+}

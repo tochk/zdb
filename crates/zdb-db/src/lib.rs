@@ -14,7 +14,7 @@ mod query;
 mod tls;
 mod types;
 
-pub use actor::DbHandle;
+pub use actor::{DbHandle, QueryStream};
 pub use config::{ConnectionConfig, SslMode};
 pub use edit::{build_batch, DescribedResult, EditTarget, RowEdit};
 pub use error::DbError;
