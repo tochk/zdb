@@ -14,6 +14,11 @@ gpui = "0.2.2"
 gpui-component = "0.5.1"
 gpui-terminal = "0.1"
 portable-pty = "0.9"
+# SQL grammar for the editor's syntax highlighting. gpui-component gates all
+# non-JSON grammars behind its all-or-nothing `tree-sitter-languages` feature
+# (28 C grammar crates); we instead register just SQL ourselves (main.rs).
+# Version matches gpui-component 0.5.1's own pin so the tree holds one copy.
+tree-sitter-sequel = "0.3.8"
 
 # Data layer
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

@@ -51,6 +51,7 @@ fn main() {
     app.run(move |cx| {
         // Must run before using any gpui-component features.
         gpui_component::init(cx);
+        register_sql_language();
         // White scheme by default; `theme: "dark"` in settings.json switches it.
         gpui_component::Theme::change(theme_mode(theme), None, cx);
 
@@ -115,6 +116,26 @@ fn config_from_env() -> Option<ConnectionConfig> {
     Some(cfg)
 }
 
+/// Register the SQL tree-sitter grammar with gpui-component's language
+/// registry so `code_editor("sql")` highlights. Without this, gpui-component
+/// only knows JSON (its other grammars sit behind the heavyweight
+/// `tree-sitter-languages` feature) and `"sql"` silently falls back to the
+/// JSON grammar — no highlighting. Registered names win over that fallback.
+fn register_sql_language() {
+    use gpui_component::highlighter::{LanguageConfig, LanguageRegistry};
+    LanguageRegistry::singleton().register(
+        "sql",
+        &LanguageConfig::new(
+            "sql",
+            tree_sitter_sequel::LANGUAGE.into(),
+            vec![],
+            tree_sitter_sequel::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+    );
+}
+
 fn theme_mode(t: zdb_config::Theme) -> gpui_component::ThemeMode {
     match t {
         zdb_config::Theme::Light => gpui_component::ThemeMode::Light,
@@ -128,4 +149,25 @@ fn is_wsl() -> bool {
         || std::fs::read_to_string("/proc/sys/kernel/osrelease")
             .map(|s| s.to_lowercase().contains("microsoft"))
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Single test on the process-wide registry singleton (no cross-test
+    // ordering to worry about).
+    #[test]
+    fn sql_language_registers() {
+        use gpui_component::highlighter::LanguageRegistry;
+        register_sql_language();
+        let cfg = LanguageRegistry::singleton()
+            .language("sql")
+            .expect("sql must be registered");
+        assert_eq!(cfg.name.as_ref(), "sql");
+        assert!(
+            !cfg.highlights.is_empty(),
+            "sql config must carry a highlights query"
+        );
+    }
 }

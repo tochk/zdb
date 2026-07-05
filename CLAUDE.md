@@ -278,7 +278,13 @@ The WSL host can run Windows exes directly:
   `&mut Window`). Run / Ctrl+Enter runs the **statement under the cursor**, not the whole
   editor: `util::statement_at(sql, cursor_byte_offset)` splits on top-level `;` honoring
   `'`/`"` quotes, `--`/`/* */` comments, and `$tag$` dollar-quoting (`InputState::cursor()`
-  gives the byte offset). Keyword highlight is already provided by `code_editor("sql")`.
+  gives the byte offset). **Syntax highlight is NOT automatic**: `code_editor("sql")` alone
+  does nothing — gpui-component gates every grammar except JSON behind its all-or-nothing
+  `tree-sitter-languages` feature (28 C grammar crates), and an unknown language silently
+  falls back to the JSON grammar (no error, no highlights). We register just SQL ourselves:
+  direct dep `tree-sitter-sequel` + `main.rs::register_sql_language()` (called right after
+  `gpui_component::init`) puts it in `LanguageRegistry::singleton()`; registered names win
+  over the fallback. Don't enable the `tree-sitter-languages` feature.
 
 - **Schema-aware completion = the bundled `sqls` LSP server, driven in-process** (`src/lsp.rs`).
   NOT a homegrown completer and NOT a hand-rolled protocol server — it's a real LSP client to
