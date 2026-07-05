@@ -76,7 +76,7 @@ impl Workspace {
                 .child(
                     div()
                         .flex_1()
-                        .child(Input::new(&self.filter_input).appearance(false).small()),
+                        .child(Input::new(&self.tree.filter_input).appearance(false).small()),
                 )
         });
 
@@ -88,7 +88,7 @@ impl Workspace {
                 .on_action(cx.listener(|this, _: &TreeOpenSelected, window, cx| {
                     this.open_selected_tree_node(window, cx)
                 }))
-                .child(tree(&self.tree_state, move |ix, entry, selected, window, cx| {
+                .child(tree(&self.tree.state, move |ix, entry, selected, window, cx| {
                     schema_tree_row(ix, entry, selected, &weak, window, cx)
                 }))
                 .into_any_element()
@@ -434,7 +434,7 @@ impl Workspace {
         let c = palette(cx);
 
         let mut log_list = v_flex().p_1().gap(px(1.));
-        for e in self.log_entries.iter().rev() {
+        for e in self.log.entries.iter().rev() {
             let glyph = if e.ok { "✓" } else { "✗" };
             log_list = log_list.child(
                 div()
@@ -583,13 +583,13 @@ impl Workspace {
                     v_flex()
                         .p_2()
                         .gap_1()
-                        .child(field("Name", &self.f_name))
-                        .child(field("Host", &self.f_host))
-                        .child(field("Port", &self.f_port))
-                        .child(field("User", &self.f_user))
-                        .child(field("Database", &self.f_db))
-                        .child(field("Password", &self.f_password))
-                        .child(field("SSL mode", &self.f_ssl))
+                        .child(field("Name", &self.form.name))
+                        .child(field("Host", &self.form.host))
+                        .child(field("Port", &self.form.port))
+                        .child(field("User", &self.form.user))
+                        .child(field("Database", &self.form.db))
+                        .child(field("Password", &self.form.password))
+                        .child(field("SSL mode", &self.form.ssl))
                         .child(buttons),
                 )
                 .into_any_element()
@@ -1019,9 +1019,9 @@ impl Render for Workspace {
             self.open_table_tab(schema, table, window, cx);
         }
         // Filter cleared from a window-less context (connection switch).
-        if self.pending_clear_filter {
-            self.pending_clear_filter = false;
-            self.filter_input
+        if self.tree.pending_clear_filter {
+            self.tree.pending_clear_filter = false;
+            self.tree.filter_input
                 .update(cx, |i, cx| i.set_value("", window, cx));
         }
         let center = self.render_center(cx).into_any_element();
@@ -1190,7 +1190,7 @@ fn schema_tree_row(
     let (meta, tree_state) = match weak.upgrade() {
         Some(ws) => {
             let ws = ws.read(cx);
-            (ws.node_meta.get(&item.id).cloned(), Some(ws.tree_state.clone()))
+            (ws.tree.meta.get(&item.id).cloned(), Some(ws.tree.state.clone()))
         }
         None => (None, None),
     };

@@ -83,6 +83,10 @@ pub struct DbHandle {
     tx: mpsc::UnboundedSender<Command>,
 }
 
+/// The event stream a query returns; closes when the submission finishes.
+/// Named so UI crates can accept it without depending on Tokio themselves.
+pub type QueryStream = mpsc::UnboundedReceiver<QueryEvent>;
+
 impl DbHandle {
     /// Start the worker on a dedicated Tokio runtime thread.
     pub fn spawn() -> Self {
@@ -114,7 +118,7 @@ impl DbHandle {
 
     /// Run `sql`, returning a stream of result events. The receiver closes when
     /// the submission completes or fails.
-    pub fn query(&self, conn: ConnId, sql: impl Into<String>) -> mpsc::UnboundedReceiver<QueryEvent> {
+    pub fn query(&self, conn: ConnId, sql: impl Into<String>) -> QueryStream {
         let (events, rx) = mpsc::unbounded_channel();
         if self
             .tx

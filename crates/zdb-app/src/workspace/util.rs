@@ -163,7 +163,9 @@ pub(crate) fn rel_icon(kind: RelationKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::statement_at;
+    use super::*;
+    use gpui_component::table::ColumnSort;
+    use zdb_db::SslMode;
 
     #[test]
     fn single_statement_returned_whole() {
@@ -205,5 +207,27 @@ mod tests {
         assert!(statement_at(sql, 10).starts_with("create function"));
         assert!(statement_at(sql, 10).contains("$$ language plpgsql"));
         assert_eq!(statement_at(sql, sql.len() - 1), "select 2");
+    }
+    #[test]
+    fn ssl_parsing() {
+        assert_eq!(ssl_from_str("disable"), SslMode::Disable);
+        assert_eq!(ssl_from_str("verify-full"), SslMode::VerifyFull);
+        assert_eq!(ssl_from_str("whatever"), SslMode::Prefer);
+    }
+
+    #[test]
+    fn oneline_collapses_and_truncates() {
+        assert_eq!(oneline("SELECT\n  1"), "SELECT 1");
+        assert_eq!(oneline(&"x ".repeat(200)).chars().last(), Some('…'));
+    }
+
+    #[test]
+    fn order_by_wraps_query() {
+        assert_eq!(
+            order_by_sql("SELECT * FROM t", "qty", ColumnSort::Descending),
+            r#"SELECT * FROM (SELECT * FROM t) AS _zdb ORDER BY "qty" DESC"#
+        );
+        // Default clears the sort.
+        assert_eq!(order_by_sql("SELECT 1;", "x", ColumnSort::Default), "SELECT 1;");
     }
 }
