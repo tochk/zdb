@@ -34,10 +34,9 @@ installer (Windows 10 1903+ / 11).
 
 ## CI build (no Windows machine needed locally)
 
-`.github/workflows/windows.yml` builds x64 and arm64 with MSVC on a
-`windows-latest` runner and uploads the binaries as artifacts. Trigger it from
-the Actions tab ("Run workflow") or by pushing a `v*` tag, then download the
-`zdb-windows-x64` / `zdb-windows-arm64` artifacts.
+`.github/workflows/build.yml` builds every OS × arch natively (Windows x64 on
+`windows-latest`, arm64 on `windows-11-arm`) and uploads the binaries as
+artifacts — download `zdb-windows-x64` / `zdb-windows-arm64` from the run.
 
 ## Running
 

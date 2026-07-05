@@ -1,9 +1,6 @@
 //! zdb — Zed-like PostgreSQL client. Application entry point.
 
-// On Windows, build as a GUI app (no console window). Keyed on the target, not
-// on debug_assertions, because our release profile enables debug-assertions to
-// make gpui cross-compile (it precompiles HLSL shaders only on a Windows host;
-// the debug_assertions path compiles them at runtime instead).
+// On Windows, build as a GUI app (no console window).
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod assets;
@@ -16,7 +13,7 @@ use gpui::{px, size, AppContext, Application, KeyBinding, WindowOptions};
 use gpui_component::TitleBar;
 use workspace::{
     ClosePalette, RunQuery, ToggleConnections, TogglePalette, ToggleScratch, ToggleSettings,
-    ToggleTerminal, Workspace,
+    ToggleTerminal, TreeOpenSelected, Workspace,
 };
 use zdb_db::{ConnectionConfig, DbHandle, SslMode};
 
@@ -71,6 +68,9 @@ fn main() {
             KeyBinding::new("cmd-shift-e", ToggleScratch, None),
             KeyBinding::new("ctrl-,", ToggleSettings, None),
             KeyBinding::new("cmd-,", ToggleSettings, None),
+            // Schema tree: Enter opens the selected relation (arrows come from
+            // gpui-component's own "Tree"-context bindings).
+            KeyBinding::new("enter", TreeOpenSelected, Some("Tree")),
         ]);
 
         // Use a Zed-style custom title bar instead of the OS default. The

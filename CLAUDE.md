@@ -24,7 +24,6 @@ crates/
                visibility bumps); grid.rs = Tab/TabKind + ResultDelegate;
                colors.rs = Colors/palette; util.rs = pure SQL/config helpers),
                terminal.rs, main.rs (entry, WSL X11 guard, keybindings, theme).
-vendor/gpui/   PATCHED copy of gpui 0.2.2 (see Windows notes). [patch.crates-io].
 ```
 
 The UI talks to the DB only through `DbHandle` channels; it never touches Tokio.
@@ -44,27 +43,25 @@ The UI talks to the DB only through `DbHandle` channels; it never touches Tokio.
 - Run dev with a connection via env: `ZDB_HOST/USER/DB/PASSWORD`, `ZDB_SSL_DISABLE=1`.
   `ZDB_LOG=1` prints milestones; `ZDB_SELFTEST=1` runs a demo query after connect.
 
-## Windows builds (this is the important part)
+## Windows builds
 
 Target is **Windows on ARM64** (the dev box is WSL2 aarch64; the host is ARM64).
 
-- Cross-compile with the **llvm-mingw** `aarch64-pc-windows-gnullvm` toolchain
-  (`~/.local/llvm-mingw`), env `CC_/CXX_/AR_aarch64_pc_windows_gnullvm` + PATH.
-  `[profile.release] debug-assertions = true` is REQUIRED (gpui only precompiles
-  its HLSL shaders on a Windows host; debug_assertions makes it compile them at
-  runtime instead). Set it in the PROFILE, not RUSTFLAGS (RUSTFLAGS doesn't reach
-  host proc-macros → `gpui_macros::derive_inspector_reflection` won't compile).
-- The runtime-shader path reads `*.hlsl` from gpui's build-time `CARGO_MANIFEST_DIR`,
-  which doesn't exist on the user's machine → `Error creating DirectWriteTextSystem`
-  (os error 3). FIX: **vendored gpui** (`vendor/gpui`) patches
-  `directx_renderer.rs::build_shader_blob` to read `<exe_dir>/shaders/<name>` first;
-  the package bundles those `.hlsl` in a `shaders/` folder next to `zdb.exe`.
+- **Build natively on Windows only** (locally with MSVC tools, or CI:
+  `.github/workflows/build.yml` builds every OS × arch on native runners).
+  gpui's build script precompiles its HLSL shaders with `fxc` (Windows SDK) and
+  embeds them — but only when building **on** Windows. Cross-compiling from
+  Linux leaves gpui without shaders → `Error creating DirectWriteTextSystem`
+  on the user's machine. (We used to work around this with a vendored/patched
+  gpui + `debug-assertions = true` + a bundled `shaders/` folder; that whole
+  path was removed — see BUILDING-WINDOWS.md.)
 - Manifest: `crates/zdb-app/build.rs` (embed-resource) compiles `resources/zdb.rc`
   embedding `zdb.manifest` (Common-Controls v6 → fixes `TaskDialogIndirect`) and
   `zdb.ico` (app icon). GUI subsystem via `#![cfg_attr(target_os="windows", ...)]`.
-- Package + bundle: `scripts/package-windows.sh aarch64-pc-windows-gnullvm arm64`
-  → `dist/zdb-windows-arm64.zip` (exe + libunwind.dll + shaders/ + README).
-- Don't bother with MSVC-cross (cargo-xwin): `ring` fails on aarch64-msvc; not needed.
+  MSVC's `link.exe` also auto-embeds a default manifest which collides with ours
+  → `/MANIFEST:NO` in `.cargo/config.toml` for the msvc targets.
+- CI's Package step drops `zdb.exe` + `sqls.exe` into the artifact; no extra
+  runtime files needed.
 
 ## Testing Windows builds HERE (WSL interop)
 
@@ -93,7 +90,7 @@ The WSL host can run Windows exes directly:
 - **Custom (Zed-style) title bar** lives in `workspace.rs::render_titlebar` (not
   the gpui-component `TitleBar`). Window opens borderless via
   `gpui_component::TitleBar::title_bar_options()` in `main.rs` (`appears_transparent`
-  → vendored gpui sets `hide_title_bar`, killing the native frame on Win/Linux).
+  → gpui sets `hide_title_bar`, killing the native frame on Win/Linux).
   Key lessons baked in:
   - We DON'T use gpui-component's `TitleBar` widget: its min/max/close glyphs take
     color from the ambient `window.text_style()` (no explicit color), which an
@@ -222,19 +219,46 @@ The WSL host can run Windows exes directly:
   - Opening a tab needs `&mut Window`; from windowless async contexts (the selftest) set
     `pending_open` and let `render()` consume it next frame.
 
-- **Schema tree is a lazily-loaded hierarchy** database → schema → relation → columns
-  (`workspace/mod.rs` `SchemaNode`/`RelNode` + `db_expanded`; render in
-  `view.rs::render_sidebar` + `rel_node_view`/`columns_block`). A `db_expanded` **database
-  root** node (the connection's `dbname`) holds the schemas. A relation row has TWO click
-  targets (like the tab strip, to avoid the nested-`on_click`-fires-both trap): a leading
-  chevron/spacer and the name (opens the tab). **Only tables expand** (`toggle_relation` bails
-  unless `RelationKind::Table`); expanding lazily loads columns via `DbHandle::relation_detail`
-  (`tokio::try_join!` of columns+indexes+constraints — indexes/constraints are fetched but not
-  currently rendered) and shows them as `column_leaf` rows (name + dim type + `PK`). Shared row
-  helpers: `tree_row`/`indent_guide`/`chevron_icon`. New pg_catalog queries + types
-  (`RelationDetail`/`SchemaObjects`/`IndexInfo`/`ConstraintInfo`) live in
-  `zdb-db/src/introspect.rs`, threaded through `actor.rs`. (`schema_objects` = sequences +
-  functions is still fetched but no longer shown — kept for a future object tree.)
+- **Schema tree = the `gpui_component::tree` widget** (Zed-project-panel style: virtualized
+  `uniform_list`, selection highlight, arrow-key nav, per-depth indent guides). Hierarchy:
+  database root → schemas → relations → COLUMNS/INDEXES/CONSTRAINTS groups → leaves, plus
+  per-schema SEQUENCES/FUNCTIONS groups. Model stays `workspace/mod.rs` `SchemaNode`/`RelNode`
+  (lazy `relations`/`detail` via `DbHandle::{relations,relation_detail,schema_objects}`);
+  render is `view.rs::render_sidebar` + the `schema_tree_row` free fn (returns a `ListItem`).
+  Key mechanics (all source-verified against gpui-component 0.5.1 `tree.rs`):
+  - **Expansion source of truth = `Workspace.expanded_ids`** (`HashSet<SharedString>` of node
+    ids, `'\u{1}'`-joined: `db`, `sch␁s`, `rel␁s␁t`, `cols␁s␁t`, `col␁s␁t␁c`, `load␁<parent>`…).
+    `build_tree` (pure fn) rebuilds `Vec<TreeItem>` + `NodeMeta` map from model+expanded+filter;
+    `sync_tree` is the single sink (data arrival / filter / refresh / reveal): kicks lazy loads
+    (`ensure_loads`, in-flight guard `tree_loads`), `set_items`, restores selection by id
+    (`set_items` WIPES `selected_ix`; `flat_index_of` mirrors the widget's private flatten).
+  - **Widget toggles flow back via shared state**: `TreeItem`'s expanded flag is an
+    `Rc<RefCell<…>>` and `Clone` SHARES it, so the retained `tree_items` see widget-side
+    toggles. There is no toggle callback; `cx.observe(&tree_state, on_tree_notify)` fires on
+    every select/toggle (they all notify) and `sync_expansion` diffs retained items into
+    `expanded_ids`, kicking loads. The observer NEVER calls `set_items` (no rebuild loop).
+  - **Unloaded expandables get a disabled "loading…" placeholder child** (`is_folder()` ==
+    `children.len()>0`, so without one the widget won't expand them).
+  - **Two click targets kept**: the widget's row handler is `on_mouse_down` (not click) —
+    the relation name area has its own `on_mouse_down` that `cx.stop_propagation()`s, selects
+    manually, and `open_table_tab`s. Enter opens via zdb action `TreeOpenSelected` bound to
+    `"enter"` in key context `"Tree"` (main.rs) — gpui-component binds only arrows there —
+    handled by `.on_action` on the sidebar wrapper div (bubbles out of the tree). Arrows work
+    once the tree is clicked (its `FocusHandle` is private, no programmatic focus — accepted).
+  - **Filter box** (`filter_input` under the sidebar header): non-empty `tree_filter` keeps
+    only matching relations, force-expands db+schemas TRANSIENTLY (`sync_expansion` skips
+    db/`sch␁` ids while filtering so `expanded_ids` stays clean), loads all unloaded schemas
+    (global search). **Auto-reveal**: `reveal_relation` (from `activate_tab` for Table tabs)
+    expands ancestors + sets `pending_reveal`; `sync_tree` consumes it only once the node is
+    visible → select + `scroll_to_item(Center)`. **Context menus**: `ContextMenuExt`
+    (`gpui_component::menu`) is blanket-impl'd for `ParentElement+Styled` divs; closure-based
+    `PopupMenuItem::new(..).on_click(..)` (Open / Copy name / schema Refresh).
+  - Rows are uniform `h(px(24.))` (uniform_list measures the first row); `ListItem` hover/
+    selected styling uses the same theme tokens as `Colors.hover/active`. pg_catalog queries +
+    types (`RelationDetail`/`SchemaObjects`/…) live in `zdb-db/src/introspect.rs` via `actor.rs`.
+  - Tests: pure `flat_index_of`/`build_tree`/`sync_expansion` units + `#[gpui::test]` reveal &
+    widget-toggle-kicks-load (simulate a toggle by mutating a retained item's shared Rc then
+    notifying the `TreeState`).
 
 - **Result export** (`zdb-db/src/export.rs`, pure fns `to_csv`/`to_json`/`to_inserts`/`to_tsv`
   + `ExportFormat`): CSV/JSON/SQL-INSERTs to a file via the native save dialog
@@ -286,7 +310,7 @@ The WSL host can run Windows exes directly:
     (`CGO_ENABLED=0`) — must first drop the two CGO-only blank imports (`godror` Oracle,
     `mattn/go-sqlite3`); we only speak Postgres. Official releases are x86-64 only, hence
     build-from-source (native Windows ARM64, the target). zdb finds `sqls[.exe]` next to its
-    own exe, else on PATH; `package-windows.sh` bundles `sqls.exe`.
+    own exe, else on PATH; CI's Package step bundles `sqls.exe`.
   - **Version trap**: gpui-component 0.5.1 pins `ropey = "=2.0.0-beta.1"` (its text engine —
     already in the tree for every input). Do NOT add a direct `ropey` dep (it's a beta): name
     the type via the re-export `gpui_component::Rope` in the `CompletionProvider` impl.
