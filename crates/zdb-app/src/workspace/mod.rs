@@ -297,8 +297,9 @@ fn rel_tree_item(
     item.expanded(expanded.contains(&rid))
 }
 
-/// Build the widget's item hierarchy (db → schemas → relations → groups →
-/// leaves) from the model. Pure: expansion comes from `expanded`, and a
+/// Build the widget's item hierarchy (db → schemas → TABLES/SEQUENCES/
+/// FUNCTIONS groups → relations → leaves) from the model. Pure: expansion
+/// comes from `expanded`, and a
 /// non-empty `filter` keeps only matching relations, force-expanding db +
 /// schemas transiently (never written back to `expanded`).
 fn build_tree(
@@ -322,16 +323,24 @@ fn build_tree(
         match &node.relations {
             None => kids.push(placeholder_item(&sid, "loading…", &mut meta)),
             Some(rels) => {
+                let gid = node_id(&["tbls", &node.name]);
+                meta.insert(gid.clone(), NodeMeta::Group);
+                let mut rel_items = Vec::new();
                 for rel in rels {
                     if filtering && !rel.name.to_lowercase().contains(&filter) {
                         continue;
                     }
                     matches += 1;
-                    kids.push(rel_tree_item(&node.name, rel, expanded, &mut meta));
+                    rel_items.push(rel_tree_item(&node.name, rel, expanded, &mut meta));
                 }
-                if rels.is_empty() {
-                    kids.push(placeholder_item(&sid, "(empty)", &mut meta));
+                if rel_items.is_empty() {
+                    rel_items.push(placeholder_item(&gid, "(empty)", &mut meta));
                 }
+                kids.push(
+                    TreeItem::new(gid.clone(), "TABLES")
+                        .children(rel_items)
+                        .expanded(filtering || expanded.contains(&gid)),
+                );
                 if !filtering {
                     if let Some(objs) = &node.objects {
                         let obj_group = |tag: &str,
@@ -1066,6 +1075,7 @@ impl Workspace {
         }
         self.expanded_ids.insert("db".into());
         self.expanded_ids.insert(node_id(&["sch", schema]));
+        self.expanded_ids.insert(node_id(&["tbls", schema]));
         self.pending_reveal = Some(node_id(&["rel", schema, table]));
         self.sync_tree(cx);
     }
@@ -1100,7 +1110,6 @@ impl Workspace {
                 this.tree_loads.remove(&node_id(&["sch", &schema]));
                 match rels {
                     Ok(rels) => {
-                        let (mut seqs, mut funcs) = (false, false);
                         // Look the node up by name: the tree may have been
                         // reloaded/reordered while the query ran.
                         if let Some(node) = this.tree.iter_mut().find(|n| n.name == schema) {
@@ -1110,17 +1119,10 @@ impl Workspace {
                                     .collect(),
                             );
                             node.objects = objects.ok();
-                            seqs = node.objects.as_ref().is_some_and(|o| !o.sequences.is_empty());
-                            funcs = node.objects.as_ref().is_some_and(|o| !o.functions.is_empty());
                         }
-                        // Sequence/function groups start open (they were
-                        // always-visible labels before the tree widget).
-                        if seqs {
-                            this.expanded_ids.insert(node_id(&["seqs", &schema]));
-                        }
-                        if funcs {
-                            this.expanded_ids.insert(node_id(&["funcs", &schema]));
-                        }
+                        // TABLES starts open (the primary content);
+                        // SEQUENCES/FUNCTIONS start folded.
+                        this.expanded_ids.insert(node_id(&["tbls", &schema]));
                     }
                     Err(e) => this.status = format!("Failed to load relations: {e}"),
                 }
@@ -1144,8 +1146,7 @@ impl Workspace {
                 this.tree_loads.remove(&rid);
                 match result {
                     Ok(detail) => {
-                        let has_idx = !detail.indexes.is_empty();
-                        let has_con = !detail.constraints.is_empty();
+                        // Groups start folded; the user expands the one they need.
                         if let Some(node) = this
                             .tree
                             .iter_mut()
@@ -1154,14 +1155,6 @@ impl Workspace {
                             .and_then(|r| r.iter_mut().find(|r| r.name == table))
                         {
                             node.detail = Some(detail);
-                        }
-                        // Groups start open on first load (COLUMNS always).
-                        this.expanded_ids.insert(node_id(&["cols", &schema, &table]));
-                        if has_idx {
-                            this.expanded_ids.insert(node_id(&["idxs", &schema, &table]));
-                        }
-                        if has_con {
-                            this.expanded_ids.insert(node_id(&["cons", &schema, &table]));
                         }
                     }
                     Err(e) => this.status = format!("Failed to load relation detail: {e}"),
@@ -2109,11 +2102,16 @@ mod tests {
         assert_eq!(db.children.len(), 2);
         let public = &db.children[0];
         assert!(public.is_expanded());
-        assert_eq!(public.children.len(), 2);
+        // Relations sit under a TABLES group (folded here: not in `expanded`).
+        assert_eq!(public.children.len(), 1);
+        let tables = &public.children[0];
+        assert_eq!(tables.label.as_ref(), "TABLES");
+        assert!(!tables.is_expanded());
+        assert_eq!(tables.children.len(), 2);
         // Unloaded table gets a loading placeholder so it stays expandable;
         // views are plain leaves.
-        assert!(public.children[0].is_folder());
-        assert!(!public.children[1].is_folder());
+        assert!(tables.children[0].is_folder());
+        assert!(!tables.children[1].is_folder());
         // Unloaded schema: collapsed folder with a loading placeholder.
         let audit = &db.children[1];
         assert!(audit.is_folder());
@@ -2125,14 +2123,16 @@ mod tests {
 
         // Filtering: only matching relations remain; loaded schemas without a
         // match drop out, unloaded ones stay (results refine as loads land);
-        // db + schemas are force-expanded.
+        // db + schemas + TABLES groups are force-expanded.
         let (items, _) = build_tree(Some("zdb"), &sample_tree(), &HashSet::new(), "user");
         let db = &items[0];
         assert!(db.is_expanded());
         let names: Vec<_> = db.children.iter().map(|c| c.label.to_string()).collect();
         assert_eq!(names, vec!["public", "audit"]);
-        assert_eq!(db.children[0].children.len(), 1);
-        assert_eq!(db.children[0].children[0].label.as_ref(), "users");
+        let tables = &db.children[0].children[0];
+        assert!(tables.is_expanded());
+        assert_eq!(tables.children.len(), 1);
+        assert_eq!(tables.children[0].label.as_ref(), "users");
 
         // Not connected → no items at all.
         assert!(build_tree(None, &sample_tree(), &HashSet::new(), "").0.is_empty());

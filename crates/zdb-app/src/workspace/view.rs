@@ -1267,10 +1267,20 @@ fn schema_tree_row(
                 .text_color(c.fg_dim)
                 .child(item.label.clone()),
         ),
+        // Name must not be squeezed out by a long meta ("timestamp without
+        // time zone NOT NULL"): name keeps its content width, meta shrinks
+        // with an ellipsis.
         Some(NodeMeta::Leaf { name, meta }) => row
-            .child(div().text_color(c.fg).truncate().child(name.clone()))
+            .child(div().text_color(c.fg).flex_shrink_0().child(name.clone()))
             .when(!meta.is_empty(), |d| {
-                d.child(div().text_xs().text_color(c.fg_dim).child(meta.clone()))
+                d.child(
+                    div()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .min_w(px(0.))
+                        .truncate()
+                        .child(meta.clone()),
+                )
             }),
         // Placeholder ("loading…") or unknown: the label, dimmed by the
         // widget's disabled styling.
