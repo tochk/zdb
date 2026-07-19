@@ -45,6 +45,10 @@ enum Command {
         conn: ConnId,
         sql: String,
         events: mpsc::UnboundedSender<QueryEvent>,
+        /// True when this is the automatic second attempt after a reconnect;
+        /// a retried query that still cannot submit reports failure instead of
+        /// looping.
+        retried: bool,
     },
     Introspect {
         conn: ConnId,
@@ -91,6 +95,7 @@ impl DbHandle {
     /// Start the worker on a dedicated Tokio runtime thread.
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let worker_tx = tx.clone();
         std::thread::Builder::new()
             .name("zdb-db".into())
             .spawn(move || {
@@ -98,7 +103,7 @@ impl DbHandle {
                     .enable_all()
                     .build()
                     .expect("build zdb tokio runtime");
-                rt.block_on(worker(rx));
+                rt.block_on(worker(worker_tx, rx));
             })
             .expect("spawn zdb-db thread");
         DbHandle { tx }
@@ -126,6 +131,7 @@ impl DbHandle {
                 conn,
                 sql: sql.into(),
                 events: events.clone(),
+                retried: false,
             })
             .is_err()
         {
@@ -275,7 +281,29 @@ impl DbHandle {
     }
 }
 
-async fn worker(mut rx: mpsc::UnboundedReceiver<Command>) {
+/// Look up a connection, transparently reconnecting when its client is known
+/// to be closed (server restart, idle timeout, network drop — the protocol
+/// driver has exited and `is_closed()` reports it). The entry keeps its
+/// `ConnId`, so the UI's handle stays valid across the reconnect.
+async fn ensure_conn(
+    conns: &mut HashMap<ConnId, ConnEntry>,
+    conn: ConnId,
+) -> Result<Arc<Client>, DbError> {
+    let entry = conns.get_mut(&conn).ok_or(DbError::NoConnection(conn))?;
+    if entry.client.is_closed() {
+        let (client, cancel) = connect(&entry.cfg).await?;
+        entry.client = Arc::new(client);
+        entry.cancel = cancel;
+    }
+    Ok(entry.client.clone())
+}
+
+/// `tx` loops back into this worker's own queue: a query that failed to submit
+/// because the connection silently died re-enters as a `retried` command, which
+/// then sees `is_closed()` and reconnects. (Holding our own sender means the
+/// loop never sees channel-closed; the thread lives for the process lifetime,
+/// as it effectively always did.)
+async fn worker(tx: mpsc::UnboundedSender<Command>, mut rx: mpsc::UnboundedReceiver<Command>) {
     let mut conns: HashMap<ConnId, ConnEntry> = HashMap::new();
     let mut next_id: ConnId = 1;
 
@@ -297,52 +325,75 @@ async fn worker(mut rx: mpsc::UnboundedReceiver<Command>) {
                 });
                 let _ = reply.send(result);
             }
-            Command::Query { conn, sql, events } => match conns.get(&conn) {
-                Some(entry) => {
-                    let client = entry.client.clone();
-                    // Run on its own task so the command loop stays responsive
-                    // (e.g. to a concurrent Cancel) during long queries.
-                    tokio::spawn(async move {
-                        query::run(&client, &sql, &events).await;
-                    });
+            Command::Query { conn, sql, events, retried } => {
+                match ensure_conn(&mut conns, conn).await {
+                    Ok(client) => {
+                        let worker_tx = tx.clone();
+                        // Run on its own task so the command loop stays responsive
+                        // (e.g. to a concurrent Cancel) during long queries.
+                        tokio::spawn(async move {
+                            match query::run(&client, &sql, &events).await {
+                                query::RunOutcome::Done => {}
+                                // The socket died between dispatch and submit
+                                // (nothing reached the server): go around once
+                                // more — `ensure_conn` will reconnect.
+                                query::RunOutcome::ClosedAtSubmit if !retried => {
+                                    let _ = worker_tx.send(Command::Query {
+                                        conn,
+                                        sql,
+                                        events,
+                                        retried: true,
+                                    });
+                                }
+                                query::RunOutcome::ClosedAtSubmit => {
+                                    let _ = events.send(QueryEvent::Failed(DbError::Query(
+                                        "connection closed".into(),
+                                    )));
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        let _ = events.send(QueryEvent::Failed(e));
+                    }
                 }
-                None => {
-                    let _ = events.send(QueryEvent::Failed(DbError::NoConnection(conn)));
+            }
+            Command::Introspect { conn, kind, reply } => {
+                match ensure_conn(&mut conns, conn).await {
+                    Ok(client) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(run_introspect(&client, kind).await);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
                 }
-            },
-            Command::Introspect { conn, kind, reply } => match conns.get(&conn) {
-                Some(entry) => {
-                    let client = entry.client.clone();
-                    tokio::spawn(async move {
-                        let _ = reply.send(run_introspect(&client, kind).await);
-                    });
+            }
+            Command::Apply { conn, batch, reply } => {
+                match ensure_conn(&mut conns, conn).await {
+                    Ok(client) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(apply_batch(&client, &batch).await);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
                 }
-                None => {
-                    let _ = reply.send(Err(DbError::NoConnection(conn)));
+            }
+            Command::Describe { conn, sql, reply } => {
+                match ensure_conn(&mut conns, conn).await {
+                    Ok(client) => {
+                        tokio::spawn(async move {
+                            let _ = reply.send(run_describe(&client, &sql).await);
+                        });
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
                 }
-            },
-            Command::Apply { conn, batch, reply } => match conns.get(&conn) {
-                Some(entry) => {
-                    let client = entry.client.clone();
-                    tokio::spawn(async move {
-                        let _ = reply.send(apply_batch(&client, &batch).await);
-                    });
-                }
-                None => {
-                    let _ = reply.send(Err(DbError::NoConnection(conn)));
-                }
-            },
-            Command::Describe { conn, sql, reply } => match conns.get(&conn) {
-                Some(entry) => {
-                    let client = entry.client.clone();
-                    tokio::spawn(async move {
-                        let _ = reply.send(run_describe(&client, &sql).await);
-                    });
-                }
-                None => {
-                    let _ = reply.send(Err(DbError::NoConnection(conn)));
-                }
-            },
+            }
             Command::Cancel { conn } => {
                 if let Some(entry) = conns.get(&conn) {
                     let cancel = entry.cancel.clone();

@@ -15,7 +15,11 @@ crates/
   zdb-db/      data layer: async DbHandle (own Tokio runtime thread + channels),
                streaming query exec, schema introspection, inline-edit engine
                (edit.rs), query editability describe (actor.rs run_describe),
-               rustls(ring) TLS.
+               rustls(ring) TLS. Auto-reconnect: worker's `ensure_conn` redials
+               (same ConnId) when the client is closed; a query whose SUBMIT hit
+               a silently-dead socket retries once (safe — nothing reached the
+               server; mid-stream failures never retry). 10s connect_timeout +
+               120s keepalive in config.rs.
   zdb-config/  JSON settings (connections, theme, keymap) + OS-keychain passwords
                (secret.rs, keyring; per-OS backend).
   zdb-app/     gpui app (bin `zdb`): workspace/ (the UI — ONE `Workspace` gpui

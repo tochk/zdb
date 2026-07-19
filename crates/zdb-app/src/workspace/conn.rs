@@ -217,6 +217,50 @@ mod tests {
     }
 
     #[gpui::test]
+    fn switching_saved_connections_survives_failures(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, _w, cx| {
+                for name in ["a", "b"] {
+                    ws.settings.connections.push(ConnectionEntry {
+                        name: name.into(),
+                        host: "127.0.0.1".into(),
+                        port: 1, // nothing listens here: connect fails fast
+                        dbname: "d".into(),
+                        user: "u".into(),
+                        ssl_mode: "disable".into(),
+                    });
+                }
+                // Rapid switches, including while a connect is still in flight.
+                ws.connect_saved(0, cx);
+                ws.connect_saved(1, cx);
+                ws.connect_saved(0, cx);
+            })
+            .unwrap();
+        // Let the in-flight connect results land (they arrive from the real
+        // DB thread, so poll rather than a single run_until_parked).
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let failed = window
+                .update(cx, |ws, _w, _cx| ws.status.starts_with("Connection failed"))
+                .unwrap();
+            if failed {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        window
+            .update(cx, |ws, _w, cx| {
+                assert!(ws.conn.is_none());
+                assert!(ws.status.starts_with("Connection failed"), "status: {}", ws.status);
+                // And one more switch after a failure must not blow up.
+                ws.connect_saved(1, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
     fn conn_manager_toggles_list_and_form(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
         window

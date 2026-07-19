@@ -89,6 +89,30 @@ async fn dml_roundtrip_in_one_session() {
 }
 
 #[tokio::test]
+async fn reconnects_after_connection_lost() {
+    let Some(cfg) = test_config() else {
+        eprintln!("skipping: ZDB_TEST_* not set");
+        return;
+    };
+    let db = DbHandle::spawn();
+    let conn = db.connect(cfg).await.expect("connect");
+
+    // Kill this session's backend server-side: the driver exits and the
+    // client reports closed — the same state as a server restart / idle drop.
+    let mut rx = db.query(conn, "SELECT pg_terminate_backend(pg_backend_pid())");
+    while rx.recv().await.is_some() {} // drain; ends in Failed, expected
+
+    // Give the driver task a moment to observe the FIN and mark the client closed.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The next query on the SAME ConnId must transparently reconnect.
+    let mut rx = db.query(conn, "SELECT 41 + 1 AS answer");
+    let (cols, rows, _) = collect(&mut rx).await;
+    assert_eq!(cols, ["answer"]);
+    assert_eq!(rows[0][0], CellValue::Text("42".into()));
+}
+
+#[tokio::test]
 async fn error_surfaces_with_sqlstate() {
     let Some(cfg) = test_config() else {
         eprintln!("skipping: ZDB_TEST_* not set");
