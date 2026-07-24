@@ -20,6 +20,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # macOS regression guard: the app hung on selecting a saved connection because
+  # the keychain read ran on the UI thread (blocking gpui's render loop). Run the
+  # test suite on macOS, where that bug manifested.
+  test-macos:
+    name: test-macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-macos
+      # Integration tests needing a live Postgres stay gated on ZDB_TEST_* (unset
+      # here) and self-skip; the connect/UI-thread regression test needs no DB.
+      - name: Test
+        run: cargo test -p zdb-app -p zdb-config -p zdb-db
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

@@ -101,11 +101,11 @@ impl Workspace {
 
     pub(super) fn connect_saved(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(entry) = self.settings.connections.get(idx).cloned() else { return };
-        let pw = self
-            .passwords
-            .get(&entry.name)
-            .cloned()
-            .or_else(|| zdb_config::secret::get_password(&entry.name));
+        // Only the session cache here — no keychain read. On macOS a Keychain
+        // lookup can block (and pop a system prompt); doing it on this UI-thread
+        // click handler freezes the render loop (the app "hangs" on select).
+        // `start_connect` resolves the stored password off the UI thread.
+        let pw = self.passwords.get(&entry.name).cloned();
         let cfg = entry_to_config(&entry, pw);
         self.switch_connection(cfg, cx);
     }
@@ -151,9 +151,25 @@ impl Workspace {
     pub(super) fn start_connect(&mut self, cfg: ConnectionConfig, cx: &mut Context<Self>) {
         self.status = format!("Connecting to {}…", cfg.name);
         let db = self.db.clone();
-        // Keep a copy to configure the completion server after a successful connect.
-        let lsp_cfg = cfg.clone();
-        self.spawn_db(cx, async move { db.connect(cfg).await }, move |this, result, cx| {
+        // Resolve a stored password off the UI thread: a macOS Keychain read can
+        // block (and pop a system prompt), which would freeze the render loop and
+        // make the app appear to hang. `background_spawn` runs it on a worker
+        // thread; the connect future awaits the result.
+        let pw_task = cfg.password.is_none().then(|| {
+            let name = cfg.name.clone();
+            cx.background_spawn(async move { zdb_config::secret::get_password(&name) })
+        });
+        let fut = async move {
+            let mut cfg = cfg;
+            if let Some(task) = pw_task {
+                cfg.password = task.await;
+            }
+            // A copy (with the resolved password) to configure the completion
+            // server after a successful connect.
+            let lsp_cfg = cfg.clone();
+            (db.connect(cfg).await, lsp_cfg)
+        };
+        self.spawn_db(cx, fut, move |this, (result, lsp_cfg), cx| {
             match result {
                 Ok(conn) => {
                     log(format!("connected (conn={conn})"));
@@ -258,6 +274,55 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+    }
+
+    // Regression (macOS hang on selecting a saved connection): the keychain read
+    // must be deferred to a background task. `connect_saved` runs on the UI
+    // thread; a synchronous keychain read there froze gpui's render loop (and can
+    // pop a system prompt) → the app hung indefinitely. Assert the UI-thread
+    // portion never reads the keychain and the background task does. Cross-platform
+    // by construction; exercised on the macOS CI runner where the bug manifested.
+    #[gpui::test]
+    fn connect_saved_defers_keychain_off_ui_thread(cx: &mut TestAppContext) {
+        const NAME: &str = "zdb-regression-ui-thread-probe";
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, _w, cx| {
+                ws.settings.connections.push(ConnectionEntry {
+                    name: NAME.into(),
+                    host: "127.0.0.1".into(),
+                    port: 1, // nothing listens: the connect itself fails fast
+                    dbname: "d".into(),
+                    user: "u".into(),
+                    ssl_mode: "disable".into(),
+                });
+                // No session-cached password → the keychain is the only source.
+                assert_eq!(zdb_config::secret::probe::get_password_calls(NAME), 0);
+                ws.connect_saved(0, cx);
+                // The synchronous UI-thread click handler must NOT have touched
+                // the keychain (the deferred background task, not yet driven, will).
+                assert_eq!(
+                    zdb_config::secret::probe::get_password_calls(NAME),
+                    0,
+                    "connect_saved read the keychain on the UI thread (hangs macOS)"
+                );
+            })
+            .unwrap();
+
+        // Drive the executor so start_connect's background password lookup runs.
+        let mut resolved = false;
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if zdb_config::secret::probe::get_password_calls(NAME) > 0 {
+                resolved = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            resolved,
+            "start_connect never resolved the password off the UI thread"
+        );
     }
 
     #[gpui::test]
