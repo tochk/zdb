@@ -17,14 +17,37 @@ pub(crate) fn format_sql(sql: &str) -> String {
 
 /// Wrap a query so it is ordered by one of its result columns. `Default` clears
 /// the sort (returns the base query unchanged).
+///
+/// A trailing `LIMIT n` is hoisted OUTSIDE the wrapper: table-browse queries
+/// end in `LIMIT 500`, and ordering inside the limit would sort only the
+/// already-fetched page instead of the whole table (ORDER BY must run before
+/// LIMIT to pick the top-n of all rows).
 pub(crate) fn order_by_sql(base: &str, col: &str, sort: ColumnSort) -> String {
-    let q = base.trim().trim_end_matches(';');
+    let q = base.trim().trim_end_matches(';').trim_end();
     let ident = col.replace('"', "\"\"");
-    match sort {
-        ColumnSort::Default => base.to_string(),
-        ColumnSort::Ascending => format!("SELECT * FROM ({q}) AS _zdb ORDER BY \"{ident}\" ASC"),
-        ColumnSort::Descending => format!("SELECT * FROM ({q}) AS _zdb ORDER BY \"{ident}\" DESC"),
+    let dir = match sort {
+        ColumnSort::Default => return base.to_string(),
+        ColumnSort::Ascending => "ASC",
+        ColumnSort::Descending => "DESC",
+    };
+    let (inner, limit) = split_trailing_limit(q);
+    let tail = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+    format!("SELECT * FROM ({inner}) AS _zdb ORDER BY \"{ident}\" {dir}{tail}")
+}
+
+/// Split a trailing `LIMIT <digits>` off a query, if present. Conservative: the
+/// keyword must be preceded by whitespace and followed only by digits, so a
+/// `limit` inside an identifier or string literal never matches.
+fn split_trailing_limit(q: &str) -> (&str, Option<&str>) {
+    let lower = q.to_ascii_lowercase();
+    if let Some(pos) = lower.rfind("limit") {
+        let count = q[pos + 5..].trim();
+        let preceded_by_space = q[..pos].ends_with(|ch: char| ch.is_whitespace());
+        if preceded_by_space && !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()) {
+            return (q[..pos].trim_end(), Some(count));
+        }
     }
+    (q, None)
 }
 
 /// The single SQL statement containing byte offset `cursor`, trimmed. Splits on
@@ -229,5 +252,37 @@ mod tests {
         );
         // Default clears the sort.
         assert_eq!(order_by_sql("SELECT 1;", "x", ColumnSort::Default), "SELECT 1;");
+    }
+
+    #[test]
+    fn order_by_hoists_trailing_limit() {
+        // The LIMIT moves outside the ORDER BY so the whole table is sorted,
+        // not just the previously fetched page.
+        assert_eq!(
+            order_by_sql(
+                "SELECT * FROM \"public\".\"t\" LIMIT 500",
+                "qty",
+                ColumnSort::Ascending
+            ),
+            r#"SELECT * FROM (SELECT * FROM "public"."t") AS _zdb ORDER BY "qty" ASC LIMIT 500"#
+        );
+        // WHERE filter stays inside; LIMIT still hoisted.
+        assert_eq!(
+            order_by_sql(
+                "SELECT * FROM t WHERE id > 5 LIMIT 500",
+                "id",
+                ColumnSort::Descending
+            ),
+            r#"SELECT * FROM (SELECT * FROM t WHERE id > 5) AS _zdb ORDER BY "id" DESC LIMIT 500"#
+        );
+        // A non-numeric or embedded "limit" is left alone.
+        assert_eq!(
+            order_by_sql("SELECT 'limit 5'", "a", ColumnSort::Ascending),
+            r#"SELECT * FROM (SELECT 'limit 5') AS _zdb ORDER BY "a" ASC"#
+        );
+        assert_eq!(
+            order_by_sql("SELECT * FROM t LIMIT all", "a", ColumnSort::Ascending),
+            r#"SELECT * FROM (SELECT * FROM t LIMIT all) AS _zdb ORDER BY "a" ASC"#
+        );
     }
 }

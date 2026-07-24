@@ -441,7 +441,7 @@ impl Workspace {
                     .px_2()
                     .py_1()
                     .text_xs()
-                    .text_color(if e.ok { c.fg } else { c.fg_null })
+                    .text_color(if e.ok { c.fg } else { c.danger })
                     .truncate()
                     .child(format!("{glyph}  {}", oneline(&e.sql))),
             );
@@ -874,13 +874,20 @@ impl Workspace {
             ("icons/window-maximize.svg", WindowControlArea::Max)
         };
 
-        // Left: app name + connection status dot + active connection.
+        // Left: app name + connection status dot + active connection. On macOS
+        // the native traffic lights are drawn over the client area at the
+        // top-left (traffic_light_position in title_bar_options), so the
+        // content starts past them.
         let left = h_flex()
             .flex_shrink_0()
             .h_full()
             .items_center()
             .gap_2()
-            .pl_3()
+            .pl(if cfg!(target_os = "macos") {
+                px(80.)
+            } else {
+                px(12.)
+            })
             .child(
                 div()
                     .text_sm()
@@ -952,7 +959,7 @@ impl Workspace {
         // does NOT work: the results table's min-content width inflates the layout
         // width past the window, pushing the controls off-screen right. A definite
         // width pins the right edge.
-        let bar = h_flex()
+        let mut bar = h_flex()
             .w(window.viewport_size().width)
             .h(px(34.))
             .flex_shrink_0()
@@ -960,8 +967,12 @@ impl Workspace {
             .bg(c.header)
             .border_b_1()
             .border_color(c.border)
-            .child(drag)
-            .child(controls);
+            .child(drag);
+        // macOS keeps its native traffic lights; drawing our own controls would
+        // duplicate them (and ours would overlap the top-right corner).
+        if !cfg!(target_os = "macos") {
+            bar = bar.child(controls);
+        }
 
         bar
     }

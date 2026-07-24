@@ -20,6 +20,24 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # macOS regression guard: the app hung on selecting a saved connection because
+  # the keychain read ran on the UI thread (blocking gpui's render loop). Run the
+  # test suite on macOS, where that bug manifested.
+  test-macos:
+    name: test-macos
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-macos
+      # Integration tests needing a live Postgres stay gated on ZDB_TEST_* (unset
+      # here) and self-skip; the connect/UI-thread regression test needs no DB.
+      - name: Test
+        run: cargo test -p zdb-app -p zdb-config -p zdb-db
+
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -34,7 +52,7 @@ jobs:
           - { name: macos-arm64,   os: macos-14,         goos: darwin,  goarch: arm64, sqls: sqls-darwin-arm64,     bin: zdb }
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # gpui (blade/Vulkan) build + link deps on Linux. macOS/Windows ship theirs.
       - name: Linux deps
@@ -58,14 +76,27 @@ jobs:
         with:
           key: ${{ matrix.name }}
 
+      # The sqls build is deterministic (pinned VERSION in the script, CGO off),
+      # so cache the built binaries keyed on the script itself — a version bump
+      # edits the script and rolls the key. On a hit, skip Go setup + build.
+      - name: Cache sqls binaries
+        id: sqls-cache
+        uses: actions/cache@v6
+        with:
+          path: dist/sqls
+          key: sqls-${{ hashFiles('scripts/build-sqls.sh') }}
+
       - name: Go toolchain (for sqls)
-        uses: actions/setup-go@v5
+        if: steps.sqls-cache.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v7
         with:
           go-version: "1.25"
+          cache: false # no go.sum in this repo; sqls is cloned by the script
 
       # Cross-builds sqls for all arches into dist/sqls/ (Go, fast). Uniform via
       # bash on every runner (Git Bash on Windows).
       - name: Build sqls
+        if: steps.sqls-cache.outputs.cache-hit != 'true'
         shell: bash
         run: bash scripts/build-sqls.sh
 
@@ -85,7 +116,7 @@ jobs:
           chmod +x "dist/$out/$sqls_dst" || true
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zdb-${{ matrix.name }}
           path: dist/zdb-${{ matrix.name }}

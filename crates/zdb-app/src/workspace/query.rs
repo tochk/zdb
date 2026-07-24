@@ -55,9 +55,10 @@ async fn drain_query(mut rx: zdb_db::QueryStream) -> QueryOutcome {
 impl Workspace {
     // ---- query execution -------------------------------------------------
 
-    /// Run the active tab: a Table tab reloads; a Query/Scratch tab runs the
-    /// single statement under the cursor (or the whole editor if there's one
-    /// statement).
+    /// Run the active tab: a Table tab rebuilds its query from the CURRENT
+    /// filter input (not the stale `base_sql`, which still holds the last
+    /// applied WHERE); a Query/Scratch tab runs the single statement under the
+    /// cursor (or the whole editor if there's one statement).
     pub(super) fn run_active_tab(&mut self, cx: &mut Context<Self>) {
         let (id, is_table, full, cursor) = {
             let Some(tab) = self.active_tab() else { return };
@@ -70,7 +71,7 @@ impl Workspace {
             )
         };
         if is_table {
-            self.reload_data(id, cx);
+            self.apply_where(id, cx);
         } else {
             self.run_new_query(id, util::statement_at(&full, cursor), cx);
         }
@@ -403,6 +404,29 @@ mod tests {
                 ws.run_new_query(id, "SELECT 1".into(), cx);
                 assert!(ws.tab(id).unwrap().edit_target.is_none());
                 assert!(ws.tab(id).unwrap().edit_cols.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn run_button_rereads_table_filter(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                let input = ws.tab(id).unwrap().where_input.clone();
+                input.update(cx, |i, cx| i.set_value("id > 5", window, cx));
+                ws.apply_where(id, cx);
+                let base = ws.tab(id).unwrap().base_sql.clone().unwrap();
+                assert!(base.contains("WHERE id > 5"));
+
+                // Clearing the filter and pressing Run must drop the WHERE —
+                // without requiring Enter in the filter box first.
+                input.update(cx, |i, cx| i.set_value("", window, cx));
+                ws.run_active_tab(cx);
+                let base = ws.tab(id).unwrap().base_sql.clone().unwrap();
+                assert!(!base.contains("WHERE"));
             })
             .unwrap();
     }
