@@ -223,6 +223,14 @@ The WSL host can run Windows exes directly:
   title-bar controls on-screen (see the title-bar notes above). Not unit-testable
   (layout lives in gpui's render); verify by running with a 25-column table and
   wheel-scrolling — vertical scroll is unaffected by the clamp.
+  The clamp alone still LOOKED broken on Windows: gpui-component defaults to
+  `ScrollbarShow::Scrolling`, so the bar appears only *while* scrolling and fades
+  after 2s — and horizontal scroll is shift+wheel (gpui's Windows `WM_MOUSEWHEEL`
+  handler maps shift→`delta.x`) or a tilt wheel, neither of which anyone tries
+  without a visible bar. `main.rs` therefore sets
+  `Theme::global_mut(cx).scrollbar_show = ScrollbarShow::Always` right after
+  `Theme::change` (`Theme::change` only rewrites colors, so the setting survives
+  the settings modal's live light/dark switch).
 - `text_color` on an icon: `Icon::empty().path("icons/<name>.svg").text_color(rgba(..))`
   tints by alpha mask (gpui rasterizes the SVG → coverage → fills with the color), so
   Lucide stroke OR solid-fill SVGs both work. Don't tint an icon the same color as a
