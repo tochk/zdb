@@ -375,7 +375,15 @@ impl Workspace {
                             .text_color(c.fg_dim)
                             .child(format!("{schema}.{table}  WHERE")),
                     )
-                    .child(div().flex_grow().child(Input::new(&tab.where_input))),
+                    .child(div().flex_grow().child(Input::new(&tab.where_input)))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(c.fg_dim)
+                            .child("ORDER BY"),
+                    )
+                    .child(div().flex_grow().child(Input::new(&tab.order_input))),
             );
         }
         // The results area shows the grid, or — after EXPLAIN — the plan text in

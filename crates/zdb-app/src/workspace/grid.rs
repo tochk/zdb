@@ -101,8 +101,9 @@ impl TableDelegate for ResultDelegate {
             .size_full()
             .cursor_pointer()
             .child(format!("{name}{arrow}"))
-            .on_click(move |_: &ClickEvent, _window, app| {
-                weak.update(app, |w, cx| w.toggle_sort(tab_id, col_ix, cx)).ok();
+            .on_click(move |_: &ClickEvent, window, app| {
+                weak.update(app, |w, cx| w.toggle_sort(tab_id, col_ix, window, cx))
+                    .ok();
             })
     }
 
@@ -215,6 +216,9 @@ pub(crate) struct Tab {
     pub(crate) editor: Entity<InputState>,
     /// WHERE filter input (Table tabs).
     pub(crate) where_input: Entity<InputState>,
+    /// ORDER BY input (Table tabs). Header clicks write into it, so the text is
+    /// the single source of truth for the generated `ORDER BY`.
+    pub(crate) order_input: Entity<InputState>,
     pub(crate) table: Entity<TableState<ResultDelegate>>,
 
     // Current result.
@@ -278,6 +282,7 @@ impl Tab {
         title: String,
         editor: Entity<InputState>,
         where_input: Entity<InputState>,
+        order_input: Entity<InputState>,
         table: Entity<TableState<ResultDelegate>>,
     ) -> Self {
         Self {
@@ -286,6 +291,7 @@ impl Tab {
             title,
             editor,
             where_input,
+            order_input,
             table,
             headers: Vec::new(),
             rows: Vec::new(),
@@ -316,8 +322,17 @@ impl Tab {
         let weak = cx.weak_entity();
         let editor = make_sql_editor("SELECT * FROM ... ;  (press Run)", slot, id, window, cx);
         let where_input = cx.new(|cx| InputState::new(window, cx));
+        let order_input = cx.new(|cx| InputState::new(window, cx));
         let table = make_grid(weak, id, window, cx);
-        Tab::base(id, TabKind::Query, format!("Query {n}"), editor, where_input, table)
+        Tab::base(
+            id,
+            TabKind::Query,
+            format!("Query {n}"),
+            editor,
+            where_input,
+            order_input,
+            table,
+        )
     }
 
     /// The singleton scratch tab: editor seeded from disk and auto-saved on edit.
@@ -345,11 +360,20 @@ impl Tab {
         })
         .detach();
         let where_input = cx.new(|cx| InputState::new(window, cx));
+        let order_input = cx.new(|cx| InputState::new(window, cx));
         let table = make_grid(weak, id, window, cx);
-        Tab::base(id, TabKind::Scratch, "Scratch".into(), editor, where_input, table)
+        Tab::base(
+            id,
+            TabKind::Scratch,
+            "Scratch".into(),
+            editor,
+            where_input,
+            order_input,
+            table,
+        )
     }
 
-    /// A table-browse tab; the WHERE input re-runs the query on Enter.
+    /// A table-browse tab; the WHERE / ORDER BY inputs re-run the query on Enter.
     pub(crate) fn table(
         id: u64,
         schema: String,
@@ -362,12 +386,16 @@ impl Tab {
         let editor = make_sql_editor("", slot, id, window, cx);
         let where_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("WHERE … (Enter to filter)"));
-        cx.subscribe(&where_input, move |this, _i, event: &InputEvent, cx| {
-            if let InputEvent::PressEnter { .. } = event {
-                this.apply_where(id, cx);
-            }
-        })
-        .detach();
+        let order_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("ORDER BY … (Enter to apply)"));
+        for input in [&where_input, &order_input] {
+            cx.subscribe(input, move |this, _i, event: &InputEvent, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    this.apply_where(id, cx);
+                }
+            })
+            .detach();
+        }
         let table = make_grid(weak, id, window, cx);
         let title = format!("{schema}.{table_name}");
         Tab::base(
@@ -376,6 +404,7 @@ impl Tab {
             title,
             editor,
             where_input,
+            order_input,
             table,
         )
     }

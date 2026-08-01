@@ -313,8 +313,14 @@ impl Workspace {
 
     /// Clicking a header cycles its sort: none → ascending → descending → none,
     /// re-running the query ordered by that column.
-    pub(super) fn toggle_sort(&mut self, tab_id: u64, col_ix: usize, cx: &mut Context<Self>) {
-        let (next, base, headers) = {
+    pub(super) fn toggle_sort(
+        &mut self,
+        tab_id: u64,
+        col_ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (next, base, headers, is_table) = {
             let Some(tab) = self.tab_mut(tab_id) else { return };
             let next = match tab.sort_state {
                 Some((c, false)) if c == col_ix => Some((col_ix, true)),
@@ -322,8 +328,34 @@ impl Workspace {
                 _ => Some((col_ix, false)),
             };
             tab.sort_state = next;
-            (next, tab.base_sql.clone(), tab.headers.clone())
+            let is_table = matches!(tab.kind, TabKind::Table { .. });
+            (next, tab.base_sql.clone(), tab.headers.clone(), is_table)
         };
+        // A table tab owns all the parts of its query: push the new sort into the
+        // ORDER BY input and rebuild, instead of rewriting the SQL it produced
+        // last time.
+        if is_table {
+            let clause = match next {
+                Some((c, desc)) => headers
+                    .get(c)
+                    .map(|name| {
+                        format!(
+                            "\"{}\" {}",
+                            name.replace('"', "\"\""),
+                            if desc { "DESC" } else { "ASC" }
+                        )
+                    })
+                    .unwrap_or_default(),
+                None => String::new(),
+            };
+            if let Some(input) = self.tab(tab_id).map(|t| t.order_input.clone()) {
+                input.update(cx, |state, cx| state.set_value(clause, window, cx));
+            }
+            let sql = self.table_query(tab_id, cx);
+            log(format!("sort: {sql}"));
+            self.run_sql(tab_id, sql, cx);
+            return;
+        }
         let Some(base) = base else {
             log("sort: no base query");
             return;
@@ -363,11 +395,11 @@ mod tests {
                     tab.headers = vec!["qty".into()];
                 }
                 assert_eq!(ws.tab(id).unwrap().sort_state, None);
-                ws.toggle_sort(id, 0, cx);
+                ws.toggle_sort(id, 0, window, cx);
                 assert_eq!(ws.tab(id).unwrap().sort_state, Some((0, false))); // ascending
-                ws.toggle_sort(id, 0, cx);
+                ws.toggle_sort(id, 0, window, cx);
                 assert_eq!(ws.tab(id).unwrap().sort_state, Some((0, true))); // descending
-                ws.toggle_sort(id, 0, cx);
+                ws.toggle_sort(id, 0, window, cx);
                 assert_eq!(ws.tab(id).unwrap().sort_state, None); // cleared
             })
             .unwrap();

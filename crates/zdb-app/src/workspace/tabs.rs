@@ -152,7 +152,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// `SELECT * FROM <table> [WHERE …] LIMIT n` for a table tab.
+    /// `SELECT * FROM <table> [WHERE …] [ORDER BY …] LIMIT n` for a table tab.
+    /// The whole statement is rebuilt from the tab's own parts (filter + sort),
+    /// so sorting never has to rewrite previously generated SQL.
     pub(super) fn table_query(&self, tab_id: u64, cx: &App) -> String {
         let Some(tab) = self.tab(tab_id) else {
             return String::new();
@@ -166,18 +168,30 @@ impl Workspace {
         } else {
             format!(" WHERE {w}")
         };
+        let o = tab.order_input.read(cx).value().trim().to_string();
+        let order = if o.is_empty() {
+            String::new()
+        } else {
+            format!(" ORDER BY {o}")
+        };
         format!(
-            "SELECT * FROM \"{}\".\"{}\"{} LIMIT {}",
+            "SELECT * FROM \"{}\".\"{}\"{}{} LIMIT {}",
             s.replace('"', "\"\""),
             t.replace('"', "\"\""),
             filter,
+            order,
             ROW_LIMIT
         )
     }
 
+    /// Re-run a table tab from its WHERE / ORDER BY inputs. A hand-typed ORDER BY
+    /// replaces whatever a header click had set, so the header arrows are cleared.
     pub(super) fn apply_where(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         if !matches!(self.tab(tab_id).map(|t| &t.kind), Some(TabKind::Table { .. })) {
             return;
+        }
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.sort_state = None;
         }
         let sql = self.table_query(tab_id, cx);
         self.run_new_query(tab_id, sql, cx);
@@ -207,6 +221,51 @@ mod tests {
                 assert_eq!(
                     ws.table_query(id, cx),
                     "SELECT * FROM \"public\".\"users\" LIMIT 500"
+                );
+            })
+            .unwrap();
+    }
+
+    /// A header click on a table tab produces a plain `ORDER BY` in the generated
+    /// query (no subquery wrapper) and fills the ORDER BY input.
+    #[gpui::test]
+    fn table_query_builds_order_by(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                ws.tab_mut(id).unwrap().headers = vec!["id".into(), "name".into()];
+                ws.tab(id)
+                    .unwrap()
+                    .where_input
+                    .update(cx, |i, cx| i.set_value("id > 5", window, cx));
+
+                ws.toggle_sort(id, 1, window, cx);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 ORDER BY \"name\" ASC LIMIT 500"
+                );
+                ws.toggle_sort(id, 1, window, cx);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 ORDER BY \"name\" DESC LIMIT 500"
+                );
+                // Third click clears the sort and empties the input.
+                ws.toggle_sort(id, 1, window, cx);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 LIMIT 500"
+                );
+
+                // A hand-typed clause is used verbatim.
+                ws.tab(id)
+                    .unwrap()
+                    .order_input
+                    .update(cx, |i, cx| i.set_value("name DESC NULLS LAST", window, cx));
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 ORDER BY name DESC NULLS LAST LIMIT 500"
                 );
             })
             .unwrap();
