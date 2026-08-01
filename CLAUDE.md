@@ -211,11 +211,27 @@ The WSL host can run Windows exes directly:
   `Size` (Medium → 12px horizontal padding + a min-height), so the edit text shifted
   right + down vs the static `td_text` (which is `px_2` = 8px). FIX: `.small()` sets
   `input_px` to 8px (== `px_2`) and a tiny min-height; wrap with NO extra padding or
-  border (those re-introduce the shift), just a subtle `bg(c.active)` to signal edit
-  mode (matched by `pt(px(3.))` to the display cells' top-aligned `py_1`). A staged-edit
-  cell is flagged with a blue fill (`EDITED_BG`) + a solid blue `border_l_2` "dirty
-  gutter" that stays visible over the row-selection tint; hover keeps the blue identity
-  (`EDITED_HOVER`, darker) instead of the neutral `c.hover`. `edited_cells:
+  border (those re-introduce the shift), just a subtle `bg(c.active)` to signal edit mode.
+  **Cell highlights must fill the CELL, and the table pads the td itself.** The widget's
+  `render_cell` (state.rs) applies `table_cell_size(size)` → `table_cell_padding()`
+  (Medium = 8px h / 4px v) to the box that wraps our `render_td` element, so a `size_full()`
+  highlight paints INSIDE that padding and reads visibly smaller than the cell (short of
+  the row height, narrow of the column). FIX: build columns with `Column::p_0()` (a
+  per-column `paddings` overrides the size padding) and re-add the padding in OUR elements
+  — `td_text` and `render_th` are `size_full().flex().items_center().px_2()`, which also
+  vertically centers text in the 32px row and lines the display text up with the input.
+  A staged-edit cell is flagged with a blue fill (`EDITED_BG`) + a solid blue left "dirty
+  gutter" bar that stays visible over the row-selection tint. That bar is an ABSOLUTE
+  overlay child (`absolute left_0 top_0 bottom_0 w(px(2.))`), **not `border_l_2`**: a real
+  border participates in layout and shifted the cell's text 2px right, obvious next to
+  unedited rows. Hover keeps the blue identity (`EDITED_HOVER`, darker) instead of the
+  neutral `c.hover`. **Column separators** are ours too (the widget draws only row
+  lines; `TableOptions` has no column-border flag): `col_sep(col_ix, c)` — a 1px
+  absolute overlay in `c.grid` (= `theme.table_row_border`, matching the row lines) on
+  each cell's LEFT edge, skipped for column 0, added in `render_th` and all three
+  `render_td` branches (before the dirty gutter, so that paints over it). Left edge,
+  not right: the widget pads the header's inner flex on the right (`offset_pr`), so a
+  right-edge rule would sit 8px off from the body's. `edited_cells:
   HashSet<(row,col)>` tracks them, cleared whenever `pending` is. `orig_rows` snapshots
   the loaded values: editing a cell back to its original drops the staged `Update`
   (`remove_pending_update`, which also dedups re-edits of the same cell) and unmarks it.

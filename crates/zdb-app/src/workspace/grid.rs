@@ -53,8 +53,14 @@ impl ResultDelegate {
             .iter()
             .enumerate()
             .map(|(i, h)| {
+                // `p_0()` zeroes the widget's own cell padding (`table_cell_padding`,
+                // 8px/4px) so OUR td element fills the whole cell box — otherwise the
+                // edit/edited highlight paints inside that padding and reads visibly
+                // smaller than the cell. We re-add the padding ourselves in `td_text`
+                // / `render_th` so the text lands in the same place as before.
                 Column::new(SharedString::from(format!("c{i}")), SharedString::from(h.clone()))
                     .width(px(180.))
+                    .p_0()
             })
             .collect();
         self.rows = rows;
@@ -99,7 +105,14 @@ impl TableDelegate for ResultDelegate {
         div()
             .id(SharedString::from(format!("th-{col_ix}")))
             .size_full()
+            .flex()
+            .items_center()
+            // Columns are `p_0()`, so the header supplies its own padding (matches
+            // `td_text`'s `px_2` → header and cell text share one left edge).
+            .px_2()
+            .relative()
             .cursor_pointer()
+            .children(col_sep(col_ix, palette(cx)))
             .child(format!("{name}{arrow}"))
             .on_click(move |_: &ClickEvent, window, app| {
                 weak.update(app, |w, cx| w.toggle_sort(tab_id, col_ix, window, cx))
@@ -134,16 +147,18 @@ impl TableDelegate for ResultDelegate {
             // Seamless inline edit: `appearance(false)` drops the input's border /
             // background, and `.small()` sets its horizontal padding to 8px — the
             // same as `td_text`'s `px_2` — so the text sits exactly where the
-            // display text was (no shift right/down). The cell just gets a subtle
-            // active background to signal edit mode. No wrapper padding/border (that
-            // was the original "text shifts right and down" problem).
+            // display text was (no shift right/down). The wrapper carries NO padding
+            // or border of its own (that was the original "text shifts right and
+            // down" problem); it fills the whole cell (columns are `p_0()`) and
+            // centers the input vertically, so the highlight matches the cell box.
             return div()
                 .size_full()
-                // Small top padding nudges the vertically-centered input text down
-                // to line up with the display cells (which are top-aligned + py_1).
-                .pt(px(3.))
+                .flex()
+                .items_center()
+                .relative()
                 .bg(c.active)
                 .text_sm()
+                .children(col_sep(col_ix, c))
                 .child(Input::new(&cell_input).appearance(false).small())
                 .into_any_element();
         }
@@ -154,15 +169,29 @@ impl TableDelegate for ResultDelegate {
             div()
                 .id(SharedString::from(format!("cell-{row_ix}-{col_ix}")))
                 .size_full()
+                .relative()
+                // Column separator goes in FIRST so the dirty gutter below paints
+                // over it (both sit on the left edge).
+                .children(col_sep(col_ix, c))
                 // Staged-edit marker: blue fill + a solid blue left bar (the bar
                 // stays visible even over the row-selection tint, like a dirty
                 // gutter in DataGrip / Zed). Hover keeps the blue identity (a bit
                 // darker) rather than reverting to the neutral hover color.
+                // The bar is an ABSOLUTE overlay, not `border_l_2`: a real border
+                // takes part in layout and shifted the cell text 2px right, which
+                // was plainly visible next to unedited rows.
                 .when(edited, |d| {
                     d.bg(rgba(EDITED_BG))
-                        .border_l_2()
-                        .border_color(rgba(EDITED_BAR))
                         .hover(|s| s.bg(rgba(EDITED_HOVER)))
+                        .child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .top_0()
+                                .bottom_0()
+                                .w(px(2.))
+                                .bg(rgba(EDITED_BAR)),
+                        )
                 })
                 .when(!edited, |d| d.hover(|s| s.bg(c.hover)))
                 .cursor_pointer()
@@ -180,13 +209,43 @@ impl TableDelegate for ResultDelegate {
                 })
                 .into_any_element()
         } else {
-            base.into_any_element()
+            base.relative()
+                .children(col_sep(col_ix, c))
+                .into_any_element()
         }
     }
 }
 
+/// A 1px rule on a cell's LEFT edge, separating it from the previous column
+/// (skipped for column 0 so no line hugs the table's left edge).
+///
+/// It is an absolute overlay rather than `border_l_1`/`border_r_1` on purpose:
+/// a real border takes part in layout and would nudge the cell text sideways —
+/// and it must be the left edge in BOTH the header and the body, because the
+/// widget pads the header's inner flex on the right (`offset_pr`) so a
+/// right-edge rule would not line up between the two.
+fn col_sep(col_ix: usize, c: Colors) -> Option<gpui::Div> {
+    (col_ix > 0).then(|| {
+        div()
+            .absolute()
+            .left_0()
+            .top_0()
+            .bottom_0()
+            .w(px(1.))
+            .bg(c.grid)
+    })
+}
+
 fn td_text(cell: Option<CellValue>, c: Colors) -> gpui::Div {
-    let base = div().px_2().py_1().text_sm();
+    // Fills the cell (columns are `p_0()`) and carries the padding the widget used
+    // to add, so highlights cover the full cell while the text stays put. Vertically
+    // centered, matching the inline edit input.
+    let base = div()
+        .size_full()
+        .flex()
+        .items_center()
+        .px_2()
+        .text_sm();
     match cell {
         Some(CellValue::Text(s)) => base.text_color(c.fg).child(s),
         Some(CellValue::Null) => base.text_color(c.fg_null).child("NULL"),

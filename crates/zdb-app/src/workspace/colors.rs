@@ -21,6 +21,9 @@ pub(crate) struct Colors {
     pub(crate) active: Hsla,
     /// Error/destructive foreground (readable in both theme modes).
     pub(crate) danger: Hsla,
+    /// Result-grid rule; same token the table widget uses for its row lines, so
+    /// our column separators match them.
+    pub(crate) grid: Hsla,
 }
 
 pub(crate) fn palette(cx: &App) -> Colors {
@@ -39,6 +42,7 @@ pub(crate) fn palette(cx: &App) -> Colors {
         hover: t.list_hover,
         active: t.list_active,
         danger: t.danger,
+        grid: t.table_row_border,
     }
 }
 
