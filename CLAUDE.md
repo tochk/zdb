@@ -189,12 +189,48 @@ The WSL host can run Windows exes directly:
   OLD icon from its per-path icon cache even when the taskbar/window icon is correct —
   that's host-side staleness (clear with `ie4uinit.exe -show` / delete iconcache), not
   a build problem.
+- **Window geometry is persisted** (`Settings.window: Option<WindowState>` in zdb-config;
+  `zdb_config::save_window_state` re-reads the file before writing so it never clobbers
+  other settings). `main.rs` turns it into `WindowOptions.window_bounds`
+  (`Maximized` when the flag is set — gpui stores the RESTORE bounds in that variant),
+  dropping bounds that intersect no current display (unplugged monitor → off-screen window).
+  Saving has two paths because neither alone is enough: `Workspace::new` registers
+  `window.on_window_should_close` (Windows close button / Alt+F4 → WM_CLOSE) and the Linux
+  title-bar close button calls `save_window_geometry` before `remove_window()` (that call
+  bypasses the OS close path). PLUS `render` calls `track_window_geometry`, which debounces
+  a write 500ms after the geometry stops changing — resize renders every frame, and a hard
+  exit never reaches any close hook. The disk write is `#[cfg(not(test))]` (tests would
+  otherwise stomp the dev machine's real settings.json).
+  Verifying on WSL X11: `xdotool windowsize/windowmove` DO work, but synthetic
+  `xdotool click`/`key alt+F4` are ignored by the app — don't try to test close paths by
+  clicking here; resize + read `~/.config/zdb/settings.json` instead.
 - Resizable panels: gpui-component seeds any `resizable_panel()` WITHOUT an explicit
   `.size()` to `PANEL_MIN_SIZE` (state.rs `sync_panels_count`), then ratio-scales to
   the container. A group where the first panel had no size squeezed the last panel
   off-screen (the bottom query-log / review pane was clipped below the window). Give
   EVERY panel an explicit `.size()` (the ratios are scaled to fit) — don't leave one
   unsized expecting it to flex-fill.
+- **Wide results must be able to scroll horizontally**: a flex item's automatic
+  minimum size is its MIN-CONTENT width, and for the grid that's the sum of every
+  column width (180px × N). Every ancestor — including gpui-component's
+  `resizable_panel` (`flex_grow` + `size_full`, no min-width of its own) — then grows
+  to that width, so the Table element believes it fits, its built-in horizontal
+  scrollbar never engages, and the off-window columns are simply clipped by the root
+  `overflow_hidden` (the "can't scroll right on wide tables" bug). FIX: `min_w(px(0.))`
+  + `overflow_hidden` on the WHOLE chain down to the Table — `render_center`'s root,
+  `render_tab_body`'s root, the `results` v_flex, and the div wrapping
+  `Table::new(...)`. One missing link re-breaks it. Same clamp is what keeps the
+  title-bar controls on-screen (see the title-bar notes above). Not unit-testable
+  (layout lives in gpui's render); verify by running with a 25-column table and
+  wheel-scrolling — vertical scroll is unaffected by the clamp.
+  The clamp alone still LOOKED broken on Windows: gpui-component defaults to
+  `ScrollbarShow::Scrolling`, so the bar appears only *while* scrolling and fades
+  after 2s — and horizontal scroll is shift+wheel (gpui's Windows `WM_MOUSEWHEEL`
+  handler maps shift→`delta.x`) or a tilt wheel, neither of which anyone tries
+  without a visible bar. `main.rs` therefore sets
+  `Theme::global_mut(cx).scrollbar_show = ScrollbarShow::Always` right after
+  `Theme::change` (`Theme::change` only rewrites colors, so the setting survives
+  the settings modal's live light/dark switch).
 - `text_color` on an icon: `Icon::empty().path("icons/<name>.svg").text_color(rgba(..))`
   tints by alpha mask (gpui rasterizes the SVG → coverage → fills with the color), so
   Lucide stroke OR solid-fill SVGs both work. Don't tint an icon the same color as a
@@ -211,11 +247,27 @@ The WSL host can run Windows exes directly:
   `Size` (Medium → 12px horizontal padding + a min-height), so the edit text shifted
   right + down vs the static `td_text` (which is `px_2` = 8px). FIX: `.small()` sets
   `input_px` to 8px (== `px_2`) and a tiny min-height; wrap with NO extra padding or
-  border (those re-introduce the shift), just a subtle `bg(c.active)` to signal edit
-  mode (matched by `pt(px(3.))` to the display cells' top-aligned `py_1`). A staged-edit
-  cell is flagged with a blue fill (`EDITED_BG`) + a solid blue `border_l_2` "dirty
-  gutter" that stays visible over the row-selection tint; hover keeps the blue identity
-  (`EDITED_HOVER`, darker) instead of the neutral `c.hover`. `edited_cells:
+  border (those re-introduce the shift), just a subtle `bg(c.active)` to signal edit mode.
+  **Cell highlights must fill the CELL, and the table pads the td itself.** The widget's
+  `render_cell` (state.rs) applies `table_cell_size(size)` → `table_cell_padding()`
+  (Medium = 8px h / 4px v) to the box that wraps our `render_td` element, so a `size_full()`
+  highlight paints INSIDE that padding and reads visibly smaller than the cell (short of
+  the row height, narrow of the column). FIX: build columns with `Column::p_0()` (a
+  per-column `paddings` overrides the size padding) and re-add the padding in OUR elements
+  — `td_text` and `render_th` are `size_full().flex().items_center().px_2()`, which also
+  vertically centers text in the 32px row and lines the display text up with the input.
+  A staged-edit cell is flagged with a blue fill (`EDITED_BG`) + a solid blue left "dirty
+  gutter" bar that stays visible over the row-selection tint. That bar is an ABSOLUTE
+  overlay child (`absolute left_0 top_0 bottom_0 w(px(2.))`), **not `border_l_2`**: a real
+  border participates in layout and shifted the cell's text 2px right, obvious next to
+  unedited rows. Hover keeps the blue identity (`EDITED_HOVER`, darker) instead of the
+  neutral `c.hover`. **Column separators** are ours too (the widget draws only row
+  lines; `TableOptions` has no column-border flag): `col_sep(col_ix, c)` — a 1px
+  absolute overlay in `c.grid` (= `theme.table_row_border`, matching the row lines) on
+  each cell's LEFT edge, skipped for column 0, added in `render_th` and all three
+  `render_td` branches (before the dirty gutter, so that paints over it). Left edge,
+  not right: the widget pads the header's inner flex on the right (`offset_pr`), so a
+  right-edge rule would sit 8px off from the body's. `edited_cells:
   HashSet<(row,col)>` tracks them, cleared whenever `pending` is. `orig_rows` snapshots
   the loaded values: editing a cell back to its original drops the staged `Update`
   (`remove_pending_update`, which also dedups re-edits of the same cell) and unmarks it.
@@ -245,10 +297,18 @@ The WSL host can run Windows exes directly:
 
 - **Center is TABBED (Zed-style)** — `Workspace.tabs: Vec<Tab>` + `active: Option<usize>`
   (`None` = welcome pane). Each `Tab` (id, `TabKind::{Query,Scratch,Table}`, title) OWNS
-  its `editor`/`where_input`/`table` Entities + ALL result+edit state (headers/rows/
+  its `editor`/`where_input`/`order_input`/`table` Entities + ALL result+edit state (headers/rows/
   orig_rows/base_sql/last_sql/sort_state/edit_target/edit_cols/editing/current_row/
   new_row_idx/pending/edited_cells/running) so switching tabs preserves each one's grid,
   selection, and staged edits. Key rules baked in:
+  - **Table-tab sorting rebuilds, never rewrites.** A Table tab's SQL is generated by
+    `tabs.rs::table_query` from its own parts: `SELECT * FROM "s"."t" [WHERE <where_input>]
+    [ORDER BY <order_input>] LIMIT 500`. A header click (`query.rs::toggle_sort`) writes
+    `"col" ASC|DESC` into `order_input` and regenerates — so the ORDER BY text field (next
+    to WHERE in the table toolbar, Enter re-runs) is the single source of truth, and typing
+    in it clears `sort_state` (header arrows off). Do NOT re-parse the previous SQL. Query /
+    Scratch tabs sort arbitrary user SQL, so they still use `util::order_by_sql`'s
+    `SELECT * FROM (<base>) AS _zdb ORDER BY …` wrapper (LIMIT hoisted out).
   - The flat result fields were REMOVED from `Workspace`; every result/edit method takes a
     `tab_id` and looks up `tab_mut(id)`. Toolbar/action callers pass `active_id()`.
     `cell_input` stays SHARED on `Workspace` (only the active tab edits one cell at a time;
@@ -265,6 +325,16 @@ The WSL host can run Windows exes directly:
     `open_query_tab` ("Query N"). The tab-strip close `x` is a SEPARATE clickable sibling
     of the activate region (nesting two `on_click`s would fire both → activate a
     just-removed tab).
+  - **Right-click menu on a tab chip** (Close / Close Others / Close to the Right /
+    Close All → `close_tab`/`close_other_tabs`/`close_tabs_right`/`close_all_tabs`).
+    `ContextMenuExt::context_menu` hardcodes its element id (`"context-menu"`), and
+    gpui keys element state by the id PATH — so N sibling chips with no id'd ancestor
+    share ONE `ContextMenuState`: every chip renders the popup + its full-window
+    `occlude()` overlay, the same `PopupMenu` entity is rendered N times, and its
+    items' interactive state collides → the menu LOOKS fine but clicks do nothing.
+    FIX: wrap each chip in a uniquely id'd div (`div().id(format!("tabchip-{id}"))`)
+    so each context menu gets its own state. (Tree rows escape this because
+    `uniform_list` already pushes a per-item id.)
   - `activate_tab` focuses the tab's input only when `window.root::<gpui_component::Root>()`
     exists — headless `#[gpui::test]` windows have no `Root`, and focusing a code-editor
     input there panics (`root.rs` "window first layer should be a Root").

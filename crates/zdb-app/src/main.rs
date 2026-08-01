@@ -9,7 +9,10 @@ mod terminal;
 mod workspace;
 
 use assets::Assets;
-use gpui::{px, size, AppContext, Application, KeyBinding, TitlebarOptions, WindowOptions};
+use gpui::{
+    point, px, size, AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds,
+    WindowOptions,
+};
 use gpui_component::TitleBar;
 use workspace::{
     ClosePalette, RunQuery, ToggleConnections, TogglePalette, ToggleScratch, ToggleSettings,
@@ -42,6 +45,7 @@ fn main() {
 
     let settings = zdb_config::Settings::load().unwrap_or_default();
     let theme = settings.theme;
+    let saved_window = settings.window;
     let db = DbHandle::spawn();
     // Auto-connect only from explicit env (dev). Otherwise the connection
     // manager opens with the saved list for the user to pick.
@@ -54,6 +58,15 @@ fn main() {
         register_sql_language();
         // White scheme by default; `theme: "dark"` in settings.json switches it.
         gpui_component::Theme::change(theme_mode(theme), None, cx);
+        // Scrollbars stay VISIBLE. gpui-component defaults to
+        // `ScrollbarShow::Scrolling` — the bar only appears *while* scrolling and
+        // fades after 2s, so a wide result grid gives no hint that its off-screen
+        // columns are reachable at all (horizontal scroll is shift+wheel or a tilt
+        // wheel; without a bar there's nothing to discover or drag). `Always` is
+        // the data-grid convention. `Theme::change` (the settings modal's live
+        // light/dark switch) only touches colors, so this survives a theme swap.
+        gpui_component::Theme::global_mut(cx).scrollbar_show =
+            gpui_component::scroll::ScrollbarShow::Always;
 
         cx.bind_keys([
             KeyBinding::new("ctrl-enter", RunQuery, None),
@@ -83,19 +96,42 @@ fn main() {
         // what the taskbar / alt-tab show. `title_bar_options()` leaves it None,
         // which the Windows backend turns into an empty window name (blank
         // taskbar tooltip). The workspace keeps it in sync with the connection.
+        // Reopen where we were left: the workspace saves the geometry when the
+        // window closes. Bounds that no longer land on any connected display
+        // (monitor unplugged / resolution change) are dropped so the window
+        // can't open off-screen.
+        let displays = cx.displays();
+        let window_bounds = saved_window.and_then(|w| {
+            let bounds = Bounds {
+                origin: point(px(w.x), px(w.y)),
+                size: size(px(w.width), px(w.height)),
+            };
+            let on_screen = displays.iter().any(|d| d.bounds().intersects(&bounds));
+            if !on_screen {
+                return None;
+            }
+            Some(if w.maximized {
+                WindowBounds::Maximized(bounds)
+            } else {
+                WindowBounds::Windowed(bounds)
+            })
+        });
+
         let window_options = WindowOptions {
             titlebar: Some(TitlebarOptions {
                 title: Some("zdb".into()),
                 ..TitleBar::title_bar_options()
             }),
             window_min_size: Some(size(px(640.), px(480.))),
+            window_bounds,
             ..Default::default()
         };
 
         cx.spawn(async move |cx| {
             cx.open_window(window_options, |window, cx| {
-                let view =
-                    cx.new(|cx| Workspace::new(db.clone(), settings.clone(), auto.clone(), window, cx));
+                let view = cx.new(|cx| {
+                    Workspace::new(db.clone(), settings.clone(), auto.clone(), window, cx)
+                });
                 cx.new(|cx| gpui_component::Root::new(view, window, cx))
             })
             .expect("failed to open zdb window");

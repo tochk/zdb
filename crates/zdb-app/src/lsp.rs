@@ -293,7 +293,10 @@ fn word_start(text: &str, offset: usize) -> usize {
 /// its `label`.
 fn with_word_range(resp: CompletionResponse, start: Position, end: Position) -> CompletionResponse {
     let fix = |item: &mut CompletionItem| {
-        let new_text = item.insert_text.take().unwrap_or_else(|| item.label.clone());
+        let new_text = item
+            .insert_text
+            .take()
+            .unwrap_or_else(|| item.label.clone());
         item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
             range: Range { start, end },
             new_text,

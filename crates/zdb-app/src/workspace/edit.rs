@@ -22,7 +22,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let text = {
-            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let Some(tab) = self.tab_mut(tab_id) else {
+                return;
+            };
             if tab.edit_cols.get(col).map_or(true, |o| o.is_none()) {
                 return;
             }
@@ -34,7 +36,8 @@ impl Workspace {
             tab.current_row = Some(row);
             text
         };
-        self.cell_input.update(cx, |inp, cx| inp.set_value(text, window, cx));
+        self.cell_input
+            .update(cx, |inp, cx| inp.set_value(text, window, cx));
         let handle = self.cell_input.read(cx).focus_handle(cx);
         handle.focus(window);
         cx.notify();
@@ -50,7 +53,9 @@ impl Workspace {
 
     /// Stage the active tab's cell edit (build the UPDATE and show it for review).
     pub(super) fn commit_cell_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(tab_id) = self.active_id() else { return };
+        let Some(tab_id) = self.active_id() else {
+            return;
+        };
         let Some((row, col)) = self.tab_mut(tab_id).and_then(|t| t.editing.take()) else {
             return;
         };
@@ -73,7 +78,9 @@ impl Workspace {
             return;
         }
 
-        let Some(target) = self.tab(tab_id).and_then(|t| t.edit_target.clone()) else { return };
+        let Some(target) = self.tab(tab_id).and_then(|t| t.edit_target.clone()) else {
+            return;
+        };
         let Some(real_col) = self
             .tab(tab_id)
             .and_then(|t| t.edit_cols.get(col).and_then(|o| o.clone()))
@@ -81,7 +88,9 @@ impl Workspace {
             return;
         };
         // PK must be read from the original row value before the optimistic update.
-        let Some(pk) = self.row_pk(tab_id, row, &target) else { return };
+        let Some(pk) = self.row_pk(tab_id, row, &target) else {
+            return;
+        };
 
         // Drop any earlier staged change for this same cell, so re-editing a cell
         // replaces (not stacks) its UPDATE and reverting clears it cleanly.
@@ -125,8 +134,15 @@ impl Workspace {
 
     /// Remove any staged `Update` for the given PK that sets `col` (used to
     /// dedup re-edits and to drop an edit reverted to its original value).
-    pub(super) fn remove_pending_update(&mut self, tab_id: u64, pk: &[(String, CellValue)], col: &str) {
-        let Some(tab) = self.tab_mut(tab_id) else { return };
+    pub(super) fn remove_pending_update(
+        &mut self,
+        tab_id: u64,
+        pk: &[(String, CellValue)],
+        col: &str,
+    ) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
         tab.pending.retain_mut(|e| match e {
             RowEdit::Update { pk: p, set } if p.as_slice() == pk => {
                 set.retain(|(c, _)| c != col);
@@ -139,7 +155,9 @@ impl Workspace {
     /// Append a blank editable row; cells are filled by double-clicking.
     pub(super) fn add_row(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         {
-            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let Some(tab) = self.tab_mut(tab_id) else {
+                return;
+            };
             if tab.edit_target.is_none() {
                 return;
             }
@@ -161,7 +179,9 @@ impl Workspace {
             let (Some(idx), Some(target)) = (tab.new_row_idx, tab.edit_target.clone()) else {
                 return;
             };
-            let Some(row) = tab.rows.get(idx).cloned() else { return };
+            let Some(row) = tab.rows.get(idx).cloned() else {
+                return;
+            };
             let values: Vec<(String, CellValue)> = tab
                 .edit_cols
                 .iter()
@@ -186,7 +206,9 @@ impl Workspace {
 
     /// Stage a DELETE for the selected row, or discard the unsaved new row.
     pub(super) fn delete_current_row(&mut self, tab_id: u64, cx: &mut Context<Self>) {
-        let Some(row) = self.tab(tab_id).and_then(|t| t.current_row) else { return };
+        let Some(row) = self.tab(tab_id).and_then(|t| t.current_row) else {
+            return;
+        };
         if Some(row) == self.tab(tab_id).and_then(|t| t.new_row_idx) {
             if let Some(tab) = self.tab_mut(tab_id) {
                 if row < tab.rows.len() {
@@ -200,8 +222,12 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let Some(target) = self.tab(tab_id).and_then(|t| t.edit_target.clone()) else { return };
-        let Some(pk) = self.row_pk(tab_id, row, &target) else { return };
+        let Some(target) = self.tab(tab_id).and_then(|t| t.edit_target.clone()) else {
+            return;
+        };
+        let Some(pk) = self.row_pk(tab_id, row, &target) else {
+            return;
+        };
         self.stage(tab_id, RowEdit::Delete { pk }, &target, cx);
     }
 
@@ -220,7 +246,13 @@ impl Workspace {
 
     /// Add an edit to the tab's staged batch. Edits accumulate across the table
     /// and are all applied in one transaction on Apply.
-    pub(super) fn stage(&mut self, tab_id: u64, edit: RowEdit, target: &EditTarget, cx: &mut Context<Self>) {
+    pub(super) fn stage(
+        &mut self,
+        tab_id: u64,
+        edit: RowEdit,
+        target: &EditTarget,
+        cx: &mut Context<Self>,
+    ) {
         // Validate the statement builds before queueing it.
         if let Err(e) = edit.to_sql(target) {
             self.status = format!("Cannot build statement: {e}");
@@ -228,7 +260,9 @@ impl Workspace {
             return;
         }
         let n = {
-            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let Some(tab) = self.tab_mut(tab_id) else {
+                return;
+            };
             tab.pending.push(edit);
             tab.pending.len()
         };
@@ -248,7 +282,9 @@ impl Workspace {
 
     pub(super) fn cancel_pending(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let reload = {
-            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let Some(tab) = self.tab_mut(tab_id) else {
+                return;
+            };
             tab.pending.clear();
             tab.edited_cells.clear();
             tab.last_sql.clone()
@@ -264,11 +300,15 @@ impl Workspace {
     /// Execute a tab's staged edits in a single transaction, then reload it.
     pub(super) fn apply_pending(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let (target, edits, reload) = {
-            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let Some(tab) = self.tab_mut(tab_id) else {
+                return;
+            };
             if tab.pending.is_empty() {
                 return;
             }
-            let Some(target) = tab.edit_target.clone() else { return };
+            let Some(target) = tab.edit_target.clone() else {
+                return;
+            };
             let edits = std::mem::take(&mut tab.pending);
             (target, edits, tab.last_sql.clone())
         };
@@ -329,7 +369,10 @@ impl Workspace {
             .pk_columns
             .iter()
             .map(|pk| {
-                let idx = tab.edit_cols.iter().position(|c| c.as_deref() == Some(pk.as_str()))?;
+                let idx = tab
+                    .edit_cols
+                    .iter()
+                    .position(|c| c.as_deref() == Some(pk.as_str()))?;
                 Some((pk.clone(), r.get(idx).cloned().unwrap_or(CellValue::Null)))
             })
             .collect()
@@ -366,12 +409,14 @@ mod tests {
 
                 // Editing the new row updates memory, not a staged statement.
                 ws.begin_edit(id, idx, 0, window, cx);
-                ws.cell_input.update(cx, |i, cx| i.set_value("7", window, cx));
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("7", window, cx));
                 ws.commit_cell_edit(cx);
                 assert!(ws.tab(id).unwrap().pending.is_empty());
 
                 ws.begin_edit(id, idx, 1, window, cx);
-                ws.cell_input.update(cx, |i, cx| i.set_value("zed", window, cx));
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("zed", window, cx));
                 ws.commit_cell_edit(cx);
 
                 ws.save_new_row(id, cx);
@@ -418,7 +463,8 @@ mod tests {
 
                 ws.begin_edit(id, 0, 1, window, cx);
                 assert_eq!(ws.tab(id).unwrap().editing, Some((0, 1)));
-                ws.cell_input.update(cx, |inp, cx| inp.set_value("beta", window, cx));
+                ws.cell_input
+                    .update(cx, |inp, cx| inp.set_value("beta", window, cx));
                 ws.commit_cell_edit(cx);
 
                 assert_eq!(ws.tab(id).unwrap().pending.len(), 1);
@@ -429,7 +475,10 @@ mod tests {
                     r#"UPDATE "public"."widget" SET "name" = 'beta' WHERE "id" = '1'"#
                 );
                 // Optimistic update reflects in the grid before Apply.
-                assert_eq!(ws.tab(id).unwrap().rows[0][1], CellValue::Text("beta".into()));
+                assert_eq!(
+                    ws.tab(id).unwrap().rows[0][1],
+                    CellValue::Text("beta".into())
+                );
             })
             .unwrap();
     }
@@ -448,10 +497,12 @@ mod tests {
 
                 // Edit two different rows; both stage without replacing each other.
                 ws.begin_edit(id, 0, 1, window, cx);
-                ws.cell_input.update(cx, |i, cx| i.set_value("x", window, cx));
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("x", window, cx));
                 ws.commit_cell_edit(cx);
                 ws.begin_edit(id, 1, 1, window, cx);
-                ws.cell_input.update(cx, |i, cx| i.set_value("y", window, cx));
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("y", window, cx));
                 ws.commit_cell_edit(cx);
 
                 assert_eq!(ws.tab(id).unwrap().pending.len(), 2);
@@ -482,7 +533,8 @@ mod tests {
 
                 // Edit to a new value: stages + marks the cell.
                 ws.begin_edit(id, 0, 1, window, cx);
-                ws.cell_input.update(cx, |i, cx| i.set_value("beta", window, cx));
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("beta", window, cx));
                 ws.commit_cell_edit(cx);
                 assert_eq!(ws.tab(id).unwrap().pending.len(), 1);
                 assert!(ws.tab(id).unwrap().edited_cells.contains(&(0, 1)));
@@ -490,11 +542,18 @@ mod tests {
                 // Edit back to the original value: the staged edit is dropped and
                 // the cell is no longer marked.
                 ws.begin_edit(id, 0, 1, window, cx);
-                ws.cell_input.update(cx, |i, cx| i.set_value("alpha", window, cx));
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("alpha", window, cx));
                 ws.commit_cell_edit(cx);
-                assert!(ws.tab(id).unwrap().pending.is_empty(), "edit reverted → no pending");
+                assert!(
+                    ws.tab(id).unwrap().pending.is_empty(),
+                    "edit reverted → no pending"
+                );
                 assert!(!ws.tab(id).unwrap().edited_cells.contains(&(0, 1)));
-                assert_eq!(ws.tab(id).unwrap().rows[0][1], CellValue::Text("alpha".into()));
+                assert_eq!(
+                    ws.tab(id).unwrap().rows[0][1],
+                    CellValue::Text("alpha".into())
+                );
             })
             .unwrap();
     }

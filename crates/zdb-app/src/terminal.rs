@@ -61,9 +61,8 @@ pub fn spawn<V: 'static>(cx: &mut Context<V>) -> Result<Terminal> {
         ..Default::default()
     };
 
-    let view = cx.new(|cx| {
-        TerminalView::new(writer, reader, config, cx).with_resize_callback(resize)
-    });
+    let view =
+        cx.new(|cx| TerminalView::new(writer, reader, config, cx).with_resize_callback(resize));
 
     Ok(Terminal {
         view,

@@ -32,7 +32,13 @@ fn export_basename(tab: &Tab) -> String {
     };
     let name: String = raw
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     if name.is_empty() {
         "export".to_string()

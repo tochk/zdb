@@ -162,7 +162,10 @@ pub(crate) fn ssl_from_str(s: &str) -> SslMode {
     }
 }
 
-pub(crate) fn entry_to_config(entry: &ConnectionEntry, password: Option<String>) -> ConnectionConfig {
+pub(crate) fn entry_to_config(
+    entry: &ConnectionEntry,
+    password: Option<String>,
+) -> ConnectionConfig {
     let mut cfg = ConnectionConfig::new(
         entry.name.clone(),
         entry.host.clone(),
@@ -270,7 +273,10 @@ mod tests {
             r#"SELECT * FROM (SELECT * FROM t) AS _zdb ORDER BY "qty" DESC"#
         );
         // Default clears the sort.
-        assert_eq!(order_by_sql("SELECT 1;", "x", ColumnSort::Default), "SELECT 1;");
+        assert_eq!(
+            order_by_sql("SELECT 1;", "x", ColumnSort::Default),
+            "SELECT 1;"
+        );
     }
 
     #[test]

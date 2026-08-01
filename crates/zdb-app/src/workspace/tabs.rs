@@ -90,7 +90,11 @@ impl Workspace {
 
     /// Focus the singleton scratch tab, opening it if absent.
     pub(super) fn focus_scratch_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(idx) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Scratch)) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(t.kind, TabKind::Scratch))
+        {
             self.activate_tab(idx, window, cx);
             return;
         }
@@ -119,6 +123,32 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Keep only `id` (tab-strip context menu "Close Others").
+    pub(super) fn close_other_tabs(&mut self, id: u64, cx: &mut Context<Self>) {
+        if !self.tabs.iter().any(|t| t.id == id) {
+            return;
+        }
+        self.tabs.retain(|t| t.id == id);
+        self.active = Some(0);
+        cx.notify();
+    }
+
+    /// Drop every tab after `id` (tab-strip context menu "Close to the Right").
+    pub(super) fn close_tabs_right(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        if idx + 1 >= self.tabs.len() {
+            return;
+        }
+        self.tabs.truncate(idx + 1);
+        // Only move focus if the active tab was one of the closed ones.
+        if self.active.is_none_or(|a| a > idx) {
+            self.active = Some(idx);
+        }
+        cx.notify();
+    }
+
     /// Drop every tab (e.g. on connection switch — old results are invalid).
     pub(super) fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
         self.tabs.clear();
@@ -126,12 +156,18 @@ impl Workspace {
         cx.notify();
     }
 
-    /// `SELECT * FROM <table> [WHERE …] LIMIT n` for a table tab.
+    /// `SELECT * FROM <table> [WHERE …] [ORDER BY …] LIMIT n` for a table tab.
+    /// The whole statement is rebuilt from the tab's own parts (filter + sort),
+    /// so sorting never has to rewrite previously generated SQL.
     pub(super) fn table_query(&self, tab_id: u64, cx: &App) -> String {
         let Some(tab) = self.tab(tab_id) else {
             return String::new();
         };
-        let TabKind::Table { schema: s, table: t } = &tab.kind else {
+        let TabKind::Table {
+            schema: s,
+            table: t,
+        } = &tab.kind
+        else {
             return String::new();
         };
         let w = tab.where_input.read(cx).value().trim().to_string();
@@ -140,18 +176,33 @@ impl Workspace {
         } else {
             format!(" WHERE {w}")
         };
+        let o = tab.order_input.read(cx).value().trim().to_string();
+        let order = if o.is_empty() {
+            String::new()
+        } else {
+            format!(" ORDER BY {o}")
+        };
         format!(
-            "SELECT * FROM \"{}\".\"{}\"{} LIMIT {}",
+            "SELECT * FROM \"{}\".\"{}\"{}{} LIMIT {}",
             s.replace('"', "\"\""),
             t.replace('"', "\"\""),
             filter,
+            order,
             ROW_LIMIT
         )
     }
 
+    /// Re-run a table tab from its WHERE / ORDER BY inputs. A hand-typed ORDER BY
+    /// replaces whatever a header click had set, so the header arrows are cleared.
     pub(super) fn apply_where(&mut self, tab_id: u64, cx: &mut Context<Self>) {
-        if !matches!(self.tab(tab_id).map(|t| &t.kind), Some(TabKind::Table { .. })) {
+        if !matches!(
+            self.tab(tab_id).map(|t| &t.kind),
+            Some(TabKind::Table { .. })
+        ) {
             return;
+        }
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.sort_state = None;
         }
         let sql = self.table_query(tab_id, cx);
         self.run_new_query(tab_id, sql, cx);
@@ -186,6 +237,51 @@ mod tests {
             .unwrap();
     }
 
+    /// A header click on a table tab produces a plain `ORDER BY` in the generated
+    /// query (no subquery wrapper) and fills the ORDER BY input.
+    #[gpui::test]
+    fn table_query_builds_order_by(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                ws.tab_mut(id).unwrap().headers = vec!["id".into(), "name".into()];
+                ws.tab(id)
+                    .unwrap()
+                    .where_input
+                    .update(cx, |i, cx| i.set_value("id > 5", window, cx));
+
+                ws.toggle_sort(id, 1, window, cx);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 ORDER BY \"name\" ASC LIMIT 500"
+                );
+                ws.toggle_sort(id, 1, window, cx);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 ORDER BY \"name\" DESC LIMIT 500"
+                );
+                // Third click clears the sort and empties the input.
+                ws.toggle_sort(id, 1, window, cx);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 LIMIT 500"
+                );
+
+                // A hand-typed clause is used verbatim.
+                ws.tab(id)
+                    .unwrap()
+                    .order_input
+                    .update(cx, |i, cx| i.set_value("name DESC NULLS LAST", window, cx));
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 ORDER BY name DESC NULLS LAST LIMIT 500"
+                );
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn new_query_tab_titles_increment(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
@@ -211,6 +307,67 @@ mod tests {
                 ws.close_tab(id, cx);
                 assert!(ws.tabs.is_empty());
                 assert_eq!(ws.active, None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn close_other_tabs_keeps_one(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                seed_query_tab(ws, window, cx);
+                let mid = seed_query_tab(ws, window, cx);
+                seed_query_tab(ws, window, cx);
+                ws.close_other_tabs(mid, cx);
+                assert_eq!(ws.tabs.len(), 1);
+                assert_eq!(ws.tabs[0].id, mid);
+                assert_eq!(ws.active, Some(0));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn close_tabs_right_truncates(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let first = seed_query_tab(ws, window, cx);
+                seed_query_tab(ws, window, cx);
+                seed_query_tab(ws, window, cx);
+                ws.close_tabs_right(first, cx);
+                assert_eq!(ws.tabs.len(), 1);
+                assert_eq!(ws.active, Some(0));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn close_tabs_right_keeps_active_left_of_anchor(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                seed_query_tab(ws, window, cx);
+                let mid = seed_query_tab(ws, window, cx);
+                seed_query_tab(ws, window, cx);
+                ws.activate_tab(0, window, cx);
+                ws.close_tabs_right(mid, cx);
+                assert_eq!(ws.tabs.len(), 2);
+                assert_eq!(ws.active, Some(0));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn close_tabs_right_on_last_is_noop(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                seed_query_tab(ws, window, cx);
+                let last = seed_query_tab(ws, window, cx);
+                ws.close_tabs_right(last, cx);
+                assert_eq!(ws.tabs.len(), 2);
+                assert_eq!(ws.active, Some(1));
             })
             .unwrap();
     }
