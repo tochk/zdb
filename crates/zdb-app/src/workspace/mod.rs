@@ -7,6 +7,8 @@
 //! column header re-runs the query ordered by that column. Every executed query
 //! is recorded in the query log.
 
+use crate::lsp::{self, LspSlot};
+use gpui::ClipboardItem;
 use gpui::{
     actions, div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context,
     Entity, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
@@ -22,8 +24,6 @@ use gpui_component::{
     tree::{TreeItem, TreeState},
     v_flex, Disableable, Icon, IconName, Sizable,
 };
-use crate::lsp::{self, LspSlot};
-use gpui::ClipboardItem;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use zdb_config::{ConnectionEntry, Settings};
@@ -208,11 +208,14 @@ impl Workspace {
         let cell_input = cx.new(|cx| InputState::new(window, cx));
 
         // Commit/cancel inline edits on Enter / focus loss (acts on the active tab).
-        cx.subscribe(&cell_input, |this, _input, event: &InputEvent, cx| match event {
-            InputEvent::PressEnter { .. } => this.commit_cell_edit(cx),
-            InputEvent::Blur => this.cancel_cell_edit(cx),
-            _ => {}
-        })
+        cx.subscribe(
+            &cell_input,
+            |this, _input, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } => this.commit_cell_edit(cx),
+                InputEvent::Blur => this.cancel_cell_edit(cx),
+                _ => {}
+            },
+        )
         .detach();
 
         let form = ConnForm::new(window, cx);
@@ -391,7 +394,6 @@ impl Workspace {
         }
         cx.notify();
     }
-
 }
 
 #[cfg(test)]

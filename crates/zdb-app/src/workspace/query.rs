@@ -18,7 +18,10 @@ pub(super) struct QueryLog {
 
 impl QueryLog {
     pub(super) fn push(&mut self, sql: &str, ok: bool) {
-        self.entries.push(LogEntry { sql: sql.to_string(), ok });
+        self.entries.push(LogEntry {
+            sql: sql.to_string(),
+            ok,
+        });
         if self.entries.len() > LOG_CAP {
             self.entries.remove(0);
         }
@@ -126,7 +129,9 @@ impl Workspace {
         let logged = sql.clone();
         let fut = async move { drain_query(db.query(conn, sql)).await };
         self.spawn_db(cx, fut, move |this, out, _cx| {
-            let Some(tab) = this.tab_mut(tab_id) else { return };
+            let Some(tab) = this.tab_mut(tab_id) else {
+                return;
+            };
             tab.running = false;
             match out.error {
                 Some(e) => {
@@ -173,7 +178,9 @@ impl Workspace {
     /// editability, then describe (for editability) and execute it.
     pub(super) fn run_new_query(&mut self, tab_id: u64, base: String, cx: &mut Context<Self>) {
         let table = {
-            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let Some(tab) = self.tab_mut(tab_id) else {
+                return;
+            };
             tab.base_sql = Some(base.clone());
             tab.sort_state = None;
             tab.edit_target = None;
@@ -195,19 +202,25 @@ impl Workspace {
     pub(super) fn describe_async(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
         let Some(conn) = self.conn else { return };
         let db = self.db.clone();
-        self.spawn_db(cx, async move { db.describe(conn, sql).await }, move |this, res, _cx| {
-            let Some(tab) = this.tab_mut(tab_id) else { return };
-            match res {
-                Ok(Some(d)) => {
-                    tab.edit_target = Some(d.target);
-                    tab.edit_cols = d.columns;
+        self.spawn_db(
+            cx,
+            async move { db.describe(conn, sql).await },
+            move |this, res, _cx| {
+                let Some(tab) = this.tab_mut(tab_id) else {
+                    return;
+                };
+                match res {
+                    Ok(Some(d)) => {
+                        tab.edit_target = Some(d.target);
+                        tab.edit_cols = d.columns;
+                    }
+                    _ => {
+                        tab.edit_target = None;
+                        tab.edit_cols.clear();
+                    }
                 }
-                _ => {
-                    tab.edit_target = None;
-                    tab.edit_cols.clear();
-                }
-            }
-        });
+            },
+        );
     }
 
     /// Execute `sql` for display in `tab_id` (does not change editability or sort base).
@@ -226,7 +239,9 @@ impl Workspace {
             return;
         }
         {
-            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let Some(tab) = self.tab_mut(tab_id) else {
+                return;
+            };
             tab.running = true;
             tab.editing = None;
             tab.new_row_idx = None;
@@ -239,9 +254,17 @@ impl Workspace {
         let fut = async move { drain_query(db.query(conn, sql)).await };
         self.spawn_db(cx, fut, move |this, out, cx| {
             // The tab may have been closed while the query ran.
-            let Some(tab) = this.tab_mut(tab_id) else { return };
+            let Some(tab) = this.tab_mut(tab_id) else {
+                return;
+            };
             tab.running = false;
-            let QueryOutcome { headers, rows, affected, elapsed, error } = out;
+            let QueryOutcome {
+                headers,
+                rows,
+                affected,
+                elapsed,
+                error,
+            } = out;
             let status = match error {
                 Some(e) => {
                     let s = format!("Error: {e}");
@@ -252,7 +275,9 @@ impl Workspace {
                     let is_select = !headers.is_empty();
                     let n = rows.len();
                     let table = {
-                        let Some(tab) = this.tab_mut(tab_id) else { return };
+                        let Some(tab) = this.tab_mut(tab_id) else {
+                            return;
+                        };
                         tab.headers = headers.clone();
                         tab.rows = rows.clone();
                         tab.orig_rows = rows.clone();
@@ -321,7 +346,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let (next, base, headers, is_table) = {
-            let Some(tab) = self.tab_mut(tab_id) else { return };
+            let Some(tab) = self.tab_mut(tab_id) else {
+                return;
+            };
             let next = match tab.sort_state {
                 Some((c, false)) if c == col_ix => Some((col_ix, true)),
                 Some((c, true)) if c == col_ix => None,

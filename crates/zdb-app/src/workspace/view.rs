@@ -42,7 +42,9 @@ impl Workspace {
                 Button::new("refresh")
                     .icon(Icon::empty().path("icons/refresh-cw.svg"))
                     .tooltip("Refresh schemas")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.connect_or_refresh(cx))),
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.connect_or_refresh(cx)),
+                    ),
             );
         }
         let header = h_flex()
@@ -74,9 +76,11 @@ impl Workspace {
                 .border_color(c.border)
                 .child(tree_icon("icons/search.svg", c.fg_dim))
                 .child(
-                    div()
-                        .flex_1()
-                        .child(Input::new(&self.tree.filter_input).appearance(false).small()),
+                    div().flex_1().child(
+                        Input::new(&self.tree.filter_input)
+                            .appearance(false)
+                            .small(),
+                    ),
                 )
         });
 
@@ -88,9 +92,12 @@ impl Workspace {
                 .on_action(cx.listener(|this, _: &TreeOpenSelected, window, cx| {
                     this.open_selected_tree_node(window, cx)
                 }))
-                .child(tree(&self.tree.state, move |ix, entry, selected, window, cx| {
-                    schema_tree_row(ix, entry, selected, &weak, window, cx)
-                }))
+                .child(tree(
+                    &self.tree.state,
+                    move |ix, entry, selected, window, cx| {
+                        schema_tree_row(ix, entry, selected, &weak, window, cx)
+                    },
+                ))
                 .into_any_element()
         } else {
             div()
@@ -181,45 +188,57 @@ impl Workspace {
             let weak = weak.clone();
             let has_others = n_tabs > 1;
             let has_right = idx + 1 < n_tabs;
+            // `ContextMenuExt::context_menu` hardcodes the element id
+            // ("context-menu"), so sibling chips would all share ONE element
+            // state (menu open flag + full-window occluding overlay) — every
+            // chip then paints the popup and the last overlay swallows the
+            // clicks. Wrapping each chip in a UNIQUELY id'd div puts a distinct
+            // id on the stack above the menu, giving each its own state.
+            let chip = h_flex()
+                .h_full()
+                .items_center()
+                .flex_shrink_0()
+                .border_r_1()
+                .border_color(c.border)
+                .when(is_active, |d| d.bg(c.center))
+                .child(label)
+                .child(close)
+                // Right-click anywhere on the chip: close variants.
+                .context_menu(move |menu, _, _| {
+                    let w = weak.clone();
+                    let mut menu =
+                        menu.item(PopupMenuItem::new("Close").on_click(move |_, _, cx| {
+                            w.update(cx, |this, cx| this.close_tab(id, cx)).ok();
+                        }));
+                    if has_others {
+                        let w = weak.clone();
+                        menu = menu.item(PopupMenuItem::new("Close Others").on_click(
+                            move |_, _, cx| {
+                                w.update(cx, |this, cx| this.close_other_tabs(id, cx)).ok();
+                            },
+                        ));
+                    }
+                    if has_right {
+                        let w = weak.clone();
+                        menu = menu.item(PopupMenuItem::new("Close to the Right").on_click(
+                            move |_, _, cx| {
+                                w.update(cx, |this, cx| this.close_tabs_right(id, cx)).ok();
+                            },
+                        ));
+                    }
+                    let w = weak.clone();
+                    menu.separator()
+                        .item(PopupMenuItem::new("Close All").on_click(move |_, _, cx| {
+                            w.update(cx, |this, cx| this.close_all_tabs(cx)).ok();
+                        }))
+                });
             strip = strip.child(
-                h_flex()
+                div()
+                    .id(SharedString::from(format!("tabchip-{id}")))
                     .h_full()
-                    .items_center()
+                    .flex()
                     .flex_shrink_0()
-                    .border_r_1()
-                    .border_color(c.border)
-                    .when(is_active, |d| d.bg(c.center))
-                    .child(label)
-                    .child(close)
-                    // Right-click anywhere on the chip: close variants.
-                    .context_menu(move |menu, _, _| {
-                        let w = weak.clone();
-                        let mut menu =
-                            menu.item(PopupMenuItem::new("Close").on_click(move |_, _, cx| {
-                                w.update(cx, |this, cx| this.close_tab(id, cx)).ok();
-                            }));
-                        if has_others {
-                            let w = weak.clone();
-                            menu = menu.item(PopupMenuItem::new("Close Others").on_click(
-                                move |_, _, cx| {
-                                    w.update(cx, |this, cx| this.close_other_tabs(id, cx)).ok();
-                                },
-                            ));
-                        }
-                        if has_right {
-                            let w = weak.clone();
-                            menu = menu.item(PopupMenuItem::new("Close to the Right").on_click(
-                                move |_, _, cx| {
-                                    w.update(cx, |this, cx| this.close_tabs_right(id, cx)).ok();
-                                },
-                            ));
-                        }
-                        let w = weak.clone();
-                        menu.separator()
-                            .item(PopupMenuItem::new("Close All").on_click(move |_, _, cx| {
-                                w.update(cx, |this, cx| this.close_all_tabs(cx)).ok();
-                            }))
-                    }),
+                    .child(chip),
             );
         }
         strip
@@ -227,9 +246,9 @@ impl Workspace {
                 Button::new("tab-add")
                     .icon(IconName::Plus)
                     .tooltip("New query")
-                    .on_click(
-                        cx.listener(|this, _: &ClickEvent, window, cx| this.open_query_tab(window, cx)),
-                    ),
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.open_query_tab(window, cx)
+                    })),
             )
             .child(
                 Button::new("tab-scratch")
@@ -255,12 +274,20 @@ impl Workspace {
         // Run toggles to Stop while a query is in flight.
         let run_btn = if tab.running {
             Button::new("run")
-                .icon(Icon::empty().path("icons/circle-x.svg").text_color(rgba(0xef4444ff)))
+                .icon(
+                    Icon::empty()
+                        .path("icons/circle-x.svg")
+                        .text_color(rgba(0xef4444ff)),
+                )
                 .tooltip("Stop")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)))
         } else {
             Button::new("run")
-                .icon(Icon::empty().path("icons/play.svg").text_color(rgba(0x22c55eff)))
+                .icon(
+                    Icon::empty()
+                        .path("icons/play.svg")
+                        .text_color(rgba(0x22c55eff)),
+                )
                 .tooltip("Run (Ctrl/Cmd+Enter)")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.run_active_tab(cx)))
         };
@@ -293,7 +320,9 @@ impl Workspace {
                     .icon(IconName::Plus)
                     .tooltip("Add row")
                     .disabled(!editable)
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.add_row(tab_id, cx))),
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.add_row(tab_id, cx)),
+                    ),
             )
             .child(
                 Button::new("del-row")
@@ -309,9 +338,11 @@ impl Workspace {
                     .icon(Icon::empty().path("icons/refresh-cw.svg").text_color(c.fg))
                     .tooltip("Refresh data")
                     .disabled(tab.base_sql.is_none())
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.reload_data(tab_id, cx)
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.reload_data(tab_id, cx)
+                        }),
+                    ),
             )
             // EXPLAIN the current statement (plan shown in the grid).
             .child(
@@ -319,9 +350,9 @@ impl Workspace {
                     .label("Explain")
                     .tooltip("EXPLAIN this query")
                     .disabled(!has_sql)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.explain_active(false, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.explain_active(false, cx)),
+                    ),
             )
             // Export / copy the current result.
             .child(
@@ -532,68 +563,66 @@ impl Workspace {
             .active_tab()
             .filter(|t| !t.pending.is_empty())
             .map(|t| (t.id, t.pending.len()));
-        let right = if let Some((tab_id, n)) = pending_tab {
-            let sql = self.pending_sql(tab_id).unwrap_or_default();
-            v_flex()
-                .flex_grow()
-                .h_full()
-                .overflow_hidden()
-                .child(section_header(
-                    format!("PENDING — {n} CHANGE(S), REVIEW THEN APPLY"),
-                    c,
-                ))
-                .child(
-                    div()
-                        .id("pending-scroll")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .overflow_y_scroll()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(c.fg)
-                        .child(sql),
-                )
-                .child(
-                    h_flex()
-                        .px_2()
-                        .pb_2()
-                        .gap_2()
-                        .child(
-                            Button::new("apply")
-                                .label("Apply")
-                                .primary()
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+        let right =
+            if let Some((tab_id, n)) = pending_tab {
+                let sql = self.pending_sql(tab_id).unwrap_or_default();
+                v_flex()
+                    .flex_grow()
+                    .h_full()
+                    .overflow_hidden()
+                    .child(section_header(
+                        format!("PENDING — {n} CHANGE(S), REVIEW THEN APPLY"),
+                        c,
+                    ))
+                    .child(
+                        div()
+                            .id("pending-scroll")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .px_3()
+                            .py_2()
+                            .text_sm()
+                            .text_color(c.fg)
+                            .child(sql),
+                    )
+                    .child(
+                        h_flex()
+                            .px_2()
+                            .pb_2()
+                            .gap_2()
+                            .child(Button::new("apply").label("Apply").primary().on_click(
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.apply_pending(tab_id, cx)
-                                })),
-                        )
-                        .child(Button::new("cancel-edit").label("Cancel").on_click(
-                            cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.cancel_pending(tab_id, cx)
-                            }),
-                        )),
-                )
-                .into_any_element()
-        } else {
-            v_flex()
-                .flex_grow()
-                .h_full()
-                .overflow_hidden()
-                .child(section_header("MESSAGES", c))
-                .child(
-                    div()
-                        .id("messages-scroll")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .overflow_y_scroll()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(c.fg)
-                        .child(self.status.clone()),
-                )
-                .into_any_element()
-        };
+                                }),
+                            ))
+                            .child(Button::new("cancel-edit").label("Cancel").on_click(
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.cancel_pending(tab_id, cx)
+                                }),
+                            )),
+                    )
+                    .into_any_element()
+            } else {
+                v_flex()
+                    .flex_grow()
+                    .h_full()
+                    .overflow_hidden()
+                    .child(section_header("MESSAGES", c))
+                    .child(
+                        div()
+                            .id("messages-scroll")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .overflow_y_scroll()
+                            .px_3()
+                            .py_2()
+                            .text_sm()
+                            .text_color(c.fg)
+                            .child(self.status.clone()),
+                    )
+                    .into_any_element()
+            };
 
         h_flex()
             .size_full()
@@ -631,15 +660,16 @@ impl Workspace {
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_connection(cx))),
             );
             // Allow returning to the list if there are saved connections.
-            buttons = if self.settings.connections.is_empty() {
-                buttons.child(Button::new("close-form").label("Close").on_click(
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_connections(cx)),
-                ))
-            } else {
-                buttons.child(Button::new("back-list").label("Back").on_click(cx.listener(
-                    |this, _: &ClickEvent, _, cx| this.show_conn_list(cx),
-                )))
-            };
+            buttons =
+                if self.settings.connections.is_empty() {
+                    buttons.child(Button::new("close-form").label("Close").on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_connections(cx)),
+                    ))
+                } else {
+                    buttons.child(Button::new("back-list").label("Back").on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.show_conn_list(cx)),
+                    ))
+                };
             v_flex()
                 .child(section_header("ADD CONNECTION", c))
                 .child(
@@ -708,17 +738,12 @@ impl Workspace {
                         .gap_2()
                         .border_t_1()
                         .border_color(c.border)
-                        .child(
-                            Button::new("add-new")
-                                .label("Add")
-                                .primary()
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.show_add_form(cx)
-                                })),
-                        )
-                        .child(Button::new("close-conn").label("Close").on_click(cx.listener(
-                            |this, _: &ClickEvent, _, cx| this.toggle_connections(cx),
-                        ))),
+                        .child(Button::new("add-new").label("Add").primary().on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.show_add_form(cx)),
+                        ))
+                        .child(Button::new("close-conn").label("Close").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_connections(cx)),
+                        )),
                 )
                 .into_any_element()
         };
@@ -748,16 +773,17 @@ impl Workspace {
         let c = palette(cx);
         let theme = self.settings.theme;
 
-        let theme_btn = |label: &'static str, val: zdb_config::Theme| {
-            let selected = theme == val;
-            let mut b = Button::new(SharedString::from(format!("theme-{label}"))).label(label);
-            if selected {
-                b = b.primary();
-            }
-            b.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.set_theme(val, window, cx)
-            }))
-        };
+        let theme_btn =
+            |label: &'static str, val: zdb_config::Theme| {
+                let selected = theme == val;
+                let mut b = Button::new(SharedString::from(format!("theme-{label}"))).label(label);
+                if selected {
+                    b = b.primary();
+                }
+                b.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.set_theme(val, window, cx)
+                }))
+            };
 
         let setting_row = |label: &'static str, control: gpui::AnyElement| {
             h_flex()
@@ -803,36 +829,33 @@ impl Workspace {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(unavailable)".into());
 
-        let body = v_flex()
-            .child(section_header("SETTINGS", c))
-            .child(setting_row(
-                "Theme",
-                h_flex()
-                    .gap_1()
-                    .child(theme_btn("Light", zdb_config::Theme::Light))
-                    .child(theme_btn("Dark", zdb_config::Theme::Dark))
-                    .into_any_element(),
-            ))
-            .child(section_header("KEYBINDINGS", c))
-            .child(keys_list)
-            .child(section_header("CONFIG FILE", c))
-            .child(
-                div()
-                    .px_3()
-                    .py_2()
-                    .text_xs()
-                    .text_color(c.fg_dim)
-                    .child(path),
-            )
-            .child(
-                h_flex().p_2().gap_2().justify_end().child(
-                    Button::new("close-settings")
-                        .label("Close")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.toggle_settings(cx)
-                        })),
-                ),
-            );
+        let body =
+            v_flex()
+                .child(section_header("SETTINGS", c))
+                .child(setting_row(
+                    "Theme",
+                    h_flex()
+                        .gap_1()
+                        .child(theme_btn("Light", zdb_config::Theme::Light))
+                        .child(theme_btn("Dark", zdb_config::Theme::Dark))
+                        .into_any_element(),
+                ))
+                .child(section_header("KEYBINDINGS", c))
+                .child(keys_list)
+                .child(section_header("CONFIG FILE", c))
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .child(path),
+                )
+                .child(h_flex().p_2().gap_2().justify_end().child(
+                    Button::new("close-settings").label("Close").on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_settings(cx)),
+                    ),
+                ));
 
         div()
             .absolute()
@@ -974,14 +997,7 @@ impl Workspace {
                 WindowControlArea::Min,
                 cx,
             ))
-            .child(self.window_control(
-                "win-max",
-                max_icon,
-                c.fg,
-                c.header,
-                max_area,
-                cx,
-            ))
+            .child(self.window_control("win-max", max_icon, c.fg, c.header, max_area, cx))
             .child(self.window_control(
                 "win-close",
                 "icons/window-close.svg",
@@ -1116,7 +1132,8 @@ impl Render for Workspace {
         // Filter cleared from a window-less context (connection switch).
         if self.tree.pending_clear_filter {
             self.tree.pending_clear_filter = false;
-            self.tree.filter_input
+            self.tree
+                .filter_input
                 .update(cx, |i, cx| i.set_value("", window, cx));
         }
         let center = self.render_center(cx).into_any_element();
@@ -1176,38 +1193,39 @@ impl Render for Workspace {
                     .child(main),
             );
 
-        let mut root = div()
-            .relative()
-            .size_full()
-            // Window-wide default text color (the ambient `window.text_style()`
-            // is otherwise transparent).
-            .text_color(c.fg)
-            .key_context("zdb")
-            .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_active_tab(cx)))
-            .on_action(cx.listener(|this, _: &CancelQuery, _, cx| this.cancel(cx)))
-            .on_action(cx.listener(|this, _: &ToggleScratch, window, cx| {
-                this.focus_scratch_tab(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &TogglePalette, _, cx| this.toggle_palette(cx)))
-            .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
-                this.close_palette(cx);
-                if this.conn_manager_open {
-                    this.conn_manager_open = false;
-                    cx.notify();
-                }
-                if this.settings_open {
-                    this.settings_open = false;
-                    cx.notify();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
-                this.toggle_terminal(window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleConnections, _, cx| {
-                this.toggle_connections(cx)
-            }))
-            .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| this.toggle_settings(cx)))
-            .child(content);
+        let mut root =
+            div()
+                .relative()
+                .size_full()
+                // Window-wide default text color (the ambient `window.text_style()`
+                // is otherwise transparent).
+                .text_color(c.fg)
+                .key_context("zdb")
+                .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_active_tab(cx)))
+                .on_action(cx.listener(|this, _: &CancelQuery, _, cx| this.cancel(cx)))
+                .on_action(cx.listener(|this, _: &ToggleScratch, window, cx| {
+                    this.focus_scratch_tab(window, cx)
+                }))
+                .on_action(cx.listener(|this, _: &TogglePalette, _, cx| this.toggle_palette(cx)))
+                .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
+                    this.close_palette(cx);
+                    if this.conn_manager_open {
+                        this.conn_manager_open = false;
+                        cx.notify();
+                    }
+                    if this.settings_open {
+                        this.settings_open = false;
+                        cx.notify();
+                    }
+                }))
+                .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                    this.toggle_terminal(window, cx)
+                }))
+                .on_action(
+                    cx.listener(|this, _: &ToggleConnections, _, cx| this.toggle_connections(cx)),
+                )
+                .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| this.toggle_settings(cx)))
+                .child(content);
 
         if self.conn_manager_open {
             root = root.child(self.render_conn_manager(cx));
@@ -1285,7 +1303,10 @@ fn schema_tree_row(
     let (meta, tree_state) = match weak.upgrade() {
         Some(ws) => {
             let ws = ws.read(cx);
-            (ws.tree.meta.get(&item.id).cloned(), Some(ws.tree.state.clone()))
+            (
+                ws.tree.meta.get(&item.id).cloned(),
+                Some(ws.tree.state.clone()),
+            )
         }
         None => (None, None),
     };
@@ -1415,7 +1436,8 @@ fn schema_tree_row(
                     let (n1, w1) = (n.clone(), weak.clone());
                     let n2 = n.clone();
                     menu.item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
-                        w1.update(cx, |this, cx| this.load_relations(n1.clone(), cx)).ok();
+                        w1.update(cx, |this, cx| this.load_relations(n1.clone(), cx))
+                            .ok();
                     }))
                     .item(PopupMenuItem::new("Copy name").on_click(move |_, _, cx| {
                         cx.write_to_clipboard(ClipboardItem::new_string(n2.clone()));

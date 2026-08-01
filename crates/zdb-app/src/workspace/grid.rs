@@ -58,9 +58,12 @@ impl ResultDelegate {
                 // edit/edited highlight paints inside that padding and reads visibly
                 // smaller than the cell. We re-add the padding ourselves in `td_text`
                 // / `render_th` so the text lands in the same place as before.
-                Column::new(SharedString::from(format!("c{i}")), SharedString::from(h.clone()))
-                    .width(px(180.))
-                    .p_0()
+                Column::new(
+                    SharedString::from(format!("c{i}")),
+                    SharedString::from(h.clone()),
+                )
+                .width(px(180.))
+                .p_0()
             })
             .collect();
         self.rows = rows;
@@ -96,10 +99,12 @@ impl TableDelegate for ResultDelegate {
         let arrow = self
             .ws
             .upgrade()
-            .and_then(|w| match w.read(cx).tab(tab_id).and_then(|t| t.sort_state) {
-                Some((ci, desc)) if ci == col_ix => Some(if desc { " ▼" } else { " ▲" }),
-                _ => None,
-            })
+            .and_then(
+                |w| match w.read(cx).tab(tab_id).and_then(|t| t.sort_state) {
+                    Some((ci, desc)) if ci == col_ix => Some(if desc { " ▼" } else { " ▲" }),
+                    _ => None,
+                },
+            )
             .unwrap_or("");
         let weak = self.ws.clone();
         div()
@@ -240,12 +245,7 @@ fn td_text(cell: Option<CellValue>, c: Colors) -> gpui::Div {
     // Fills the cell (columns are `p_0()`) and carries the padding the widget used
     // to add, so highlights cover the full cell while the text stays put. Vertically
     // centered, matching the inline edit input.
-    let base = div()
-        .size_full()
-        .flex()
-        .items_center()
-        .px_2()
-        .text_sm();
+    let base = div().size_full().flex().items_center().px_2().text_sm();
     match cell {
         Some(CellValue::Text(s)) => base.text_color(c.fg).child(s),
         Some(CellValue::Null) => base.text_color(c.fg_null).child("NULL"),
@@ -459,7 +459,10 @@ impl Tab {
         let title = format!("{schema}.{table_name}");
         Tab::base(
             id,
-            TabKind::Table { schema, table: table_name },
+            TabKind::Table {
+                schema,
+                table: table_name,
+            },
             title,
             editor,
             where_input,

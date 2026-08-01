@@ -90,7 +90,11 @@ impl Workspace {
 
     /// Focus the singleton scratch tab, opening it if absent.
     pub(super) fn focus_scratch_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(idx) = self.tabs.iter().position(|t| matches!(t.kind, TabKind::Scratch)) {
+        if let Some(idx) = self
+            .tabs
+            .iter()
+            .position(|t| matches!(t.kind, TabKind::Scratch))
+        {
             self.activate_tab(idx, window, cx);
             return;
         }
@@ -159,7 +163,11 @@ impl Workspace {
         let Some(tab) = self.tab(tab_id) else {
             return String::new();
         };
-        let TabKind::Table { schema: s, table: t } = &tab.kind else {
+        let TabKind::Table {
+            schema: s,
+            table: t,
+        } = &tab.kind
+        else {
             return String::new();
         };
         let w = tab.where_input.read(cx).value().trim().to_string();
@@ -187,7 +195,10 @@ impl Workspace {
     /// Re-run a table tab from its WHERE / ORDER BY inputs. A hand-typed ORDER BY
     /// replaces whatever a header click had set, so the header arrows are cleared.
     pub(super) fn apply_where(&mut self, tab_id: u64, cx: &mut Context<Self>) {
-        if !matches!(self.tab(tab_id).map(|t| &t.kind), Some(TabKind::Table { .. })) {
+        if !matches!(
+            self.tab(tab_id).map(|t| &t.kind),
+            Some(TabKind::Table { .. })
+        ) {
             return;
         }
         if let Some(tab) = self.tab_mut(tab_id) {

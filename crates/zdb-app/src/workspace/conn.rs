@@ -19,7 +19,11 @@ impl ConnForm {
         let input = |window: &mut Window, cx: &mut Context<Workspace>, ph: &str, val: &str| {
             let ph = ph.to_string();
             let val = val.to_string();
-            cx.new(|cx| InputState::new(window, cx).placeholder(ph).default_value(val))
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(ph)
+                    .default_value(val)
+            })
         };
         Self {
             name: input(window, cx, "name", ""),
@@ -28,7 +32,12 @@ impl ConnForm {
             user: input(window, cx, "user", ""),
             db: input(window, cx, "database", ""),
             password: input(window, cx, "password", ""),
-            ssl: input(window, cx, "sslmode (disable/prefer/require/verify-full)", "prefer"),
+            ssl: input(
+                window,
+                cx,
+                "sslmode (disable/prefer/require/verify-full)",
+                "prefer",
+            ),
         }
     }
 }
@@ -62,7 +71,12 @@ impl Workspace {
     }
 
     /// Switch the theme live and persist it to settings.json.
-    pub(super) fn set_theme(&mut self, theme: zdb_config::Theme, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn set_theme(
+        &mut self,
+        theme: zdb_config::Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings.theme == theme {
             return;
         }
@@ -100,7 +114,9 @@ impl Workspace {
     }
 
     pub(super) fn connect_saved(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let Some(entry) = self.settings.connections.get(idx).cloned() else { return };
+        let Some(entry) = self.settings.connections.get(idx).cloned() else {
+            return;
+        };
         // Only the session cache here — no keychain read. On macOS a Keychain
         // lookup can block (and pop a system prompt); doing it on this UI-thread
         // click handler freezes the render loop (the app "hangs" on select).
@@ -115,7 +131,14 @@ impl Workspace {
         let host = self.form.host.read(cx).value().trim().to_string();
         let user = self.form.user.read(cx).value().trim().to_string();
         let dbname = self.form.db.read(cx).value().trim().to_string();
-        let port = self.form.port.read(cx).value().trim().parse().unwrap_or(5432);
+        let port = self
+            .form
+            .port
+            .read(cx)
+            .value()
+            .trim()
+            .parse()
+            .unwrap_or(5432);
         let ssl = self.form.ssl.read(cx).value().trim().to_string();
         let password = self.form.password.read(cx).value().to_string();
 
@@ -169,19 +192,17 @@ impl Workspace {
             let lsp_cfg = cfg.clone();
             (db.connect(cfg).await, lsp_cfg)
         };
-        self.spawn_db(cx, fut, move |this, (result, lsp_cfg), cx| {
-            match result {
-                Ok(conn) => {
-                    log(format!("connected (conn={conn})"));
-                    this.conn = Some(conn);
-                    this.status = "Connected. Loading schemas…".into();
-                    this.start_lsp(&lsp_cfg);
-                    this.load_schemas(cx);
-                }
-                Err(e) => {
-                    log(format!("connect failed: {e}"));
-                    this.status = format!("Connection failed: {e}");
-                }
+        self.spawn_db(cx, fut, move |this, (result, lsp_cfg), cx| match result {
+            Ok(conn) => {
+                log(format!("connected (conn={conn})"));
+                this.conn = Some(conn);
+                this.status = "Connected. Loading schemas…".into();
+                this.start_lsp(&lsp_cfg);
+                this.load_schemas(cx);
+            }
+            Err(e) => {
+                log(format!("connect failed: {e}"));
+                this.status = format!("Connection failed: {e}");
             }
         });
     }
@@ -268,7 +289,11 @@ mod tests {
         window
             .update(cx, |ws, _w, cx| {
                 assert!(ws.conn.is_none());
-                assert!(ws.status.starts_with("Connection failed"), "status: {}", ws.status);
+                assert!(
+                    ws.status.starts_with("Connection failed"),
+                    "status: {}",
+                    ws.status
+                );
                 // And one more switch after a failure must not blow up.
                 ws.connect_saved(1, cx);
             })

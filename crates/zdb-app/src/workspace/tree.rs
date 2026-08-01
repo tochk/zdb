@@ -72,7 +72,8 @@ impl SchemaTree {
         self.loads.clear();
         self.filter.clear();
         self.pending_clear_filter = true;
-        self.state.update(cx, |ts, cx| ts.set_items(Vec::<TreeItem>::new(), cx));
+        self.state
+            .update(cx, |ts, cx| ts.set_items(Vec::<TreeItem>::new(), cx));
     }
 }
 
@@ -112,12 +113,21 @@ pub(super) fn node_id(parts: &[&str]) -> SharedString {
 #[derive(Clone)]
 pub(super) enum NodeMeta {
     Db,
-    Schema { name: String },
-    Rel { schema: String, name: String, kind: RelationKind },
+    Schema {
+        name: String,
+    },
+    Rel {
+        schema: String,
+        name: String,
+        kind: RelationKind,
+    },
     /// Small-caps section header (COLUMNS / INDEXES / CONSTRAINTS / …).
     Group,
     /// Column/index/constraint/sequence/function leaf: name + dim meta text.
-    Leaf { name: String, meta: String },
+    Leaf {
+        name: String,
+        meta: String,
+    },
     /// "loading…" / "(empty)" filler row (disabled in the widget).
     Placeholder,
 }
@@ -127,7 +137,11 @@ pub(super) type NodeMetaMap = HashMap<SharedString, NodeMeta>;
 /// A disabled filler child. Also makes the parent a folder (`is_folder()` is
 /// `children.len() > 0`) so the widget lets the user expand it before the
 /// lazy load lands.
-pub(super) fn placeholder_item(parent: &SharedString, label: &'static str, meta: &mut NodeMetaMap) -> TreeItem {
+pub(super) fn placeholder_item(
+    parent: &SharedString,
+    label: &'static str,
+    meta: &mut NodeMetaMap,
+) -> TreeItem {
     let id: SharedString = format!("load{ID_SEP}{parent}").into();
     meta.insert(id.clone(), NodeMeta::Placeholder);
     TreeItem::new(id, label).disabled(true)
@@ -142,7 +156,11 @@ pub(super) fn rel_tree_item(
     let rid = node_id(&["rel", schema, &rel.name]);
     meta.insert(
         rid.clone(),
-        NodeMeta::Rel { schema: schema.to_string(), name: rel.name.clone(), kind: rel.kind },
+        NodeMeta::Rel {
+            schema: schema.to_string(),
+            name: rel.name.clone(),
+            kind: rel.kind,
+        },
     );
     let mut item = TreeItem::new(rid.clone(), rel.name.clone());
     // Only tables expand (columns are shown for tables only); other kinds are
@@ -169,7 +187,13 @@ pub(super) fn rel_tree_item(
                 } else if !c0.nullable {
                     ty.push_str("  NOT NULL");
                 }
-                meta.insert(id.clone(), NodeMeta::Leaf { name: c0.name.clone(), meta: ty });
+                meta.insert(
+                    id.clone(),
+                    NodeMeta::Leaf {
+                        name: c0.name.clone(),
+                        meta: ty,
+                    },
+                );
                 leaves.push(TreeItem::new(id, c0.name.clone()));
             }
             if leaves.is_empty() {
@@ -195,7 +219,10 @@ pub(super) fn rel_tree_item(
                     };
                     meta.insert(
                         id.clone(),
-                        NodeMeta::Leaf { name: ix.name.clone(), meta: tag.to_string() },
+                        NodeMeta::Leaf {
+                            name: ix.name.clone(),
+                            meta: tag.to_string(),
+                        },
                     );
                     leaves.push(TreeItem::new(id, ix.name.clone()));
                 }
@@ -221,7 +248,10 @@ pub(super) fn rel_tree_item(
                     };
                     meta.insert(
                         id.clone(),
-                        NodeMeta::Leaf { name: con.name.clone(), meta: kind.to_string() },
+                        NodeMeta::Leaf {
+                            name: con.name.clone(),
+                            meta: kind.to_string(),
+                        },
                     );
                     leaves.push(TreeItem::new(id, con.name.clone()));
                 }
@@ -283,10 +313,10 @@ pub(super) fn build_tree(
                 if !filtering {
                     if let Some(objs) = &node.objects {
                         let obj_group = |tag: &str,
-                                             label: &'static str,
-                                             leaf_tag: &str,
-                                             names: &[String],
-                                             meta: &mut NodeMetaMap|
+                                         label: &'static str,
+                                         leaf_tag: &str,
+                                         names: &[String],
+                                         meta: &mut NodeMetaMap|
                          -> Option<TreeItem> {
                             if names.is_empty() {
                                 return None;
@@ -298,7 +328,10 @@ pub(super) fn build_tree(
                                 let id = node_id(&[leaf_tag, &node.name, name]);
                                 meta.insert(
                                     id.clone(),
-                                    NodeMeta::Leaf { name: name.clone(), meta: String::new() },
+                                    NodeMeta::Leaf {
+                                        name: name.clone(),
+                                        meta: String::new(),
+                                    },
                                 );
                                 leaves.push(TreeItem::new(id, name.clone()));
                             }
@@ -308,8 +341,20 @@ pub(super) fn build_tree(
                                     .expanded(expanded.contains(&gid)),
                             )
                         };
-                        kids.extend(obj_group("seqs", "SEQUENCES", "seq", &objs.sequences, &mut meta));
-                        kids.extend(obj_group("funcs", "FUNCTIONS", "func", &objs.functions, &mut meta));
+                        kids.extend(obj_group(
+                            "seqs",
+                            "SEQUENCES",
+                            "seq",
+                            &objs.sequences,
+                            &mut meta,
+                        ));
+                        kids.extend(obj_group(
+                            "funcs",
+                            "FUNCTIONS",
+                            "func",
+                            &objs.functions,
+                            &mut meta,
+                        ));
                     }
                 }
             }
@@ -319,9 +364,18 @@ pub(super) fn build_tree(
         if filtering && node.relations.is_some() && matches == 0 {
             continue;
         }
-        meta.insert(sid.clone(), NodeMeta::Schema { name: node.name.clone() });
+        meta.insert(
+            sid.clone(),
+            NodeMeta::Schema {
+                name: node.name.clone(),
+            },
+        );
         let exp = filtering || expanded.contains(&sid);
-        schema_items.push(TreeItem::new(sid, node.name.clone()).children(kids).expanded(exp));
+        schema_items.push(
+            TreeItem::new(sid, node.name.clone())
+                .children(kids)
+                .expanded(exp),
+        );
     }
 
     let db_id = SharedString::from("db");
@@ -406,30 +460,34 @@ impl Workspace {
     pub(super) fn load_schemas(&mut self, cx: &mut Context<Self>) {
         let Some(conn) = self.conn else { return };
         let db = self.db.clone();
-        self.spawn_db(cx, async move { db.schemas(conn).await }, |this, result, cx| {
-            match result {
-                Ok(schemas) => {
-                    this.tree.schemas = schemas
-                        .into_iter()
-                        .map(|s| SchemaNode {
-                            name: s.name,
-                            relations: None,
-                            objects: None,
-                        })
-                        .collect();
-                    log(format!("schemas loaded: {}", this.tree.schemas.len()));
-                    this.status = format!("{} schema(s)", this.tree.schemas.len());
-                    // Expansion is kept across a refresh (relations of
-                    // still-expanded schemas re-fetch via `sync_tree`).
-                    this.tree.expanded.insert("db".into());
-                    this.sync_tree(cx);
-                    if std::env::var_os("ZDB_SELFTEST").is_some() {
-                        this.selftest(cx);
+        self.spawn_db(
+            cx,
+            async move { db.schemas(conn).await },
+            |this, result, cx| {
+                match result {
+                    Ok(schemas) => {
+                        this.tree.schemas = schemas
+                            .into_iter()
+                            .map(|s| SchemaNode {
+                                name: s.name,
+                                relations: None,
+                                objects: None,
+                            })
+                            .collect();
+                        log(format!("schemas loaded: {}", this.tree.schemas.len()));
+                        this.status = format!("{} schema(s)", this.tree.schemas.len());
+                        // Expansion is kept across a refresh (relations of
+                        // still-expanded schemas re-fetch via `sync_tree`).
+                        this.tree.expanded.insert("db".into());
+                        this.sync_tree(cx);
+                        if std::env::var_os("ZDB_SELFTEST").is_some() {
+                            this.selftest(cx);
+                        }
                     }
+                    Err(e) => this.status = format!("Failed to load schemas: {e}"),
                 }
-                Err(e) => this.status = format!("Failed to load schemas: {e}"),
-            }
-        });
+            },
+        );
     }
 
     /// Rebuild the widget's items from the model + `expanded_ids`, kick lazy
@@ -471,7 +529,12 @@ impl Workspace {
             .as_ref()
             .filter(|_| self.conn.is_some())
             .map(|c| c.dbname.as_str());
-        build_tree(dbname, &self.tree.schemas, &self.tree.expanded, &self.tree.filter)
+        build_tree(
+            dbname,
+            &self.tree.schemas,
+            &self.tree.expanded,
+            &self.tree.filter,
+        )
     }
 
     /// Start a lazy load for every expanded-but-unloaded schema/table not
@@ -538,7 +601,8 @@ impl Workspace {
     /// Enter on the tree: open the selected relation in a tab.
     pub(super) fn open_selected_tree_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self
-            .tree.state
+            .tree
+            .state
             .read(cx)
             .selected_entry()
             .map(|e| e.item().id.clone())
@@ -573,7 +637,11 @@ impl Workspace {
                     if let Some(node) = this.tree.schemas.iter_mut().find(|n| n.name == schema) {
                         node.relations = Some(
                             rels.into_iter()
-                                .map(|r| RelNode { name: r.name, kind: r.kind, detail: None })
+                                .map(|r| RelNode {
+                                    name: r.name,
+                                    kind: r.kind,
+                                    detail: None,
+                                })
                                 .collect(),
                         );
                         node.objects = objects.ok();
@@ -588,7 +656,12 @@ impl Workspace {
         });
     }
 
-    pub(super) fn load_relation_detail(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
+    pub(super) fn load_relation_detail(
+        &mut self,
+        schema: String,
+        table: String,
+        cx: &mut Context<Self>,
+    ) {
         let Some(conn) = self.conn else { return };
         let rid = node_id(&["rel", &schema, &table]);
         if !self.tree.loads.insert(rid.clone()) {
@@ -637,12 +710,24 @@ mod tests {
             SchemaNode {
                 name: "public".into(),
                 relations: Some(vec![
-                    RelNode { name: "users".into(), kind: RelationKind::Table, detail: None },
-                    RelNode { name: "v_orders".into(), kind: RelationKind::View, detail: None },
+                    RelNode {
+                        name: "users".into(),
+                        kind: RelationKind::Table,
+                        detail: None,
+                    },
+                    RelNode {
+                        name: "v_orders".into(),
+                        kind: RelationKind::View,
+                        detail: None,
+                    },
                 ]),
                 objects: None,
             },
-            SchemaNode { name: "audit".into(), relations: None, objects: None },
+            SchemaNode {
+                name: "audit".into(),
+                relations: None,
+                objects: None,
+            },
         ]
     }
 
@@ -711,7 +796,9 @@ mod tests {
         assert_eq!(tables.children[0].label.as_ref(), "users");
 
         // Not connected → no items at all.
-        assert!(build_tree(None, &sample_tree(), &HashSet::new(), "").0.is_empty());
+        assert!(build_tree(None, &sample_tree(), &HashSet::new(), "")
+            .0
+            .is_empty());
     }
 
     #[test]
@@ -763,10 +850,17 @@ mod tests {
             .update(cx, |ws, _w, cx| {
                 ws.conn = Some(1);
                 ws.cfg = Some(ConnectionConfig::new("dev", "h", "zdb", "u"));
-                ws.tree.schemas = vec![SchemaNode { name: "public".into(), relations: None, objects: None }];
+                ws.tree.schemas = vec![SchemaNode {
+                    name: "public".into(),
+                    relations: None,
+                    objects: None,
+                }];
                 ws.tree.expanded.insert("db".into());
                 ws.sync_tree(cx);
-                assert!(ws.tree.loads.is_empty(), "collapsed schema: nothing to load");
+                assert!(
+                    ws.tree.loads.is_empty(),
+                    "collapsed schema: nothing to load"
+                );
                 // Simulate the widget expanding the schema row through the
                 // shared item state + its notify.
                 let sch = &ws.tree.items[0].children[0];

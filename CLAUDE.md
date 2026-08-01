@@ -317,6 +317,16 @@ The WSL host can run Windows exes directly:
     `open_query_tab` ("Query N"). The tab-strip close `x` is a SEPARATE clickable sibling
     of the activate region (nesting two `on_click`s would fire both → activate a
     just-removed tab).
+  - **Right-click menu on a tab chip** (Close / Close Others / Close to the Right /
+    Close All → `close_tab`/`close_other_tabs`/`close_tabs_right`/`close_all_tabs`).
+    `ContextMenuExt::context_menu` hardcodes its element id (`"context-menu"`), and
+    gpui keys element state by the id PATH — so N sibling chips with no id'd ancestor
+    share ONE `ContextMenuState`: every chip renders the popup + its full-window
+    `occlude()` overlay, the same `PopupMenu` entity is rendered N times, and its
+    items' interactive state collides → the menu LOOKS fine but clicks do nothing.
+    FIX: wrap each chip in a uniquely id'd div (`div().id(format!("tabchip-{id}"))`)
+    so each context menu gets its own state. (Tree rows escape this because
+    `uniform_list` already pushes a per-item id.)
   - `activate_tab` focuses the tab's input only when `window.root::<gpui_component::Root>()`
     exists — headless `#[gpui::test]` windows have no `Root`, and focusing a code-editor
     input there panics (`root.rs` "window first layer should be a Root").

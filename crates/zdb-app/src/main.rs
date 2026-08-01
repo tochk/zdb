@@ -120,8 +120,9 @@ fn main() {
 
         cx.spawn(async move |cx| {
             cx.open_window(window_options, |window, cx| {
-                let view =
-                    cx.new(|cx| Workspace::new(db.clone(), settings.clone(), auto.clone(), window, cx));
+                let view = cx.new(|cx| {
+                    Workspace::new(db.clone(), settings.clone(), auto.clone(), window, cx)
+                });
                 cx.new(|cx| gpui_component::Root::new(view, window, cx))
             })
             .expect("failed to open zdb window");
