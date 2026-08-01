@@ -10,7 +10,8 @@
 use gpui::{
     actions, div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context,
     Entity, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Window, WindowControlArea,
+    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds,
+    WindowControlArea,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -155,6 +156,44 @@ pub struct Workspace {
     conn_adding: bool,
     settings_open: bool,
     form: ConnForm,
+
+    /// Latest window geometry seen in `render`, and whether a debounced write of
+    /// it is already scheduled (resizing renders every frame — one write wins).
+    pending_geom: Option<zdb_config::WindowState>,
+    geom_flush: bool,
+}
+
+/// The window's geometry as stored in settings. A maximized window reports its
+/// *restore* bounds, so unmaximizing after a restart lands on the size the user
+/// last dragged.
+fn geom_state(bounds: WindowBounds, is_maximized: bool) -> zdb_config::WindowState {
+    let b = bounds.get_bounds();
+    zdb_config::WindowState {
+        x: f32::from(b.origin.x),
+        y: f32::from(b.origin.y),
+        width: f32::from(b.size.width),
+        height: f32::from(b.size.height),
+        maximized: matches!(bounds, WindowBounds::Maximized(_)) || is_maximized,
+    }
+}
+
+fn window_geom(window: &Window) -> zdb_config::WindowState {
+    geom_state(window.window_bounds(), window.is_maximized())
+}
+
+/// Persist the window's current geometry (best effort). Called on the close
+/// paths; `track_window_geometry` covers everything else.
+pub(super) fn save_window_geometry(window: &Window) {
+    save_geom(window_geom(window));
+}
+
+/// The one place geometry reaches the disk. Tests run with real settings on the
+/// dev machine, so they must never write.
+fn save_geom(state: zdb_config::WindowState) {
+    #[cfg(not(test))]
+    zdb_config::save_window_state(state);
+    #[cfg(test)]
+    let _ = state;
 }
 
 impl Workspace {
@@ -178,6 +217,16 @@ impl Workspace {
 
         let form = ConnForm::new(window, cx);
         let tree = SchemaTree::new(window, cx);
+
+        // Remember the window geometry so the next launch reopens the same size
+        // and position (otherwise gpui picks its default bounds every start).
+        // Fires on the OS close path (Windows close button / Alt+F4); the Linux
+        // title-bar button calls `save_window_geometry` itself before removing
+        // the window.
+        window.on_window_should_close(cx, |window, _cx| {
+            save_window_geometry(window);
+            true
+        });
 
         let mut this = Self {
             db,
@@ -203,6 +252,8 @@ impl Workspace {
             conn_adding: false,
             settings_open: false,
             form,
+            pending_geom: None,
+            geom_flush: false,
         };
         if let Some(cfg) = auto {
             if let Some(pw) = &cfg.password {
@@ -214,6 +265,34 @@ impl Workspace {
             this.conn_adding = this.settings.connections.is_empty();
         }
         this
+    }
+
+    /// Note the window's geometry (called from `render`, which runs on every
+    /// resize) and schedule one write half a second after it stops changing —
+    /// so a drag doesn't hammer the settings file, and a geometry change is
+    /// persisted even if the app never reaches its close path.
+    pub(super) fn track_window_geometry(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let state = window_geom(window);
+        if self.pending_geom == Some(state) {
+            return;
+        }
+        self.pending_geom = Some(state);
+        if self.geom_flush {
+            return;
+        }
+        self.geom_flush = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let _ = this.update(cx, |this, _cx| {
+                this.geom_flush = false;
+                if let Some(state) = this.pending_geom {
+                    save_geom(state);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Run `fut` to completion, then apply its output to the workspace and
@@ -320,8 +399,25 @@ mod test_support;
 
 #[cfg(test)]
 mod tests {
+    use super::geom_state;
     use crate::workspace::test_support::*;
-    use gpui::TestAppContext;
+    use gpui::{point, px, size, Bounds, TestAppContext, WindowBounds};
+
+    #[test]
+    fn geometry_keeps_restore_bounds_when_maximized() {
+        let bounds = Bounds {
+            origin: point(px(30.), px(40.)),
+            size: size(px(1000.), px(700.)),
+        };
+        let windowed = geom_state(WindowBounds::Windowed(bounds), false);
+        assert_eq!((windowed.x, windowed.width), (30., 1000.));
+        assert!(!windowed.maximized);
+
+        // Maximized stores the *restore* size, flagged so it reopens maximized.
+        let max = geom_state(WindowBounds::Maximized(bounds), true);
+        assert_eq!((max.width, max.height), (1000., 700.));
+        assert!(max.maximized);
+    }
 
     #[gpui::test]
     fn palette_opens_and_closes(cx: &mut TestAppContext) {

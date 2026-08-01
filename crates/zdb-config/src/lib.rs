@@ -17,6 +17,21 @@ pub struct Settings {
     pub theme: Theme,
     /// Optional keybinding overrides: action name → key (e.g. "run" → "ctrl-enter").
     pub keymap: Vec<KeyBindingEntry>,
+    /// Last window geometry, restored on the next launch. `None` until the app
+    /// has been closed once.
+    pub window: Option<WindowState>,
+}
+
+/// Saved window geometry (logical pixels, global coordinates). `maximized`
+/// reopens maximized while keeping the restore size in the other fields.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WindowState {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +113,17 @@ impl Settings {
     }
 }
 
+/// Persist just the window geometry (best effort), re-reading the file first so
+/// this never clobbers settings changed elsewhere in the session.
+pub fn save_window_state(state: WindowState) {
+    let mut settings = Settings::load().unwrap_or_default();
+    if settings.window == Some(state) {
+        return;
+    }
+    settings.window = Some(state);
+    let _ = settings.save();
+}
+
 /// Path of the auto-saved scratch query file (`<config dir>/zdb/scratch.sql`).
 pub fn scratch_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "zdb").map(|d| d.config_dir().join("scratch.sql"))
@@ -140,6 +166,13 @@ mod tests {
                 action: "run".into(),
                 key: "ctrl-enter".into(),
             }],
+            window: Some(WindowState {
+                x: 10.,
+                y: 20.,
+                width: 1200.,
+                height: 800.,
+                maximized: true,
+            }),
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -147,6 +180,14 @@ mod tests {
         assert_eq!(back.connections[0].port, 5433);
         assert_eq!(back.theme, Theme::Light);
         assert_eq!(back.keymap[0].key, "ctrl-enter");
+        assert_eq!(back.window.unwrap().width, 1200.);
+    }
+
+    #[test]
+    fn window_state_absent_in_old_files() {
+        // Settings written before window persistence existed must still load.
+        let s: Settings = serde_json::from_str(r#"{ "theme": "dark" }"#).unwrap();
+        assert_eq!(s.window, None);
     }
 
     #[test]

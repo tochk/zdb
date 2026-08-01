@@ -189,6 +189,21 @@ The WSL host can run Windows exes directly:
   OLD icon from its per-path icon cache even when the taskbar/window icon is correct —
   that's host-side staleness (clear with `ie4uinit.exe -show` / delete iconcache), not
   a build problem.
+- **Window geometry is persisted** (`Settings.window: Option<WindowState>` in zdb-config;
+  `zdb_config::save_window_state` re-reads the file before writing so it never clobbers
+  other settings). `main.rs` turns it into `WindowOptions.window_bounds`
+  (`Maximized` when the flag is set — gpui stores the RESTORE bounds in that variant),
+  dropping bounds that intersect no current display (unplugged monitor → off-screen window).
+  Saving has two paths because neither alone is enough: `Workspace::new` registers
+  `window.on_window_should_close` (Windows close button / Alt+F4 → WM_CLOSE) and the Linux
+  title-bar close button calls `save_window_geometry` before `remove_window()` (that call
+  bypasses the OS close path). PLUS `render` calls `track_window_geometry`, which debounces
+  a write 500ms after the geometry stops changing — resize renders every frame, and a hard
+  exit never reaches any close hook. The disk write is `#[cfg(not(test))]` (tests would
+  otherwise stomp the dev machine's real settings.json).
+  Verifying on WSL X11: `xdotool windowsize/windowmove` DO work, but synthetic
+  `xdotool click`/`key alt+F4` are ignored by the app — don't try to test close paths by
+  clicking here; resize + read `~/.config/zdb/settings.json` instead.
 - Resizable panels: gpui-component seeds any `resizable_panel()` WITHOUT an explicit
   `.size()` to `PANEL_MIN_SIZE` (state.rs `sync_panels_count`), then ratio-scales to
   the container. A group where the first panel had no size squeezed the last panel

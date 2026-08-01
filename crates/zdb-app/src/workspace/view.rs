@@ -1056,7 +1056,12 @@ impl Workspace {
         let btn = btn.on_click(cx.listener(move |_, _: &ClickEvent, window, _| match id {
             "win-min" => window.minimize_window(),
             "win-max" => window.zoom_window(),
-            _ => window.remove_window(),
+            _ => {
+                // `remove_window` bypasses the OS close path, so the geometry
+                // hook in `Workspace::new` never runs — save it here.
+                super::save_window_geometry(window);
+                window.remove_window()
+            }
         }));
 
         btn
@@ -1080,6 +1085,8 @@ impl Render for Workspace {
             window.set_window_title(&title);
             self.window_title = title;
         }
+        // Remember size/position for the next launch (debounced; see the fn).
+        self.track_window_geometry(window, cx);
         // A table requested from a windowless context (e.g. the selftest) opens
         // here, where the window is available.
         if let Some((schema, table)) = self.pending_open.take() {
