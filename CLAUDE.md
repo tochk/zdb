@@ -83,6 +83,33 @@ Target is **Windows on ARM64** (the dev box is WSL2 aarch64; the host is ARM64).
 - CI's Package step drops `zdb.exe` + `sqls.exe` into the artifact; no extra
   runtime files needed.
 
+## macOS builds
+
+**Always ship the `.app` bundle, never the bare `zdb` executable.** Finder cannot
+launch a Unix executable — double-clicking one makes it open **Terminal** and run
+the app from there, and it shows the generic exec icon (no `CFBundleIconFile`).
+That was the whole "it starts a terminal first / has no icon" symptom.
+
+- `scripts/package-macos.sh [arch]` assembles `dist/zdb.app` (must run ON a Mac —
+  no macOS SDK on the Linux dev box). Env: `ZDB_SKIP_BUILD=1` reuses an existing
+  release binary (CI already built one into `target/release`), `ZDB_ZIP=1` also
+  writes `dist/zdb-macos-<arch>.zip` via `ditto`.
+- The script ad-hoc **codesigns** the bundle (`codesign --force --deep --sign -`):
+  Apple Silicon refuses unsigned code, and adding `sqls`/Info.plist invalidates the
+  linker's own ad-hoc signature on the bare binary. It then `lsregister -f`s the
+  path — macOS caches bundle icons **per path** and otherwise keeps showing the old
+  or generic one (same class of trap as the Windows Explorer icon cache).
+- Icon: `scripts/gen-icon.py` emits BOTH `resources/zdb.ico` and `resources/zdb.icns`.
+  The `.icns` is written by a small pure-Python packer (`icns` header + `type/len/PNG`
+  entries) because Pillow's own ICNS *writer* shells out to macOS-only `iconutil`,
+  and we generate here on Linux. Art is inset to 824/1024 (Apple's icon grid) or it
+  looks oversized in the Dock.
+- CI (`build.yml` Package step) branches on `goos == darwin`: runs the script and
+  uploads `zdb.app.zip`. Upload-artifact does NOT preserve the exec bit or bundle
+  layout, so the inner `ditto` zip is required, not cosmetic.
+- Distributing it: ad-hoc signing ≠ notarized, so a downloaded copy needs
+  `xattr -dr com.apple.quarantine /Applications/zdb.app` once (documented in README).
+
 ## Testing Windows builds HERE (WSL interop)
 
 The WSL host can run Windows exes directly:

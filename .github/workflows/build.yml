@@ -109,11 +109,20 @@ jobs:
           set -euo pipefail
           out="zdb-${{ matrix.name }}"
           mkdir -p "dist/$out"
-          cp "target/release/${{ matrix.bin }}" "dist/$out/"
-          # sqls next to the executable (zdb finds it there).
-          sqls_dst="sqls"; [ "${{ matrix.goos }}" = windows ] && sqls_dst="sqls.exe"
-          cp "dist/sqls/${{ matrix.sqls }}" "dist/$out/$sqls_dst"
-          chmod +x "dist/$out/$sqls_dst" || true
+          if [ "${{ matrix.goos }}" = darwin ]; then
+            # macOS ships a .app bundle, not a bare executable: Finder cannot
+            # launch a Unix executable, so it opens Terminal to run it, and it
+            # gets the generic icon. Ship it zipped by `ditto` — upload-artifact
+            # does not preserve the exec bit or the bundle layout.
+            ZDB_SKIP_BUILD=1 ZDB_ZIP=1 bash scripts/package-macos.sh "${{ matrix.goarch }}"
+            mv "dist/zdb-macos-${{ matrix.goarch }}.zip" "dist/$out/zdb.app.zip"
+          else
+            cp "target/release/${{ matrix.bin }}" "dist/$out/"
+            # sqls next to the executable (zdb finds it there).
+            sqls_dst="sqls"; [ "${{ matrix.goos }}" = windows ] && sqls_dst="sqls.exe"
+            cp "dist/sqls/${{ matrix.sqls }}" "dist/$out/$sqls_dst"
+            chmod +x "dist/$out/$sqls_dst" || true
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
