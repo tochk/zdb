@@ -86,6 +86,11 @@ impl ConnectionConfig {
     }
 
     /// Build the tokio-postgres connection config (without the TLS connector).
+    ///
+    /// `connect_timeout` bounds (re)connection attempts so a dead host can't
+    /// stall the DB worker; the short keepalive interval makes NAT/firewall
+    /// silent drops both less likely and detected promptly, so `is_closed()`
+    /// reflects a lost connection and the worker's auto-reconnect kicks in.
     pub fn to_pg_config(&self) -> tokio_postgres::Config {
         let mut cfg = tokio_postgres::Config::new();
         cfg.host(&self.host)
@@ -93,6 +98,8 @@ impl ConnectionConfig {
             .dbname(&self.dbname)
             .user(&self.user)
             .application_name("zdb")
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .keepalives_idle(std::time::Duration::from_secs(120))
             .ssl_mode(self.ssl_mode.transport());
         if let Some(pw) = &self.password {
             cfg.password(pw);

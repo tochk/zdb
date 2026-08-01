@@ -31,3 +31,6 @@ embed-resource = "3"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# Enables `secret::probe` so the connect regression test can assert the keychain
+# read is deferred off the UI thread. Dev-only: absent from the release binary.
+zdb-config = { path = "../zdb-config", features = ["test-probe"] }

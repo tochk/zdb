@@ -15,16 +15,32 @@ use tokio_postgres::{Client, SimpleQueryMessage};
 
 const ROW_BATCH: usize = 500;
 
+/// How a [`run`] call ended, from the caller's point of view.
+pub(crate) enum RunOutcome {
+    /// The submission finished (successfully or not); any error was already
+    /// forwarded to the event channel.
+    Done,
+    /// The connection was already closed when the SQL was submitted — nothing
+    /// reached the server and nothing was sent on the event channel, so the
+    /// caller may reconnect and retry safely (even for writes).
+    ClosedAtSubmit,
+}
+
 /// Execute `sql` on `client`, forwarding [`QueryEvent`]s to `tx`. A submission
 /// may contain multiple statements; each yields its own `Columns…Done` sequence.
-pub(crate) async fn run(client: &Client, sql: &str, tx: &UnboundedSender<QueryEvent>) {
+pub(crate) async fn run(
+    client: &Client,
+    sql: &str,
+    tx: &UnboundedSender<QueryEvent>,
+) -> RunOutcome {
     let mut start = Instant::now();
 
     let stream = match client.simple_query_raw(sql).await {
         Ok(s) => s,
+        Err(e) if e.is_closed() => return RunOutcome::ClosedAtSubmit,
         Err(e) => {
             let _ = tx.send(QueryEvent::Failed(DbError::from_pg(&e)));
-            return;
+            return RunOutcome::Done;
         }
     };
     let mut stream = std::pin::pin!(stream);
@@ -68,12 +84,15 @@ pub(crate) async fn run(client: &Client, sql: &str, tx: &UnboundedSender<QueryEv
             Err(e) => {
                 flush(&mut batch, tx);
                 let _ = tx.send(QueryEvent::Failed(DbError::from_pg(&e)));
-                return;
+                // Mid-stream failure: statements may have executed, so this is
+                // never retried — report Done, error already forwarded.
+                return RunOutcome::Done;
             }
         }
     }
 
     flush(&mut batch, tx);
+    RunOutcome::Done
 }
 
 fn emit_columns<'a>(

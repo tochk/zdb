@@ -19,6 +19,8 @@ pub(crate) struct Colors {
     pub(crate) hover: Hsla,
     /// Selected/active row background.
     pub(crate) active: Hsla,
+    /// Error/destructive foreground (readable in both theme modes).
+    pub(crate) danger: Hsla,
 }
 
 pub(crate) fn palette(cx: &App) -> Colors {
@@ -36,6 +38,7 @@ pub(crate) fn palette(cx: &App) -> Colors {
         accent: t.accent,
         hover: t.list_hover,
         active: t.list_active,
+        danger: t.danger,
     }
 }
 

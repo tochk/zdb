@@ -52,6 +52,24 @@ cargo build -p zdb-app --release
 Linux build deps (Debian/Ubuntu): `libfontconfig1-dev libfreetype-dev libxkbcommon-dev
 libwayland-dev libvulkan-dev libxcb*-dev libdbus-1-dev clang`.
 
+### macOS
+
+Run the app as a bundle, not as the bare `zdb` executable — Finder cannot launch a Unix
+executable directly, so double-clicking it opens Terminal and runs the app from there, and
+it shows the generic executable icon instead of the app icon.
+
+```bash
+make package-macos              # → dist/zdb.app  (must run on a Mac)
+```
+
+The CI artifact `zdb-macos-arm64` contains the same bundle as `zdb.app.zip`. The build is
+only **ad-hoc signed**, so after unzipping a downloaded copy, clear the quarantine flag
+once (otherwise Gatekeeper reports the app as damaged):
+
+```bash
+xattr -dr com.apple.quarantine /Applications/zdb.app
+```
+
 ### Connecting
 
 Use the in-app **Connections** dialog (opens on first launch). Details are saved to

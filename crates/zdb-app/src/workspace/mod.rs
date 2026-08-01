@@ -47,7 +47,7 @@ use conn::ConnForm;
 use grid::{Tab, TabKind};
 use query::QueryLog;
 use tree::{NodeMeta, SchemaTree};
-use util::{entry_to_config, oneline, order_by_sql, rel_icon};
+use util::{entry_to_config, oneline, order_by_sql, rel_icon, window_title};
 
 actions!(
     zdb,
@@ -126,6 +126,9 @@ pub struct Workspace {
     /// A table to open on the next render (set from windowless async contexts,
     /// e.g. the selftest, where no `&mut Window` is available).
     pending_open: Option<(String, String)>,
+    /// Last title pushed to the OS window (taskbar / alt-tab), so `render` only
+    /// calls into the platform when it actually changes.
+    window_title: String,
 
     /// Shared inline-cell editor (only the active tab edits a cell at a time).
     cell_input: Entity<InputState>,
@@ -186,6 +189,7 @@ impl Workspace {
             active: None,
             next_tab_id: 1,
             pending_open: None,
+            window_title: "zdb".into(),
             cell_input,
             lsp_slot: lsp::new_slot(),
             log: QueryLog::default(),

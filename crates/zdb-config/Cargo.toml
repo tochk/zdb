@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Test-only: instrument `secret::get_password` so tests can assert the blocking
+# keychain read is deferred off the UI thread (see zdb-app connect regression).
+# Enabled via zdb-app's dev-dependency; never on in release builds.
+test-probe = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
