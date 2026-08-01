@@ -120,7 +120,13 @@ impl Workspace {
             }
             _ => welcome_pane(c).into_any_element(),
         };
-        v_flex().size_full().bg(c.center).child(strip).child(body)
+        v_flex()
+            .size_full()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .bg(c.center)
+            .child(strip)
+            .child(body)
     }
 
     /// The Zed-style tab strip: one chip per open tab + `+` (new query) and a
@@ -357,7 +363,14 @@ impl Workspace {
             );
         }
 
-        let mut results = v_flex().size_full();
+        // `min_w(0)` + `overflow_hidden` all the way down to the Table element:
+        // a flex item's automatic minimum size is its MIN-CONTENT width, which for
+        // a wide grid is the sum of all column widths. Without the clamp every
+        // ancestor (incl. gpui-component's `resizable_panel`, which is `flex_grow`
+        // + `size_full` with no min-width of its own) grows to that width, the
+        // table believes it fits, its internal horizontal scroll never engages, and
+        // the off-window columns are simply clipped by the root `overflow_hidden`.
+        let mut results = v_flex().size_full().min_w(px(0.)).overflow_hidden();
         if let TabKind::Table { schema, table } = &tab.kind {
             results = results.child(
                 h_flex()
@@ -394,6 +407,8 @@ impl Workspace {
             results.child(
                 div()
                     .size_full()
+                    .min_w(px(0.))
+                    .overflow_hidden()
                     .child(Table::new(&tab.table).stripe(true).bordered(true)),
             )
         };
@@ -414,7 +429,13 @@ impl Workspace {
                 .into_any_element()
         };
 
-        v_flex().size_full().bg(c.center).child(toolbar).child(body)
+        v_flex()
+            .size_full()
+            .min_w(px(0.))
+            .overflow_hidden()
+            .bg(c.center)
+            .child(toolbar)
+            .child(body)
     }
 
     /// The EXPLAIN plan view: a header with a close button and a scrollable

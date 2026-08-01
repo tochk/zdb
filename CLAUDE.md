@@ -210,6 +210,19 @@ The WSL host can run Windows exes directly:
   off-screen (the bottom query-log / review pane was clipped below the window). Give
   EVERY panel an explicit `.size()` (the ratios are scaled to fit) — don't leave one
   unsized expecting it to flex-fill.
+- **Wide results must be able to scroll horizontally**: a flex item's automatic
+  minimum size is its MIN-CONTENT width, and for the grid that's the sum of every
+  column width (180px × N). Every ancestor — including gpui-component's
+  `resizable_panel` (`flex_grow` + `size_full`, no min-width of its own) — then grows
+  to that width, so the Table element believes it fits, its built-in horizontal
+  scrollbar never engages, and the off-window columns are simply clipped by the root
+  `overflow_hidden` (the "can't scroll right on wide tables" bug). FIX: `min_w(px(0.))`
+  + `overflow_hidden` on the WHOLE chain down to the Table — `render_center`'s root,
+  `render_tab_body`'s root, the `results` v_flex, and the div wrapping
+  `Table::new(...)`. One missing link re-breaks it. Same clamp is what keeps the
+  title-bar controls on-screen (see the title-bar notes above). Not unit-testable
+  (layout lives in gpui's render); verify by running with a 25-column table and
+  wheel-scrolling — vertical scroll is unaffected by the clamp.
 - `text_color` on an icon: `Icon::empty().path("icons/<name>.svg").text_color(rgba(..))`
   tints by alpha mask (gpui rasterizes the SVG → coverage → fills with the color), so
   Lucide stroke OR solid-fill SVGs both work. Don't tint an icon the same color as a
