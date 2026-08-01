@@ -134,6 +134,8 @@ impl Workspace {
             .border_b_1()
             .border_color(c.border)
             .overflow_hidden();
+        let weak = cx.weak_entity();
+        let n_tabs = self.tabs.len();
         for (idx, tab) in self.tabs.iter().enumerate() {
             let is_active = self.active == Some(idx);
             let id = tab.id;
@@ -170,6 +172,9 @@ impl Workspace {
                 .hover(|s| s.bg(c.hover))
                 .child(tree_icon("icons/close.svg", c.fg_dim))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.close_tab(id, cx)));
+            let weak = weak.clone();
+            let has_others = n_tabs > 1;
+            let has_right = idx + 1 < n_tabs;
             strip = strip.child(
                 h_flex()
                     .h_full()
@@ -179,7 +184,36 @@ impl Workspace {
                     .border_color(c.border)
                     .when(is_active, |d| d.bg(c.center))
                     .child(label)
-                    .child(close),
+                    .child(close)
+                    // Right-click anywhere on the chip: close variants.
+                    .context_menu(move |menu, _, _| {
+                        let w = weak.clone();
+                        let mut menu =
+                            menu.item(PopupMenuItem::new("Close").on_click(move |_, _, cx| {
+                                w.update(cx, |this, cx| this.close_tab(id, cx)).ok();
+                            }));
+                        if has_others {
+                            let w = weak.clone();
+                            menu = menu.item(PopupMenuItem::new("Close Others").on_click(
+                                move |_, _, cx| {
+                                    w.update(cx, |this, cx| this.close_other_tabs(id, cx)).ok();
+                                },
+                            ));
+                        }
+                        if has_right {
+                            let w = weak.clone();
+                            menu = menu.item(PopupMenuItem::new("Close to the Right").on_click(
+                                move |_, _, cx| {
+                                    w.update(cx, |this, cx| this.close_tabs_right(id, cx)).ok();
+                                },
+                            ));
+                        }
+                        let w = weak.clone();
+                        menu.separator()
+                            .item(PopupMenuItem::new("Close All").on_click(move |_, _, cx| {
+                                w.update(cx, |this, cx| this.close_all_tabs(cx)).ok();
+                            }))
+                    }),
             );
         }
         strip

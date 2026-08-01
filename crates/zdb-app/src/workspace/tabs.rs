@@ -119,6 +119,32 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Keep only `id` (tab-strip context menu "Close Others").
+    pub(super) fn close_other_tabs(&mut self, id: u64, cx: &mut Context<Self>) {
+        if !self.tabs.iter().any(|t| t.id == id) {
+            return;
+        }
+        self.tabs.retain(|t| t.id == id);
+        self.active = Some(0);
+        cx.notify();
+    }
+
+    /// Drop every tab after `id` (tab-strip context menu "Close to the Right").
+    pub(super) fn close_tabs_right(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        if idx + 1 >= self.tabs.len() {
+            return;
+        }
+        self.tabs.truncate(idx + 1);
+        // Only move focus if the active tab was one of the closed ones.
+        if self.active.is_none_or(|a| a > idx) {
+            self.active = Some(idx);
+        }
+        cx.notify();
+    }
+
     /// Drop every tab (e.g. on connection switch — old results are invalid).
     pub(super) fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
         self.tabs.clear();
@@ -211,6 +237,67 @@ mod tests {
                 ws.close_tab(id, cx);
                 assert!(ws.tabs.is_empty());
                 assert_eq!(ws.active, None);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn close_other_tabs_keeps_one(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                seed_query_tab(ws, window, cx);
+                let mid = seed_query_tab(ws, window, cx);
+                seed_query_tab(ws, window, cx);
+                ws.close_other_tabs(mid, cx);
+                assert_eq!(ws.tabs.len(), 1);
+                assert_eq!(ws.tabs[0].id, mid);
+                assert_eq!(ws.active, Some(0));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn close_tabs_right_truncates(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let first = seed_query_tab(ws, window, cx);
+                seed_query_tab(ws, window, cx);
+                seed_query_tab(ws, window, cx);
+                ws.close_tabs_right(first, cx);
+                assert_eq!(ws.tabs.len(), 1);
+                assert_eq!(ws.active, Some(0));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn close_tabs_right_keeps_active_left_of_anchor(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                seed_query_tab(ws, window, cx);
+                let mid = seed_query_tab(ws, window, cx);
+                seed_query_tab(ws, window, cx);
+                ws.activate_tab(0, window, cx);
+                ws.close_tabs_right(mid, cx);
+                assert_eq!(ws.tabs.len(), 2);
+                assert_eq!(ws.active, Some(0));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn close_tabs_right_on_last_is_noop(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                seed_query_tab(ws, window, cx);
+                let last = seed_query_tab(ws, window, cx);
+                ws.close_tabs_right(last, cx);
+                assert_eq!(ws.tabs.len(), 2);
+                assert_eq!(ws.active, Some(1));
             })
             .unwrap();
     }
