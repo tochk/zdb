@@ -103,6 +103,11 @@ The WSL host can run Windows exes directly:
 - Windows settings path: `%APPDATA%\zdb\config\settings.json` (directories crate
   adds the `config` subdir). Keychain = Windows Credential Manager (service `zdb`).
 
+## Commits
+
+- **Title only. No body, no description, no bullet list of changes.**
+- **NEVER add a `Co-Authored-By:` trailer** (no Claude co-author line, ever).
+
 ## Gotchas
 
 - Background-command "exit 0" from `… | tee | tail` is the tail's exit — always

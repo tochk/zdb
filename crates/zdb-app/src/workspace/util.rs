@@ -175,6 +175,17 @@ pub(crate) fn entry_to_config(entry: &ConnectionEntry, password: Option<String>)
     cfg
 }
 
+/// OS window title: the active connection name plus the app name, or just the
+/// app name when not connected. This is what the taskbar / alt-tab show, so it
+/// has to carry the connection even though our custom title bar draws it inside
+/// the client area (which the OS cannot see).
+pub(crate) fn window_title(conn_name: Option<&str>) -> String {
+    match conn_name {
+        Some(n) if !n.trim().is_empty() => format!("{} — zdb", n.trim()),
+        _ => "zdb".into(),
+    }
+}
+
 pub(crate) fn rel_icon(kind: RelationKind) -> &'static str {
     match kind {
         RelationKind::Table => "icons/table.svg",
@@ -189,6 +200,14 @@ mod tests {
     use super::*;
     use gpui_component::table::ColumnSort;
     use zdb_db::SslMode;
+
+    #[test]
+    fn window_title_reflects_connection() {
+        assert_eq!(window_title(Some("Local dev")), "Local dev — zdb");
+        assert_eq!(window_title(None), "zdb");
+        assert_eq!(window_title(Some("   ")), "zdb");
+        assert_eq!(window_title(Some(" prod ")), "prod — zdb");
+    }
 
     #[test]
     fn single_statement_returned_whole() {

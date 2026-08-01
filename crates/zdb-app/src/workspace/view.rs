@@ -1024,6 +1024,20 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
+        // The taskbar / alt-tab can't see our client-area title bar, so mirror
+        // the connection label into the real window title. `render` is hot and
+        // connections change from windowless contexts, so diff it here rather
+        // than threading a `&mut Window` into `conn.rs`.
+        let title = window_title(
+            self.cfg
+                .as_ref()
+                .filter(|_| self.conn.is_some())
+                .map(|cfg| cfg.name.as_str()),
+        );
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
         // A table requested from a windowless context (e.g. the selftest) opens
         // here, where the window is available.
         if let Some((schema, table)) = self.pending_open.take() {

@@ -9,7 +9,7 @@ mod terminal;
 mod workspace;
 
 use assets::Assets;
-use gpui::{px, size, AppContext, Application, KeyBinding, WindowOptions};
+use gpui::{px, size, AppContext, Application, KeyBinding, TitlebarOptions, WindowOptions};
 use gpui_component::TitleBar;
 use workspace::{
     ClosePalette, RunQuery, ToggleConnections, TogglePalette, ToggleScratch, ToggleSettings,
@@ -79,8 +79,15 @@ fn main() {
         // makes gpui hide the native title bar on Windows/Linux and lets the app
         // paint the whole window; `gpui_component::TitleBar` (rendered in the
         // workspace) draws the drag region + min/restore/maximize/close controls.
+        // The title is still needed even though the native bar is hidden: it is
+        // what the taskbar / alt-tab show. `title_bar_options()` leaves it None,
+        // which the Windows backend turns into an empty window name (blank
+        // taskbar tooltip). The workspace keeps it in sync with the connection.
         let window_options = WindowOptions {
-            titlebar: Some(TitleBar::title_bar_options()),
+            titlebar: Some(TitlebarOptions {
+                title: Some("zdb".into()),
+                ..TitleBar::title_bar_options()
+            }),
             window_min_size: Some(size(px(640.), px(480.))),
             ..Default::default()
         };
