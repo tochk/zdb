@@ -1220,6 +1220,10 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
                     this.close_palette(cx);
                     this.stop_autoscroll(cx);
+                    // Esc discards the inline cell edit. Clearing `editing` first
+                    // means the blur that follows (the input unmounts) finds
+                    // nothing to commit.
+                    this.cancel_cell_edit(cx);
                     if this.conn_manager_open {
                         this.conn_manager_open = false;
                         cx.notify();

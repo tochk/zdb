@@ -272,6 +272,13 @@ The WSL host can run Windows exes directly:
   HashSet<(row,col)>` tracks them, cleared whenever `pending` is. `orig_rows` snapshots
   the loaded values: editing a cell back to its original drops the staged `Update`
   (`remove_pending_update`, which also dedups re-edits of the same cell) and unmarks it.
+  **Commit rules**: Enter, blur, and moving to another cell all STAGE the edit; only
+  Esc discards. `cell_input` is ONE shared entity, so a cell→cell move never changes
+  the focus handle and emits NO `InputEvent::Blur` — `begin_edit`/`set_current_row`
+  therefore call `commit_cell_edit` themselves before repointing `editing`. Esc rides
+  the global `escape`→`ClosePalette` action (gpui-component's `InputState::escape`
+  propagates when `clean_on_escape` is off), which clears `editing` first so the blur
+  from the unmounting input finds nothing to commit.
   When browsing a table from the tree (`table_view.is_some()`) the generated
   `SELECT * FROM …` editor is hidden — the rows fill the center pane.
 - **Middle-click autoscroll** (`workspace/autoscroll.rs`): wheel-press over a grid drops

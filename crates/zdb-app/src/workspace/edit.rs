@@ -5,6 +5,8 @@ use super::*;
 
 impl Workspace {
     pub(super) fn set_current_row(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
+        // Clicking any other cell stages the edit in progress (same as Enter).
+        self.commit_cell_edit(cx);
         if let Some(tab) = self.tab_mut(tab_id) {
             tab.current_row = Some(row);
         }
@@ -21,6 +23,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // `cell_input` is ONE shared entity, so moving from cell to cell never
+        // changes the focus handle and no Blur fires — the previous cell has to be
+        // committed here explicitly, before `editing` is repointed.
+        if self.tab(tab_id).and_then(|t| t.editing) == Some((row, col)) {
+            return;
+        }
+        self.commit_cell_edit(cx);
+
         let text = {
             let Some(tab) = self.tab_mut(tab_id) else {
                 return;
@@ -479,6 +489,70 @@ mod tests {
                     ws.tab(id).unwrap().rows[0][1],
                     CellValue::Text("beta".into())
                 );
+            })
+            .unwrap();
+    }
+
+    /// Moving to another cell (single click → `set_current_row`, double click →
+    /// `begin_edit`) stages the edit in progress, exactly like Enter. Cell-to-cell
+    /// moves never blur (one shared `cell_input`), so this must happen explicitly.
+    #[gpui::test]
+    fn moving_to_another_cell_commits_the_edit(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                editable_tab(ws, id, vec!["id", "name"]);
+                ws.tab_mut(id).unwrap().rows = vec![
+                    vec![CellValue::Text("1".into()), CellValue::Text("a".into())],
+                    vec![CellValue::Text("2".into()), CellValue::Text("b".into())],
+                ];
+
+                ws.begin_edit(id, 0, 1, window, cx);
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("x", window, cx));
+                // Double-click another cell: no commit call in between.
+                ws.begin_edit(id, 1, 1, window, cx);
+                assert_eq!(ws.tab(id).unwrap().pending.len(), 1);
+                assert_eq!(ws.tab(id).unwrap().rows[0][1], CellValue::Text("x".into()));
+                assert_eq!(ws.tab(id).unwrap().editing, Some((1, 1)));
+
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("y", window, cx));
+                // Single-click a third cell.
+                ws.set_current_row(id, 0, cx);
+                assert_eq!(ws.tab(id).unwrap().pending.len(), 2);
+                assert!(ws.tab(id).unwrap().editing.is_none());
+            })
+            .unwrap();
+    }
+
+    /// Esc discards: nothing is staged and the grid keeps the loaded value.
+    #[gpui::test]
+    fn escape_discards_the_edit(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                editable_tab(ws, id, vec!["id", "name"]);
+                ws.tab_mut(id).unwrap().rows = vec![vec![
+                    CellValue::Text("1".into()),
+                    CellValue::Text("alpha".into()),
+                ]];
+
+                ws.begin_edit(id, 0, 1, window, cx);
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("beta", window, cx));
+                ws.cancel_cell_edit(cx);
+                assert!(ws.tab(id).unwrap().editing.is_none());
+                assert!(ws.tab(id).unwrap().pending.is_empty());
+                assert_eq!(
+                    ws.tab(id).unwrap().rows[0][1],
+                    CellValue::Text("alpha".into())
+                );
+                // The blur that follows the input unmounting must stage nothing.
+                ws.commit_cell_edit(cx);
+                assert!(ws.tab(id).unwrap().pending.is_empty());
             })
             .unwrap();
     }

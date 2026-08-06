@@ -212,12 +212,15 @@ impl Workspace {
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder("Type a command…"));
         let cell_input = cx.new(|cx| InputState::new(window, cx));
 
-        // Commit/cancel inline edits on Enter / focus loss (acts on the active tab).
+        // Commit inline edits on Enter *and* on focus loss — clicking away from a
+        // cell stages the edit exactly like pressing Enter (Esc is the only way to
+        // discard, handled by the `ClosePalette`/escape action, which clears
+        // `editing` first so the resulting blur commits nothing).
         cx.subscribe(
             &cell_input,
             |this, _input, event: &InputEvent, cx| match event {
                 InputEvent::PressEnter { .. } => this.commit_cell_edit(cx),
-                InputEvent::Blur => this.cancel_cell_edit(cx),
+                InputEvent::Blur => this.commit_cell_edit(cx),
                 _ => {}
             },
         )
