@@ -32,6 +32,7 @@ use zdb_db::{
     RelationDetail, RelationKind, RowEdit, SchemaObjects,
 };
 
+mod autoscroll;
 mod colors;
 mod conn;
 mod edit;
@@ -43,6 +44,7 @@ mod tree;
 mod util;
 mod view;
 
+use autoscroll::AutoScroll;
 use colors::{palette, Colors};
 use conn::ConnForm;
 use grid::{Tab, TabKind};
@@ -161,6 +163,9 @@ pub struct Workspace {
     /// it is already scheduled (resizing renders every frame — one write wins).
     pending_geom: Option<zdb_config::WindowState>,
     geom_flush: bool,
+
+    /// Middle-click autoscroll, while it is running (see `autoscroll.rs`).
+    autoscroll: Option<AutoScroll>,
 }
 
 /// The window's geometry as stored in settings. A maximized window reports its
@@ -257,6 +262,7 @@ impl Workspace {
             form,
             pending_geom: None,
             geom_flush: false,
+            autoscroll: None,
         };
         if let Some(cfg) = auto {
             if let Some(pw) = &cfg.password {

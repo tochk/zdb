@@ -34,6 +34,7 @@ crates/
                             reset()), model types, pure build/sync fns, loaders
                  query.rs   run/explain/sort/format, `QueryLog`, `drain_query`
                  edit.rs    inline-edit staging/apply, row add/delete
+                 autoscroll.rs  middle-click (wheel-press) autoscroll of the grid
                  export.rs  CSV/JSON/INSERTs/TSV export
                  view.rs    all render_* + impl Render
                  grid.rs    Tab/TabKind + ResultDelegate
@@ -273,6 +274,26 @@ The WSL host can run Windows exes directly:
   (`remove_pending_update`, which also dedups re-edits of the same cell) and unmarks it.
   When browsing a table from the tree (`table_view.is_some()`) the generated
   `SELECT * FROM …` editor is hidden — the rows fill the center pane.
+- **Middle-click autoscroll** (`workspace/autoscroll.rs`): wheel-press over a grid drops
+  an anchor and latches the mode; a 60Hz task then scrolls BOTH axes at a speed ∝ the
+  cursor's distance from the anchor (dead zone 12px, capped), Windows-style. Any click
+  exits, Esc exits, and releasing the wheel after >8px of movement exits (press-drag-
+  release reads as a one-shot pan). Key points:
+  - It drives the widget's own handles: `TableState::{horizontal,vertical}_scroll_handle`
+    are pub; the horizontal one (`VirtualListScrollHandle`) derefs to gpui's `ScrollHandle`,
+    the vertical (`UniformListScrollHandle`) keeps it at `.0.borrow().base_handle`. Offsets
+    are shared `Rc`s (mutating them + notifying the TableState entity is enough to repaint),
+    run from `-max_offset` (scrolled to the end) to `0`, and **`set_offset` does NOT clamp** —
+    `clamp_offset` does it, or the grid scrolls into empty space.
+  - The press handler sits on the div wrapping `Table` and `stop_propagation()`s; the cursor
+    tracking + exits are bound on the WORKSPACE ROOT and only while the mode runs. Root-level
+    is required (the pointer leaves the grid), and "only while running" is what keeps the root
+    from swallowing the very press that starts it.
+  - Verified live on WSL X11: synthetic `xdotool mousemove/click 2` DO reach the app (the
+    older "clicks are ignored" note applies to `key`/window-manager paths, not pointer input),
+    so screenshot + `compare -metric AE` between frames is a usable check for "is it still
+    scrolling". Effective tick rate is ~30Hz, not 60 (timer + render coalescing) — factor that
+    in when tuning `SPEED`.
 - **Row selection is the gpui-component Table widget's OWN state**, separate from
   our `current_row`. The blue full-row highlight comes from `TableState
   .selected_row` (set by the widget's internal click handler); `set_current_row`

@@ -4,7 +4,7 @@
 //! directly — no visibility bumps needed.
 
 use super::*;
-use gpui::{AnyElement, MouseButton, MouseDownEvent, WeakEntity};
+use gpui::{AnyElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, WeakEntity};
 use gpui_component::list::ListItem;
 use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_component::tree::{tree, TreeEntry};
@@ -440,6 +440,16 @@ impl Workspace {
                     .size_full()
                     .min_w(px(0.))
                     .overflow_hidden()
+                    // Wheel press = autoscroll (see `autoscroll.rs`). Stopping
+                    // propagation keeps the workspace root's "any click exits"
+                    // handler from undoing the press that just started it.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            this.toggle_autoscroll(tab_id, ev.position, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(Table::new(&tab.table).stripe(true).bordered(true)),
             )
         };
@@ -1209,6 +1219,7 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &TogglePalette, _, cx| this.toggle_palette(cx)))
                 .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
                     this.close_palette(cx);
+                    this.stop_autoscroll(cx);
                     if this.conn_manager_open {
                         this.conn_manager_open = false;
                         cx.notify();
@@ -1226,6 +1237,35 @@ impl Render for Workspace {
                 )
                 .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| this.toggle_settings(cx)))
                 .child(content);
+
+        // Middle-click autoscroll: the cursor tracking and the exits live on the
+        // root, not on the grid, so they keep working when the pointer wanders
+        // off the table (and off the window's panels entirely). They're only
+        // bound while the mode runs — otherwise the root would swallow the very
+        // press that starts it.
+        if let Some(anchor) = self.autoscroll_anchor() {
+            root = root
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                    this.autoscroll_move(ev.position, cx)
+                }))
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.autoscroll_release(cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.stop_autoscroll(cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.stop_autoscroll(cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.stop_autoscroll(cx)),
+                )
+                .child(autoscroll_marker(anchor, c));
+        }
 
         if self.conn_manager_open {
             root = root.child(self.render_conn_manager(cx));
@@ -1253,6 +1293,28 @@ fn section_header(label: impl Into<SharedString>, c: Colors) -> impl IntoElement
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .child(label.into())
+}
+
+/// The anchor puck drawn at the wheel-press point while autoscroll runs, so the
+/// origin the scroll speed is measured from is visible. Purely decorative — it
+/// carries no listeners, so it never takes a hitbox and can't eat the click that
+/// exits the mode. Positioned in window coordinates (the root div is the window).
+fn autoscroll_marker(anchor: gpui::Point<gpui::Pixels>, c: Colors) -> impl IntoElement {
+    const R: f32 = 11.;
+    div()
+        .absolute()
+        .left(anchor.x - px(R))
+        .top(anchor.y - px(R))
+        .w(px(R * 2.))
+        .h(px(R * 2.))
+        .rounded_full()
+        .border_1()
+        .border_color(c.border)
+        .bg(c.header)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(div().w(px(4.)).h(px(4.)).rounded_full().bg(c.fg_dim))
 }
 
 /// Centered placeholder shown when no tab is open.
