@@ -63,6 +63,13 @@ impl Workspace {
     /// applied WHERE); a Query/Scratch tab runs the single statement under the
     /// cursor (or the whole editor if there's one statement).
     pub(super) fn run_active_tab(&mut self, cx: &mut Context<Self>) {
+        // Ctrl/Cmd+Enter is also the multi-line cell editor's "save": while that
+        // strip is open it saves the value instead of re-running the query (which
+        // would reload the rows and drop the edit in progress).
+        if self.active_tab().is_some_and(|t| t.editing_multi) {
+            self.commit_cell_edit(cx);
+            return;
+        }
         let (id, is_table, full, cursor) = {
             let Some(tab) = self.active_tab() else { return };
             let ed = tab.editor.read(cx);

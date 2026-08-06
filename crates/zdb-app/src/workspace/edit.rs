@@ -43,18 +43,28 @@ impl Workspace {
                 _ => String::new(),
             };
             tab.editing = Some((row, col));
+            tab.editing_multi = text.contains('\n');
             tab.current_row = Some(row);
             text
         };
-        self.cell_input
-            .update(cx, |inp, cx| inp.set_value(text, window, cx));
-        let handle = self.cell_input.read(cx).focus_handle(cx);
+        // A multi-line value goes to the strip editor under the grid: the inline
+        // input is single-line, and gpui's text shaper PANICS on a newline
+        // ("text argument should not contain newlines"). Either way the editor
+        // gets the value in full — nothing is truncated for editing.
+        let input = if self.tab(tab_id).is_some_and(|t| t.editing_multi) {
+            self.cell_multi.clone()
+        } else {
+            self.cell_input.clone()
+        };
+        input.update(cx, |inp, cx| inp.set_value(text, window, cx));
+        let handle = input.read(cx).focus_handle(cx);
         handle.focus(window);
         cx.notify();
     }
 
     pub(super) fn cancel_cell_edit(&mut self, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_tab_mut() {
+            tab.editing_multi = false;
             if tab.editing.take().is_some() {
                 cx.notify();
             }
@@ -66,10 +76,18 @@ impl Workspace {
         let Some(tab_id) = self.active_id() else {
             return;
         };
-        let Some((row, col)) = self.tab_mut(tab_id).and_then(|t| t.editing.take()) else {
+        let multi = self.tab(tab_id).is_some_and(|t| t.editing_multi);
+        let Some((row, col)) = self.tab_mut(tab_id).and_then(|t| {
+            t.editing_multi = false;
+            t.editing.take()
+        }) else {
             return;
         };
-        let text = self.cell_input.read(cx).value().to_string();
+        let text = if multi {
+            self.cell_multi.read(cx).value().to_string()
+        } else {
+            self.cell_input.read(cx).value().to_string()
+        };
         let value = if text.is_empty() {
             CellValue::Null
         } else {

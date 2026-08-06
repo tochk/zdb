@@ -135,6 +135,8 @@ pub struct Workspace {
 
     /// Shared inline-cell editor (only the active tab edits a cell at a time).
     cell_input: Entity<InputState>,
+    /// Full-value editor for cells whose text spans multiple lines.
+    cell_multi: Entity<InputState>,
 
     /// Running `sqls` LSP handle (schema-aware completion), filled on connect.
     /// Shared with every SQL editor's completion provider.
@@ -211,6 +213,11 @@ impl Workspace {
     ) -> Self {
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder("Type a command…"));
         let cell_input = cx.new(|cx| InputState::new(window, cx));
+        // A value with newlines CANNOT go into the single-line `cell_input`: gpui's
+        // text system panics ("text argument should not contain newlines") when it
+        // shapes such a line. Multi-line values are edited in full in this second
+        // input, shown as a strip under the grid (`render_value_editor`).
+        let cell_multi = cx.new(|cx| InputState::new(window, cx).multi_line(true));
 
         // Commit inline edits on Enter *and* on focus loss — clicking away from a
         // cell stages the edit exactly like pressing Enter (Esc is the only way to
@@ -224,6 +231,16 @@ impl Workspace {
                 _ => {}
             },
         )
+        .detach();
+
+        // The multi-line editor keeps Enter for newlines, so it commits only on
+        // Ctrl/Cmd+Enter (or the Save button / moving to another cell). It must NOT
+        // commit on blur either: clicking its own Cancel button blurs it first.
+        cx.subscribe(&cell_multi, |this, _input, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { secondary: true } = event {
+                this.commit_cell_edit(cx);
+            }
+        })
         .detach();
 
         let form = ConnForm::new(window, cx);
@@ -251,6 +268,7 @@ impl Workspace {
             pending_open: None,
             window_title: "zdb".into(),
             cell_input,
+            cell_multi,
             lsp_slot: lsp::new_slot(),
             log: QueryLog::default(),
             palette_open: false,

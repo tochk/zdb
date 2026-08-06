@@ -123,7 +123,8 @@ impl Workspace {
         let strip = self.render_tab_strip(c, cx);
         let body = match self.active {
             Some(idx) if idx < self.tabs.len() => {
-                Self::render_tab_body(&self.tabs[idx], c, cx).into_any_element()
+                Self::render_tab_body(&self.tabs[idx], &self.cell_multi, c, cx)
+                    .into_any_element()
             }
             _ => welcome_pane(c).into_any_element(),
         };
@@ -261,7 +262,12 @@ impl Workspace {
     }
 
     /// The body of one tab: the action toolbar + (editor split | table grid).
-    fn render_tab_body(tab: &Tab, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_body(
+        tab: &Tab,
+        cell_multi: &Entity<InputState>,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let tab_id = tab.id;
         let editable = tab.edit_target.is_some();
         let is_editor = !matches!(tab.kind, TabKind::Table { .. });
@@ -477,6 +483,77 @@ impl Workspace {
             .bg(c.center)
             .child(toolbar)
             .child(body)
+            .children(Self::render_value_editor(tab, cell_multi, c, cx))
+    }
+
+    /// Full-value editor for a multi-line cell, docked under the grid.
+    ///
+    /// A cell is one row tall and the inline input is single-line (gpui's shaper
+    /// panics on a newline), so a value with line breaks is edited here — in full,
+    /// nothing truncated. Enter inserts a newline, so committing is Ctrl/Cmd+Enter
+    /// or Save; Esc discards like any other cell edit.
+    fn render_value_editor(
+        tab: &Tab,
+        cell_multi: &Entity<InputState>,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if !tab.editing_multi {
+            return None;
+        }
+        let (_, col) = tab.editing?;
+        let name = tab
+            .headers
+            .get(col)
+            .cloned()
+            .unwrap_or_else(|| format!("column {}", col + 1));
+        Some(
+            v_flex()
+                .h(px(160.))
+                .flex_none()
+                .border_t_1()
+                .border_color(c.border)
+                .bg(c.panel)
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .items_center()
+                        .bg(c.header)
+                        .child(
+                            div()
+                                .flex_grow()
+                                .text_xs()
+                                .text_color(c.fg_dim)
+                                .child(format!("{name} — multi-line value")),
+                        )
+                        .child(
+                            Button::new("value-cancel")
+                                .label("Cancel")
+                                .small()
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.cancel_cell_edit(cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("value-save")
+                                .label("Save")
+                                .primary()
+                                .small()
+                                .tooltip("Ctrl/Cmd+Enter")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.commit_cell_edit(cx)
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_grow()
+                        .p_1()
+                        .child(Input::new(cell_multi).h_full()),
+                ),
+        )
     }
 
     /// The EXPLAIN plan view: a header with a close button and a scrollable

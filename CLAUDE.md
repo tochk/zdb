@@ -301,6 +301,54 @@ The WSL host can run Windows exes directly:
     so screenshot + `compare -metric AE` between frames is a usable check for "is it still
     scrolling". Effective tick rate is ~30Hz, not 60 (timer + render coalescing) — factor that
     in when tuning `SPEED`.
+- **Row-number gutter + our own column resize** (`grid.rs`). Grid column 0 is a
+  row-number column, so **grid column `i+1` renders result column `i`** — everything the
+  `Workspace` stores (`sort_state`, `edit_cols`, `editing`, `edited_cells`) stays in
+  RESULT-column space and `render_th`/`render_td` are the only places that map. The gutter
+  is `Column::fixed_left()` (stays pinned while scrolling horizontally) and resizable like
+  any column. Column widths live in the delegate's `Column`s; `TableState::refresh(cx)`
+  rebuilds the widget's cached `col_groups` from them. `set()` carries widths over per
+  column NAME so a sort/refresh/edit-reload doesn't undo a drag.
+  - The widget's built-in resize handle is **2px** wide and effectively un-grabbable, and its
+    `MIN_WIDTH` is 10px, so `make_grid` sets `col_resizable(false)` and we render our own
+    `HANDLE_W`(9px) grab zone in `render_th`. Minimum width = the column's DEFAULT width
+    (180px data / 56px gutter) — a drag can only widen.
+  - `on_drag_move` fires for the whole window while a drag of that payload type is live
+    (gpui checks the type, NOT the bounds), and `DragMoveEvent::bounds` is the handle's own
+    box, so `new_width = old_width + (cursor.x - handle.right())` self-corrects each frame.
+    A `resize_grab` offset recorded on the first move stops the column jumping by wherever
+    inside the 9px zone the user grabbed.
+  - **The handle needs `right(-8px)`, not `right_0`**: the widget wraps our `render_th` in a
+    flex with `pr(cell_padding.right - column.paddings.right)` = 8px (room for its sort
+    icon), so our element's right edge is 8px SHORT of the column's real edge — a `right_0`
+    handle sits 8px left of the line the user aims at and the drag never starts. It still
+    lands inside the cell, so the cell's `overflow_hidden` doesn't clip the hitbox.
+  - `col_movable(false)` too: a column move reorders only the widget's `col_groups`, which
+    would desync the grid→result index mapping.
+  - Verifying with xdotool: `xdotool getwindowgeometry` reports the FRAME origin — the WM
+    adds ~(38,59) here. Use `xwininfo -id <win>`'s "Absolute upper-left X/Y" or every
+    synthetic click lands ~60px low (looks like "the handle doesn't work").
+- **Multi-line / huge cell values** (`grid.rs::display_text`, `view.rs::render_value_editor`).
+  Rows are a fixed 32px, so a value with newlines used to WRAP inside the row: a 3-line
+  value showed only its middle line and a 20-line one bled over its neighbours. `td_text`
+  is now `whitespace_nowrap` + `overflow_hidden` + `text_ellipsis`, and `display_text`
+  flattens the value (`\n`→`⏎`, tab→space) and caps it at `CELL_MAX_CHARS` (300).
+  **That cap is DISPLAY-only** — `begin_edit` reads the raw string from `tab.rows`, and
+  export/copy read the rows too, so nothing is ever truncated for editing or saving.
+  - **Editing a multi-line value in the inline input PANICS gpui**: `text_system.rs`
+    asserts "text argument should not contain newlines" when it shapes a single line.
+    So `Workspace` has a SECOND editor, `cell_multi` (`InputState::multi_line(true)`),
+    and `Tab.editing_multi` says which one holds the value. `begin_edit` picks by
+    `text.contains('\n')`, `commit_cell_edit` reads back from the same one.
+  - That editor renders as a 160px strip under the grid (`render_value_editor`), NOT in
+    the cell: the cell is one row tall and `render_cell` is `overflow_hidden`, so an
+    expanded in-cell editor would just be clipped. In the grid the cell only shows the
+    `c.active` highlight while its value is being edited below.
+  - Enter inserts a newline there, so commit is the Save button or **Ctrl/Cmd+Enter** —
+    and `run_active_tab` returns early (committing instead) when `editing_multi` is set,
+    because that chord is also `RunQuery` and re-running reloaded the rows mid-edit.
+    It must NOT commit on Blur either (clicking its own Cancel button blurs it first);
+    Esc discards like any other cell edit.
 - **Row selection is the gpui-component Table widget's OWN state**, separate from
   our `current_row`. The blue full-row highlight comes from `TableState
   .selected_row` (set by the widget's internal click handler); `set_current_row`
