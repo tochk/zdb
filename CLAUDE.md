@@ -452,8 +452,13 @@ The WSL host can run Windows exes directly:
     set it — clicking into the WHERE box would bounce focus back to the grid.
   - **`root_focus` fallback**: gpui dispatches keys along the focus path. With
     nothing focused (no tab open, last tab closed) no binding reached our handlers
-    and the keyboard was dead; `render` focuses the root div when `window.focused`
-    is `None`.
+    and the keyboard was dead; `render` focuses `root_focus` when `window.focused`
+    is `None`. That handle is tracked by a ZERO-SIZE child of the root, NOT the root
+    div: a `track_focus` element claims every mouse-down inside it (focus +
+    `prevent_default`), and gpui's Windows `handle_nc_mouse_down_msg` treats a
+    default-prevented press as handled — it returns before arming
+    `nc_button_pressed`, so min/max/close went dead (the window couldn't be
+    closed). Never put `track_focus` on anything that contains the title bar.
   - **Keep the header in step when scrolling horizontally.** The widget's
     `scroll_to_col` defers the scroll to the body's prepaint — a frame after the
     header was laid out — so the header kept showing the old columns. `set_cursor`
