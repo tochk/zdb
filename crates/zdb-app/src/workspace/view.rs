@@ -1408,7 +1408,6 @@ impl Render for Workspace {
                 // Window-wide default text color (the ambient `window.text_style()`
                 // is otherwise transparent).
                 .text_color(c.fg)
-                .track_focus(&self.root_focus)
                 .key_context("zdb")
                 .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_active_tab(cx)))
                 .on_action(cx.listener(|this, _: &CancelQuery, _, cx| this.cancel(cx)))
@@ -1443,7 +1442,16 @@ impl Render for Workspace {
                     cx.listener(|this, _: &ToggleConnections, _, cx| this.toggle_connections(cx)),
                 )
                 .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| this.toggle_settings(cx)));
-        let mut root = Self::nav_actions(root, cx).child(content);
+        let mut root = Self::nav_actions(root, cx)
+            // The fallback focus target is a ZERO-SIZE child, not the root itself.
+            // A focusable element claims every mouse-down inside it (focus +
+            // `prevent_default`), and the root contains the title bar: on Windows
+            // gpui then treats the press on min/max/close as handled and never
+            // arms the button, so the window couldn't be closed. With no area it
+            // is never under the pointer, yet keys still bubble from it to the
+            // root's handlers.
+            .child(div().absolute().size_0().track_focus(&self.root_focus))
+            .child(content);
 
         // Middle-click autoscroll: the cursor tracking and the exits live on the
         // root, not on the grid, so they keep working when the pointer wanders
