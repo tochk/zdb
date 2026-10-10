@@ -16,7 +16,7 @@ use gpui::{
 use gpui_component::TitleBar;
 use workspace::{
     ClosePalette, RunQuery, ToggleConnections, TogglePalette, ToggleScratch, ToggleSettings,
-    ToggleTerminal, TreeOpenSelected, Workspace,
+    ToggleTerminal, Workspace,
 };
 use zdb_db::{ConnectionConfig, DbHandle, SslMode};
 
@@ -82,10 +82,10 @@ fn main() {
             KeyBinding::new("cmd-shift-e", ToggleScratch, None),
             KeyBinding::new("ctrl-,", ToggleSettings, None),
             KeyBinding::new("cmd-,", ToggleSettings, None),
-            // Schema tree: Enter opens the selected relation (arrows come from
-            // gpui-component's own "Tree"-context bindings).
-            KeyBinding::new("enter", TreeOpenSelected, Some("Tree")),
         ]);
+        // Grid / tree / pane navigation. After `gpui_component::init` on purpose:
+        // these override some of the widgets' own bindings.
+        workspace::bind_nav_keys(cx);
 
         // Use a Zed-style custom title bar instead of the OS default. The
         // `appears_transparent` option (set by `TitleBar::title_bar_options`)

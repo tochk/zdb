@@ -26,28 +26,39 @@ impl Workspace {
         self.active_tab().map(|t| t.id)
     }
 
-    /// Make tab `idx` active: cancel any in-flight cell edit and focus its input.
+    /// Make tab `idx` active: stage any in-flight cell edit (leaving a cell any
+    /// way but Esc keeps the edit) and focus its input.
     pub(super) fn activate_tab(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
         if idx >= self.tabs.len() {
             return;
         }
-        self.cancel_cell_edit(cx);
+        // Before `active` moves: the edit belongs to the tab being left.
+        self.commit_cell_edit(cx);
         self.active = Some(idx);
         // Auto-reveal: a Table tab selects + scrolls to its node in the sidebar.
         if let TabKind::Table { schema, table } = &self.tabs[idx].kind {
             let (s, t) = (schema.clone(), table.clone());
             self.reveal_relation(&s, &t, cx);
         }
-        let focus = match self.tabs[idx].kind {
-            TabKind::Table { .. } => self.tabs[idx].where_input.clone(),
-            _ => self.tabs[idx].editor.clone(),
+        self.focus_editor(window, cx);
+        cx.notify();
+    }
+
+    /// Focus the active tab's text input: the SQL editor, or the WHERE filter on
+    /// a Table tab (whose generated editor is hidden).
+    pub(super) fn focus_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let focus = match tab.kind {
+            TabKind::Table { .. } => tab.where_input.clone(),
+            _ => tab.editor.clone(),
         };
         // Focusing a gpui-component input touches the window's `Root` layer, which
         // only exists under a real app (not in headless `#[gpui::test]` windows).
         if window.root::<gpui_component::Root>().flatten().is_some() {
             focus.read(cx).focus_handle(cx).focus(window);
         }
-        cx.notify();
     }
 
     /// Open a fresh blank "Query N" tab and focus it.
@@ -399,8 +410,9 @@ mod tests {
                 ws.open_table_tab("public".into(), "aaa".into(), window, cx);
                 let a = ws.active_id().unwrap();
                 let a_table = ws.tab(a).unwrap().table.clone();
+                seed_rows(ws, a, vec!["id"], 5, cx);
                 a_table.update(cx, |ts, cx| ts.set_selected_row(4, cx));
-                ws.set_current_row(a, 4, cx);
+                ws.set_cursor(a, 4, 0, cx);
                 assert_eq!(ws.tab(a).unwrap().current_row, Some(4));
 
                 // Open table B: a brand-new tab with its own (empty) selection.

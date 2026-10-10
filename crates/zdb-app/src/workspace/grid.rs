@@ -3,9 +3,10 @@
 //! and staged edits.
 
 use gpui::{
-    div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context, DragMoveEvent,
-    Entity, EntityId, InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
-    StatefulInteractiveElement, Styled, WeakEntity, Window,
+    div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context,
+    DragMoveEvent, Entity, EntityId, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
+    Window,
 };
 use gpui_component::{
     input::{Input, InputEvent, InputState},
@@ -25,6 +26,8 @@ use crate::lsp::{LspSlot, SqlCompletion};
 const EDITED_BG: u32 = 0x3b82f666;
 const EDITED_BAR: u32 = 0x2563ebff;
 const EDITED_HOVER: u32 = 0x2563eb99;
+/// Outline of the keyboard cell cursor (drawn only while the grid has focus).
+const CURSOR_RING: u32 = 0x2563ebff;
 
 /// Grid column 0 is a row-number gutter, so grid column `i+1` renders result
 /// column `i`. Everything the `Workspace` stores (sort state, `edit_cols`,
@@ -124,6 +127,16 @@ impl ResultDelegate {
             .collect();
         self.rows = rows;
         self.resize_grab = None;
+    }
+
+    /// Left edge (within the scrollable columns, i.e. past the pinned row-number
+    /// gutter) and width of RESULT column `col`.
+    pub(crate) fn col_span(&self, col: usize) -> Option<(Pixels, Pixels)> {
+        let width = self.columns.get(col + 1)?.width;
+        let left = self.columns[1..=col]
+            .iter()
+            .fold(px(0.), |sum, c| sum + c.width);
+        Some((left, width))
     }
 
     /// Applies a dragged width (clamped to the column's minimum). Returns
@@ -273,7 +286,7 @@ impl TableDelegate for ResultDelegate {
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let c = palette(cx);
@@ -295,7 +308,7 @@ impl TableDelegate for ResultDelegate {
                 .cursor_pointer()
                 .child((row_ix + 1).to_string())
                 .on_click(move |_: &ClickEvent, _window, app| {
-                    weak.update(app, |w, cx| w.set_current_row(tab_id, row_ix, cx))
+                    weak.update(app, |w, cx| w.set_cursor_row(tab_id, row_ix, cx))
                         .ok();
                 })
                 .into_any_element();
@@ -318,6 +331,10 @@ impl TableDelegate for ResultDelegate {
         let editable = tab.edit_cols.get(col_ix).is_some_and(|o| o.is_some());
         let edited = tab.edited_cells.contains(&(row_ix, col_ix));
         let cell_input = ws.cell_input.clone();
+        // The keyboard cursor: an outline, and only while the grid itself holds
+        // focus (the row highlight is what stays when focus moves elsewhere).
+        let cursor = (tab.cursor == Some((row_ix, col_ix)) && tab.grid_focus.is_focused(window))
+            .then(cursor_ring);
 
         if editing && tab.editing_multi {
             // A multi-line value is edited in the strip under the grid (see
@@ -383,21 +400,31 @@ impl TableDelegate for ResultDelegate {
                 .when(!edited, |d| d.hover(|s| s.bg(c.hover)))
                 .cursor_pointer()
                 .child(base)
+                .children(cursor)
                 .on_click(move |ev: &ClickEvent, window, app| {
                     let double = ev.click_count() >= 2;
                     weak.update(app, |w, cx| {
                         if double {
                             w.begin_edit(tab_id, row_ix, col_ix, window, cx);
                         } else {
-                            w.set_current_row(tab_id, row_ix, cx);
+                            w.set_cursor(tab_id, row_ix, col_ix, cx);
                         }
                     })
                     .ok();
                 })
                 .into_any_element()
         } else {
-            base.relative()
+            // Read-only cells still take the cursor (navigation and copy work on
+            // any result, not just editable ones).
+            let weak = self.ws.clone();
+            base.id(SharedString::from(format!("cell-{row_ix}-{col_ix}")))
+                .relative()
                 .child(sep_line(c))
+                .children(cursor)
+                .on_click(move |_: &ClickEvent, _window, app| {
+                    weak.update(app, |w, cx| w.set_cursor(tab_id, row_ix, col_ix, cx))
+                        .ok();
+                })
                 .into_any_element()
         }
     }
@@ -423,6 +450,18 @@ fn sep_line(c: Colors) -> gpui::Div {
         .bottom_0()
         .w(px(1.))
         .bg(c.grid)
+}
+
+/// The cell-cursor outline. An absolute overlay like the dirty gutter — a real
+/// border would take part in layout and nudge the text.
+fn cursor_ring() -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .border_1()
+        .border_color(rgba(CURSOR_RING))
 }
 
 fn td_text(cell: Option<CellValue>, c: Colors) -> gpui::Div {
@@ -498,6 +537,9 @@ pub(crate) struct Tab {
     /// the single source of truth for the generated `ORDER BY`.
     pub(crate) order_input: Entity<InputState>,
     pub(crate) table: Entity<TableState<ResultDelegate>>,
+    /// The grid's focus handle (a clone of the `TableState`'s). Kept here because
+    /// `render_td` runs while that entity is being rendered and can't read it.
+    pub(crate) grid_focus: FocusHandle,
 
     // Current result.
     pub(crate) headers: Vec<String>,
@@ -518,6 +560,13 @@ pub(crate) struct Tab {
     /// input panics gpui's text shaper on a newline).
     pub(crate) editing_multi: bool,
     pub(crate) current_row: Option<usize>,
+    /// Keyboard cell cursor, `(row, result column)`. `current_row` always equals
+    /// its row; go through `Workspace::set_cursor` to keep the two (and the
+    /// widget's row highlight) in step.
+    pub(crate) cursor: Option<(usize, usize)>,
+    /// Put the cursor on the first cell when the next result lands (the tab was
+    /// opened from the keyboard, before it had any rows to stand on).
+    pub(crate) cursor_on_load: bool,
     pub(crate) new_row_idx: Option<usize>,
     pub(crate) pending: Vec<RowEdit>,
     pub(crate) edited_cells: HashSet<(usize, usize)>,
@@ -537,6 +586,9 @@ pub(crate) fn make_grid(
     cx.new(|cx| {
         TableState::new(ResultDelegate::new(weak, id), window, cx)
             .row_selectable(true)
+            // We keep our own cell cursor; the widget's whole-column selection
+            // (its left/right keys, header clicks) would only fight it.
+            .col_selectable(false)
             // The widget's own resize handle is 2px wide and unhittable; we draw
             // a fat one in `render_th` and do the resize ourselves.
             .col_resizable(false)
@@ -576,7 +628,9 @@ impl Tab {
         where_input: Entity<InputState>,
         order_input: Entity<InputState>,
         table: Entity<TableState<ResultDelegate>>,
+        cx: &App,
     ) -> Self {
+        let grid_focus = table.read(cx).focus_handle(cx);
         Self {
             id,
             kind,
@@ -585,6 +639,7 @@ impl Tab {
             where_input,
             order_input,
             table,
+            grid_focus,
             headers: Vec::new(),
             rows: Vec::new(),
             orig_rows: Vec::new(),
@@ -596,6 +651,8 @@ impl Tab {
             editing: None,
             editing_multi: false,
             current_row: None,
+            cursor: None,
+            cursor_on_load: false,
             new_row_idx: None,
             pending: Vec::new(),
             edited_cells: HashSet::new(),
@@ -625,6 +682,7 @@ impl Tab {
             where_input,
             order_input,
             table,
+            cx,
         )
     }
 
@@ -663,6 +721,7 @@ impl Tab {
             where_input,
             order_input,
             table,
+            cx,
         )
     }
 
@@ -702,6 +761,7 @@ impl Tab {
             where_input,
             order_input,
             table,
+            cx,
         )
     }
 }

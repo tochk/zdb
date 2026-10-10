@@ -4,13 +4,56 @@
 use super::*;
 
 impl Workspace {
-    pub(super) fn set_current_row(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
-        // Clicking any other cell stages the edit in progress (same as Enter).
+    /// Put the cell cursor on `(row, col)` (result-column space, clamped to the
+    /// result). The one place the cursor moves: it keeps `current_row` and the
+    /// widget's row highlight on the cursor's row and scrolls the cell into view.
+    pub(super) fn set_cursor(
+        &mut self,
+        tab_id: u64,
+        row: usize,
+        col: usize,
+        cx: &mut Context<Self>,
+    ) {
+        // Moving to any other cell stages the edit in progress (same as Enter).
         self.commit_cell_edit(cx);
-        if let Some(tab) = self.tab_mut(tab_id) {
-            tab.current_row = Some(row);
-        }
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        let cursor = keynav::clamp_cursor(Some((row, col)), tab.rows.len(), tab.headers.len());
+        tab.cursor = cursor;
+        tab.current_row = cursor.map(|(r, _)| r);
+        let table = tab.table.clone();
+        table.update(cx, |ts, cx| match cursor {
+            Some((r, c)) => {
+                if ts.selected_row() != Some(r) {
+                    ts.set_selected_row(r, cx);
+                }
+                // Not the widget's `scroll_to_col`: that scroll is deferred to the
+                // body's prepaint, a frame after the header was laid out, which
+                // leaves the header showing the old columns until something
+                // else repaints. Setting the shared offset now moves both.
+                if let Some((left, width)) = ts.delegate().col_span(c) {
+                    let h = ts.horizontal_scroll_handle.clone();
+                    let off = h.offset();
+                    let x = keynav::reveal_offset(off.x, left, width, h.bounds().size.width);
+                    if x != off.x {
+                        h.set_offset(gpui::point(x, off.y));
+                    }
+                }
+            }
+            None => ts.clear_selection(cx),
+        });
         cx.notify();
+    }
+
+    /// Move the cursor to `row`, keeping its column (row-number gutter click,
+    /// row add).
+    pub(super) fn set_cursor_row(&mut self, tab_id: u64, row: usize, cx: &mut Context<Self>) {
+        let col = self
+            .tab(tab_id)
+            .and_then(|t| t.cursor)
+            .map_or(0, |(_, c)| c);
+        self.set_cursor(tab_id, row, col, cx);
     }
 
     // ---- inline editing --------------------------------------------------
@@ -23,6 +66,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.begin_edit_with(tab_id, row, col, None, window, cx);
+    }
+
+    /// Open the editor on a cell. `typed` replaces the cell's value as the
+    /// starting text (type-to-edit); `None` loads the current value.
+    pub(super) fn begin_edit_with(
+        &mut self,
+        tab_id: u64,
+        row: usize,
+        col: usize,
+        typed: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // `cell_input` is ONE shared entity, so moving from cell to cell never
         // changes the focus handle and no Blur fires — the previous cell has to be
         // committed here explicitly, before `editing` is repointed.
@@ -30,21 +87,24 @@ impl Workspace {
             return;
         }
         self.commit_cell_edit(cx);
+        if self
+            .tab(tab_id)
+            .is_none_or(|t| t.edit_cols.get(col).is_none_or(|o| o.is_none()) || row >= t.rows.len())
+        {
+            return;
+        }
+        self.set_cursor(tab_id, row, col, cx);
 
         let text = {
             let Some(tab) = self.tab_mut(tab_id) else {
                 return;
             };
-            if tab.edit_cols.get(col).map_or(true, |o| o.is_none()) {
-                return;
-            }
-            let text = match tab.rows.get(row).and_then(|r| r.get(col)) {
+            let text = typed.unwrap_or_else(|| match tab.rows.get(row).and_then(|r| r.get(col)) {
                 Some(CellValue::Text(s)) => s.clone(),
                 _ => String::new(),
-            };
+            });
             tab.editing = Some((row, col));
             tab.editing_multi = text.contains('\n');
-            tab.current_row = Some(row);
             text
         };
         // A multi-line value goes to the strip editor under the grid: the inline
@@ -191,12 +251,14 @@ impl Workspace {
             }
             let blank = vec![CellValue::Null; tab.headers.len()];
             tab.rows.push(blank);
-            let idx = tab.rows.len() - 1;
-            tab.new_row_idx = Some(idx);
-            tab.current_row = Some(idx);
+            tab.new_row_idx = Some(tab.rows.len() - 1);
         }
         self.status = "New row — double-click cells to fill, then Save row.".into();
         self.refresh_table(tab_id, cx);
+        // After the refresh, so the widget knows the row it is asked to select.
+        if let Some(idx) = self.tab(tab_id).and_then(|t| t.new_row_idx) {
+            self.set_cursor_row(tab_id, idx, cx);
+        }
         cx.notify();
     }
 
@@ -244,9 +306,13 @@ impl Workspace {
                 }
                 tab.new_row_idx = None;
                 tab.current_row = None;
+                tab.cursor = None;
             }
             self.status = "New row discarded".into();
             self.refresh_table(tab_id, cx);
+            if let Some(table) = self.tab(tab_id).map(|t| t.table.clone()) {
+                table.update(cx, |ts, cx| ts.clear_selection(cx));
+            }
             cx.notify();
             return;
         }
@@ -419,8 +485,11 @@ mod tests {
         window
             .update(cx, |ws, window, cx| {
                 let id = seed_query_tab(ws, window, cx);
-                ws.set_current_row(id, 3, cx);
-                assert_eq!(ws.tab(id).unwrap().current_row, Some(3));
+                seed_rows(ws, id, vec!["id", "name"], 5, cx);
+                ws.set_cursor(id, 3, 1, cx);
+                let tab = ws.tab(id).unwrap();
+                assert_eq!(tab.current_row, Some(3));
+                assert_eq!(tab.cursor, Some((3, 1)));
             })
             .unwrap();
     }
@@ -511,7 +580,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Moving to another cell (single click → `set_current_row`, double click →
+    /// Moving to another cell (single click → `set_cursor`, double click →
     /// `begin_edit`) stages the edit in progress, exactly like Enter. Cell-to-cell
     /// moves never blur (one shared `cell_input`), so this must happen explicitly.
     #[gpui::test]
@@ -538,7 +607,7 @@ mod tests {
                 ws.cell_input
                     .update(cx, |i, cx| i.set_value("y", window, cx));
                 // Single-click a third cell.
-                ws.set_current_row(id, 0, cx);
+                ws.set_cursor(id, 0, 0, cx);
                 assert_eq!(ws.tab(id).unwrap().pending.len(), 2);
                 assert!(ws.tab(id).unwrap().editing.is_none());
             })

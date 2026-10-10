@@ -35,6 +35,8 @@ crates/
                  query.rs   run/explain/sort/format, `QueryLog`, `drain_query`
                  edit.rs    inline-edit staging/apply, row add/delete
                  autoscroll.rs  middle-click (wheel-press) autoscroll of the grid
+                 keynav.rs  keyboard navigation: cell cursor, tree keys, pane
+                            focus, tab keys + `bind_nav_keys` (ALL nav bindings)
                  export.rs  CSV/JSON/INSERTs/TSV export
                  view.rs    all render_* + impl Render
                  grid.rs    Tab/TabKind + ResultDelegate
@@ -272,8 +274,10 @@ The WSL host can run Windows exes directly:
   HashSet<(row,col)>` tracks them, cleared whenever `pending` is. `orig_rows` snapshots
   the loaded values: editing a cell back to its original drops the staged `Update`
   (`remove_pending_update`, which also dedups re-edits of the same cell) and unmarks it.
-  **Commit rules**: Enter, blur, and moving to another cell all STAGE the edit; only
-  Esc discards. `cell_input` is ONE shared entity, so a cell→cell move never changes
+  **Commit rules**: Enter, Tab, blur, moving to another cell, and switching tabs
+  (`activate_tab` commits before `active` moves) all STAGE the edit; only Esc
+  discards — unless `Settings.esc_saves_edit` is on, then Esc stages too
+  (`keynav.rs::escape_cell_edit`). `cell_input` is ONE shared entity, so a cell→cell move never changes
   the focus handle and emits NO `InputEvent::Blur` — `begin_edit`/`set_current_row`
   therefore call `commit_cell_edit` themselves before repointing `editing`. Esc rides
   the global `escape`→`ClosePalette` action (gpui-component's `InputState::escape`
@@ -349,15 +353,16 @@ The WSL host can run Windows exes directly:
     because that chord is also `RunQuery` and re-running reloaded the rows mid-edit.
     It must NOT commit on Blur either (clicking its own Cancel button blurs it first);
     Esc discards like any other cell edit.
-- **Row selection is the gpui-component Table widget's OWN state**, separate from
-  our `current_row`. The blue full-row highlight comes from `TableState
-  .selected_row` (set by the widget's internal click handler); `set_current_row`
-  only tracks our copy (drives the `-`/delete button). So clearing `current_row`
-  is NOT enough — a stale highlight stays lit when switching tables (row 5 in
-  table A → row 5 lit in table B). FIX: `ts.clear_selection(cx)` + reset
-  `current_row` in the ONE place every result lands — the async query-result
-  handler in `run_sql` (right where `delegate_mut().set(...)` swaps the rows).
-  That covers table switch, re-sort, reload, and edit-reload in a single spot.
+- **Row selection follows the cell cursor.** The blue full-row highlight is the
+  Table widget's OWN state (`TableState.selected_row`); ours is `Tab.cursor`
+  (`(row, result col)`) with `Tab.current_row` always equal to its row (drives the
+  `-`/delete button). `edit.rs::set_cursor` is the ONE place the cursor moves: it
+  clamps, sets all three, and scrolls the cell into view. Don't write
+  `current_row`/`cursor` directly or call the widget's `set_selected_row` alone.
+  When a result lands (`run_sql`'s handler, the single point every result passes
+  through) the cursor is KEPT and clamped to the new rows — none on an empty
+  result — so refresh / re-sort / edit-reload keep your place. (It used to be
+  cleared there; per-tab + clamped is what stops a stale highlight now.)
 - The per-tab toolbar (`render_tab_body`): Run toggles to a red Stop while the tab is
   `running`; `+`/`-`/refresh are ALWAYS shown and disabled when N/A (`+` needs an
   editable result; `-` needs a selected row — its glyph is red only when enabled,
@@ -417,6 +422,64 @@ The WSL host can run Windows exes directly:
   - Opening a tab needs `&mut Window`; from windowless async contexts (the selftest) set
     `pending_open` and let `render()` consume it next frame.
 
+- **Keyboard navigation** (`workspace/keynav.rs`; bindings in `bind_nav_keys`, called
+  from `main.rs` AFTER `gpui_component::init`; every handler is on the workspace
+  root via `view.rs::nav_actions`). Grid: arrows / Tab / Home / End / Ctrl+Home/End /
+  PgUp/PgDn move the cell cursor, Enter / F2 / typing edits, Ctrl+C copies the cell.
+  Panes: Ctrl+1 tree, Ctrl+2 editor (WHERE on Table tabs), Ctrl+3 grid; Ctrl+Tab /
+  Ctrl+Shift+Tab / Ctrl+W tabs; Ctrl+S applies the staged batch. Settings has two
+  live checkboxes: "Esc saves cell edit" and "Vim navigation". Mechanics that cost
+  time:
+  - **Where a binding lives decides whether it fires.** gpui takes the DEEPEST
+    matching key context and, at one depth, the LAST-registered binding — and a
+    predicate is tested at every depth of the focus path, so `"Table && !Input"`
+    still matches at the Table's depth while an Input inside it has focus. Hence:
+    arrows + `escape` are bound in the widget's own `"Table"` context (ours win by
+    being registered later; its `escape` would clear the row highlight); every other
+    grid key is on `"Grid"`, a context the grid's wrapper div carries ONLY while no
+    cell is being edited (`"GridEdit"` while one is, `"Grid vim"` with vim on). A
+    bare-letter binding on `"Table"` would eat characters typed into the inline input.
+  - **Unhandled actions fall through to the next binding.** The single-line inline
+    input binds `tab`/`up`/`down` but doesn't handle them, so `tab` reaches
+    `"GridEdit"` (stage + move) and `down` in the filter box reaches `"TreeFilter"`
+    (focus tree). Same reason `grid_motion` is a no-op mid-edit: up/down fall out of
+    the input into the `"Table"` arrows and must not walk off the cell.
+  - **Type-to-edit** is an `on_key_down` on the grid wrapper (bindings run first, so
+    it only sees unclaimed keys); it reads `keystroke.key_char`. Off under vim.
+  - **Focus after an edit ends**: the inline input unmounts with the edit and focus
+    would fall off the grid. The paths without a `&mut Window` (the input's own
+    events) set `pending_grid_focus`, consumed in `render`. A Blur commit must NOT
+    set it — clicking into the WHERE box would bounce focus back to the grid.
+  - **`root_focus` fallback**: gpui dispatches keys along the focus path. With
+    nothing focused (no tab open, last tab closed) no binding reached our handlers
+    and the keyboard was dead; `render` focuses the root div when `window.focused`
+    is `None`.
+  - **Keep the header in step when scrolling horizontally.** The widget's
+    `scroll_to_col` defers the scroll to the body's prepaint — a frame after the
+    header was laid out — so the header kept showing the old columns. `set_cursor`
+    computes the offset itself (`reveal_offset` + `ResultDelegate::col_span`) and
+    sets the shared horizontal handle directly.
+  - **Tree focus**: `TreeState`'s focus handle is private, so the sidebar body div
+    has its own (`SchemaTree.focus`, context `"SchemaTree"`), and our handlers drive
+    the selection through `set_selected_index` + a pure `flatten` of the retained
+    items; expand/collapse edits `tree.expanded` and calls `sync_tree`. Arrows +
+    Enter are bound in BOTH `"SchemaTree"` and the widget's `"Tree"` (focused by a
+    click), where its own arrows would otherwise win.
+  - **Keyboard context menu** (Shift+F10): `ContextMenuExt` only opens on a right
+    click, so we build a `PopupMenu` ourselves (`open_tree_menu`), render it
+    `deferred(anchored())` from the root, and anchor it to the selected row's
+    bounds, captured by a `canvas` in `schema_tree_row`. `view.rs::node_menu` builds
+    the items for both menus.
+  - **Terminal**: the pane/tab/apply chords are shell keys there, so their handlers
+    `cx.propagate()` when the terminal has focus — an unhandled action lets the
+    keystroke through to the terminal's `on_key_down`.
+  - **Shortcut reference** (F1, keyboard button in the sidebar header, palette,
+    Settings → "Show"): `render_shortcuts` draws `keynav::SHORTCUTS`, a hand-kept
+    table — add a row there whenever a binding is added or changed.
+  - Verifying: synthetic `xdotool key` DOES reach the app on WSL X11 once the window
+    is activated + focused (`xdotool windowactivate/windowfocus`); the whole feature
+    was checked that way with `import -window` screenshots.
+
 - **Schema tree = the `gpui_component::tree` widget** (Zed-project-panel style: virtualized
   `uniform_list`, selection highlight, arrow-key nav, per-depth indent guides). Hierarchy:
   database root → schemas → relations → COLUMNS/INDEXES/CONSTRAINTS groups → leaves, plus
@@ -439,10 +502,10 @@ The WSL host can run Windows exes directly:
     `children.len()>0`, so without one the widget won't expand them).
   - **Two click targets kept**: the widget's row handler is `on_mouse_down` (not click) —
     the relation name area has its own `on_mouse_down` that `cx.stop_propagation()`s, selects
-    manually, and `open_table_tab`s. Enter opens via zdb action `TreeOpenSelected` bound to
-    `"enter"` in key context `"Tree"` (main.rs) — gpui-component binds only arrows there —
-    handled by `.on_action` on the sidebar wrapper div (bubbles out of the tree). Arrows work
-    once the tree is clicked (its `FocusHandle` is private, no programmatic focus — accepted).
+    manually, and `open_table_tab`s. Enter opens via zdb action `TreeOpenSelected` and
+    also hands focus to the new tab's grid (a mouse open doesn't). All tree keys, and
+    how the tree gets keyboard focus despite its private `FocusHandle`, are in the
+    keyboard-navigation notes above.
   - **Filter box** (`filter_input` under the sidebar header): non-empty `tree_filter` keeps
     only matching relations, force-expands db+schemas TRANSIENTLY (`sync_expansion` skips
     db/`sch␁` ids while filtering so `expanded_ids` stays clean), loads all unloaded schemas
