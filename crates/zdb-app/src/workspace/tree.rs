@@ -2,6 +2,10 @@
 //! `Workspace` methods that load schema data and sync it into the tree widget.
 
 use super::*;
+use gpui::{Bounds, FocusHandle, Pixels, Point};
+use gpui_component::menu::PopupMenu;
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// All sidebar schema-tree state: the loaded model, the widget's retained
 /// items/state, expansion, filter, and lazy-load bookkeeping.
@@ -26,6 +30,15 @@ pub(super) struct SchemaTree {
     /// Clear the filter input on the next render (needs `&mut Window`; set
     /// from window-less contexts like `switch_connection`).
     pub(super) pending_clear_filter: bool,
+    /// Keyboard focus for the tree. The widget's own handle is private, so
+    /// `ctrl-1` focuses this wrapper handle and our key handlers drive the
+    /// selection (see `keynav.rs`).
+    pub(super) focus: FocusHandle,
+    /// Where the selected row was last painted — the anchor for the keyboard-
+    /// opened context menu.
+    pub(super) sel_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// The keyboard-opened context menu and its position, while it is showing.
+    pub(super) menu: Option<(Entity<PopupMenu>, Point<Pixels>)>,
 }
 
 impl SchemaTree {
@@ -58,6 +71,9 @@ impl SchemaTree {
             pending_reveal: None,
             loads: HashSet::new(),
             pending_clear_filter: false,
+            focus: cx.focus_handle(),
+            sel_bounds: Rc::default(),
+            menu: None,
         }
     }
 
@@ -72,6 +88,7 @@ impl SchemaTree {
         self.loads.clear();
         self.filter.clear();
         self.pending_clear_filter = true;
+        self.menu = None;
         self.state
             .update(cx, |ts, cx| ts.set_items(Vec::<TreeItem>::new(), cx));
     }
@@ -102,7 +119,7 @@ pub(super) struct RelNode {
 /// Separator for tree-node ids: can't appear in SQL identifiers.
 const ID_SEP: &str = "\u{1}";
 /// Schema-node id prefix (`sch<SEP>name`), used to spot transient filter-expansion.
-const SCH_PREFIX: &str = "sch\u{1}";
+pub(super) const SCH_PREFIX: &str = "sch\u{1}";
 
 pub(super) fn node_id(parts: &[&str]) -> SharedString {
     parts.join(ID_SEP).into()
@@ -598,7 +615,8 @@ impl Workspace {
         self.sync_tree(cx);
     }
 
-    /// Enter on the tree: open the selected relation in a tab.
+    /// Enter on the tree: open the selected relation in a tab and hand the
+    /// keyboard to its grid (a mouse open leaves focus where it always was).
     pub(super) fn open_selected_tree_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self
             .tree
@@ -613,6 +631,18 @@ impl Workspace {
             return;
         };
         self.open_table_tab(schema, name, window, cx);
+        if let Some(tab) = self.active_tab_mut() {
+            // A brand-new tab has no rows yet; the cursor lands when they do.
+            tab.cursor_on_load = tab.cursor.is_none();
+        }
+        if self
+            .active_tab()
+            .is_some_and(|t| t.cursor.is_none() && !t.rows.is_empty())
+        {
+            let id = self.active_id().unwrap_or_default();
+            self.set_cursor(id, 0, 0, cx);
+        }
+        self.pending_grid_focus = true;
     }
 
     pub(super) fn load_relations(&mut self, schema: String, cx: &mut Context<Self>) {

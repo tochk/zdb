@@ -20,6 +20,10 @@ pub struct Settings {
     /// Last window geometry, restored on the next launch. `None` until the app
     /// has been closed once.
     pub window: Option<WindowState>,
+    /// Esc in a cell editor stages the edit (like Enter) instead of discarding it.
+    pub esc_saves_edit: bool,
+    /// Vim-style navigation keys (`hjkl`, `gg`/`G`, …) in the grid and schema tree.
+    pub vim_navigation: bool,
 }
 
 /// Saved window geometry (logical pixels, global coordinates). `maximized`
@@ -173,6 +177,8 @@ mod tests {
                 height: 800.,
                 maximized: true,
             }),
+            esc_saves_edit: true,
+            vim_navigation: true,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -181,6 +187,7 @@ mod tests {
         assert_eq!(back.theme, Theme::Light);
         assert_eq!(back.keymap[0].key, "ctrl-enter");
         assert_eq!(back.window.unwrap().width, 1200.);
+        assert!(back.esc_saves_edit && back.vim_navigation);
     }
 
     #[test]
@@ -188,6 +195,8 @@ mod tests {
         // Settings written before window persistence existed must still load.
         let s: Settings = serde_json::from_str(r#"{ "theme": "dark" }"#).unwrap();
         assert_eq!(s.window, None);
+        // …and so must ones written before the keyboard toggles: both default off.
+        assert!(!s.esc_saves_edit && !s.vim_navigation);
     }
 
     #[test]

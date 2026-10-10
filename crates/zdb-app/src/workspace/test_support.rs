@@ -30,3 +30,26 @@ pub(super) fn editable_tab(ws: &mut Workspace, tab_id: u64, headers: Vec<&str>) 
     });
     tab.edit_cols = headers.iter().map(|s| Some(s.to_string())).collect();
 }
+
+/// Give `tab_id` an `n`-row result over `headers` (cells `r{row}c{col}`), so
+/// there are cells for the cursor to stand on.
+pub(super) fn seed_rows(
+    ws: &mut Workspace,
+    tab_id: u64,
+    headers: Vec<&str>,
+    n: usize,
+    cx: &mut Context<Workspace>,
+) {
+    let rows: Vec<Vec<CellValue>> = (0..n)
+        .map(|r| {
+            (0..headers.len())
+                .map(|c| CellValue::Text(format!("r{r}c{c}")))
+                .collect()
+        })
+        .collect();
+    let tab = ws.tab_mut(tab_id).expect("tab");
+    tab.headers = headers.iter().map(|s| s.to_string()).collect();
+    tab.rows = rows.clone();
+    tab.orig_rows = rows;
+    ws.refresh_table(tab_id, cx);
+}

@@ -3,9 +3,10 @@
 //! and staged edits.
 
 use gpui::{
-    div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context, Entity,
-    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    Styled, WeakEntity, Window,
+    div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context,
+    DragMoveEvent, Entity, EntityId, FocusHandle, Focusable as _, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, WeakEntity,
+    Window,
 };
 use gpui_component::{
     input::{Input, InputEvent, InputState},
@@ -25,6 +26,48 @@ use crate::lsp::{LspSlot, SqlCompletion};
 const EDITED_BG: u32 = 0x3b82f666;
 const EDITED_BAR: u32 = 0x2563ebff;
 const EDITED_HOVER: u32 = 0x2563eb99;
+/// Outline of the keyboard cell cursor (drawn only while the grid has focus).
+const CURSOR_RING: u32 = 0x2563ebff;
+
+/// Grid column 0 is a row-number gutter, so grid column `i+1` renders result
+/// column `i`. Everything the `Workspace` stores (sort state, `edit_cols`,
+/// `editing`, `edited_cells`) is in RESULT-column space — this file is the only
+/// place that maps between the two.
+pub(crate) const ROWNUM_COL: usize = 0;
+
+/// Default (and minimum) column widths. A drag can widen a column but never
+/// shrink it below the width it starts at.
+const ROWNUM_W: Pixels = px(56.);
+const COL_W: Pixels = px(180.);
+/// Grab zone for our own resize handle. The widget's built-in one is 2px wide
+/// (`col_resizable(false)` in `make_grid` turns it off) — nobody can hit that.
+const HANDLE_W: Pixels = px(9.);
+/// The widget wraps our `render_th` in a flex that gets `pr(cell_padding.right -
+/// column padding.right)` — 8px, since our columns are `p_0()` — to leave room
+/// for its sort icon. So the box we render into ends 8px SHORT of the column's
+/// real right edge, and the handle has to be pushed back out by that much to sit
+/// on the boundary the user actually sees (it stays inside the cell, so the
+/// cell's `overflow_hidden` doesn't clip it away).
+const HEADER_PR: Pixels = px(8.);
+
+fn min_col_width(col_ix: usize) -> Pixels {
+    if col_ix == ROWNUM_COL {
+        ROWNUM_W
+    } else {
+        COL_W
+    }
+}
+
+/// Drag payload for a column resize: which table, which column.
+#[derive(Clone, Copy)]
+struct ResizeCol(EntityId, usize);
+
+impl Render for ResizeCol {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // The drag preview is invisible; the column width itself is the feedback.
+        div()
+    }
+}
 
 // ---- results table delegate ---------------------------------------------
 
@@ -36,6 +79,10 @@ pub(crate) struct ResultDelegate {
     ws: WeakEntity<Workspace>,
     /// The tab this grid belongs to; render reads that tab's editing state.
     tab_id: u64,
+    /// Where inside the resize handle the current drag was grabbed (column +
+    /// offset from the column's right edge), so the column doesn't jump by the
+    /// grab offset on the first mouse move.
+    resize_grab: Option<(usize, Pixels)>,
 }
 
 impl ResultDelegate {
@@ -45,29 +92,134 @@ impl ResultDelegate {
             rows: Vec::new(),
             ws,
             tab_id,
+            resize_grab: None,
         }
     }
 
     pub(crate) fn set(&mut self, headers: &[String], rows: Vec<Vec<CellValue>>) {
-        self.columns = headers
+        // `p_0()` zeroes the widget's own cell padding (`table_cell_padding`,
+        // 8px/4px) so OUR td element fills the whole cell box — otherwise the
+        // edit/edited highlight paints inside that padding and reads visibly
+        // smaller than the cell. We re-add the padding ourselves in `td_text`
+        // / `render_th` so the text lands in the same place as before.
+        // Re-running the same query (sort, refresh, reload after an edit) must not
+        // throw away the widths the user dragged, so carry them over per column
+        // name; a genuinely different result set just won't match.
+        let old: std::collections::HashMap<SharedString, Pixels> = self
+            .columns
             .iter()
-            .enumerate()
-            .map(|(i, h)| {
-                // `p_0()` zeroes the widget's own cell padding (`table_cell_padding`,
-                // 8px/4px) so OUR td element fills the whole cell box — otherwise the
-                // edit/edited highlight paints inside that padding and reads visibly
-                // smaller than the cell. We re-add the padding ourselves in `td_text`
-                // / `render_th` so the text lands in the same place as before.
-                Column::new(
-                    SharedString::from(format!("c{i}")),
-                    SharedString::from(h.clone()),
-                )
-                .width(px(180.))
-                .p_0()
-            })
+            .skip(1)
+            .map(|c| (c.name.clone(), c.width))
+            .collect();
+        let rownum_w = self.columns.first().map_or(ROWNUM_W, |c| c.width);
+        let rownum = Column::new(SharedString::from("rownum"), SharedString::from(""))
+            .width(rownum_w.max(ROWNUM_W))
+            .fixed_left()
+            .p_0();
+        self.columns = std::iter::once(rownum)
+            .chain(headers.iter().enumerate().map(|(i, h)| {
+                let name = SharedString::from(h.clone());
+                let w = old.get(&name).copied().unwrap_or(COL_W).max(COL_W);
+                Column::new(SharedString::from(format!("c{i}")), name)
+                    .width(w)
+                    .p_0()
+            }))
             .collect();
         self.rows = rows;
+        self.resize_grab = None;
     }
+
+    /// Left edge (within the scrollable columns, i.e. past the pinned row-number
+    /// gutter) and width of RESULT column `col`.
+    pub(crate) fn col_span(&self, col: usize) -> Option<(Pixels, Pixels)> {
+        let width = self.columns.get(col + 1)?.width;
+        let left = self.columns[1..=col]
+            .iter()
+            .fold(px(0.), |sum, c| sum + c.width);
+        Some((left, width))
+    }
+
+    /// Applies a dragged width (clamped to the column's minimum). Returns
+    /// whether anything changed — the caller only refreshes when it did.
+    fn set_col_width(&mut self, col_ix: usize, width: Pixels) -> bool {
+        let width = width.max(min_col_width(col_ix)).floor();
+        let Some(col) = self.columns.get_mut(col_ix) else {
+            return false;
+        };
+        if (col.width - width).abs() < px(1.) {
+            return false;
+        }
+        col.width = width;
+        true
+    }
+}
+
+/// A fat, draggable grab zone on the right edge of a header cell.
+///
+/// The widget's own handle is disabled (see `make_grid`) because it is 2px wide.
+/// This one is [`HANDLE_W`] and does the resize itself: `on_drag_move` fires for
+/// the whole window while a drag is live (gpui checks only the payload type, not
+/// the bounds), and `e.bounds` is this handle's own box — its right edge IS the
+/// column's right edge, so the new width follows the cursor with no drift.
+fn resize_handle(col_ix: usize, cx: &mut Context<TableState<ResultDelegate>>) -> impl IntoElement {
+    let entity_id = cx.entity_id();
+    div()
+        .id(SharedString::from(format!("colresize-{col_ix}")))
+        // Keeps the header's sort click (and the widget's column-move drag) from
+        // firing when the user is aiming at the handle.
+        .occlude()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .right(-HEADER_PR)
+        .w(HANDLE_W)
+        .cursor_col_resize()
+        .on_drag(ResizeCol(entity_id, col_ix), |drag, _, _, cx| {
+            cx.stop_propagation();
+            cx.new(|_| drag.clone())
+        })
+        .on_drag_move(cx.listener(
+            move |ts: &mut TableState<ResultDelegate>, e: &DragMoveEvent<ResizeCol>, _, cx| {
+                let ResizeCol(id, ix) = *e.drag(cx);
+                if id != cx.entity_id() || ix != col_ix {
+                    return;
+                }
+                let offset = e.event.position.x - e.bounds.right();
+                let grab = match ts.delegate().resize_grab {
+                    Some((c, grab)) if c == ix => grab,
+                    // First move of this drag: remember where inside the handle
+                    // the cursor grabbed, so the column doesn't jump.
+                    _ => {
+                        ts.delegate_mut().resize_grab = Some((ix, offset));
+                        offset
+                    }
+                };
+                let width = ts
+                    .delegate()
+                    .columns
+                    .get(ix)
+                    .map(|c| c.width)
+                    .unwrap_or(COL_W)
+                    + offset
+                    - grab;
+                if ts.delegate_mut().set_col_width(ix, width) {
+                    // Rebuilds the widget's cached `col_groups` from our columns.
+                    ts.refresh(cx);
+                }
+            },
+        ))
+        .on_mouse_up_out(
+            gpui::MouseButton::Left,
+            cx.listener(|ts: &mut TableState<ResultDelegate>, _, _, _| {
+                ts.delegate_mut().resize_grab = None;
+            }),
+        )
+        .on_mouse_up(
+            gpui::MouseButton::Left,
+            cx.listener(|ts: &mut TableState<ResultDelegate>, _, _, _| {
+                ts.delegate_mut().resize_grab = None;
+            }),
+        )
 }
 
 impl TableDelegate for ResultDelegate {
@@ -94,14 +246,15 @@ impl TableDelegate for ResultDelegate {
             .get(col_ix)
             .map(|c| c.name.to_string())
             .unwrap_or_default();
-        // Sort arrow for the currently-sorted column.
+        // Sort arrow for the currently-sorted column (in result-column space).
         let tab_id = self.tab_id;
+        let data_ix = col_ix.wrapping_sub(1);
         let arrow = self
             .ws
             .upgrade()
             .and_then(
                 |w| match w.read(cx).tab(tab_id).and_then(|t| t.sort_state) {
-                    Some((ci, desc)) if ci == col_ix => Some(if desc { " ▼" } else { " ▲" }),
+                    Some((ci, desc)) if ci == data_ix => Some(if desc { " ▼" } else { " ▲" }),
                     _ => None,
                 },
             )
@@ -116,26 +269,57 @@ impl TableDelegate for ResultDelegate {
             // `td_text`'s `px_2` → header and cell text share one left edge).
             .px_2()
             .relative()
-            .cursor_pointer()
             .children(col_sep(col_ix, palette(cx)))
             .child(format!("{name}{arrow}"))
-            .on_click(move |_: &ClickEvent, window, app| {
-                weak.update(app, |w, cx| w.toggle_sort(tab_id, col_ix, window, cx))
-                    .ok();
+            // The row-number gutter has no data to sort by.
+            .when(col_ix != ROWNUM_COL, |d| {
+                d.cursor_pointer()
+                    .on_click(move |_: &ClickEvent, window, app| {
+                        weak.update(app, |w, cx| w.toggle_sort(tab_id, data_ix, window, cx))
+                            .ok();
+                    })
             })
+            .child(resize_handle(col_ix, cx))
     }
 
     fn render_td(
         &mut self,
         row_ix: usize,
         col_ix: usize,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let c = palette(cx);
+        let tab_id = self.tab_id;
+
+        // Column 0 is the row-number gutter: not data, not editable, but clicking
+        // it selects the row like any other cell.
+        if col_ix == ROWNUM_COL {
+            let weak = self.ws.clone();
+            return div()
+                .id(SharedString::from(format!("rownum-{row_ix}")))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_end()
+                .px_2()
+                .text_sm()
+                .text_color(c.fg_dim)
+                .cursor_pointer()
+                .child((row_ix + 1).to_string())
+                .on_click(move |_: &ClickEvent, _window, app| {
+                    weak.update(app, |w, cx| w.set_cursor_row(tab_id, row_ix, cx))
+                        .ok();
+                })
+                .into_any_element();
+        }
+
+        // Grid column i+1 renders result column i. From here on `col_ix` is a
+        // RESULT column index (what the tab's edit/sort state is keyed by); every
+        // data cell sits right of the gutter, so all of them get a separator.
+        let col_ix = col_ix - 1;
         let cell = self.rows.get(row_ix).and_then(|r| r.get(col_ix)).cloned();
 
-        let tab_id = self.tab_id;
         let Some(ws_entity) = self.ws.upgrade() else {
             return td_text(cell, c).into_any_element();
         };
@@ -147,7 +331,22 @@ impl TableDelegate for ResultDelegate {
         let editable = tab.edit_cols.get(col_ix).is_some_and(|o| o.is_some());
         let edited = tab.edited_cells.contains(&(row_ix, col_ix));
         let cell_input = ws.cell_input.clone();
+        // The keyboard cursor: an outline, and only while the grid itself holds
+        // focus (the row highlight is what stays when focus moves elsewhere).
+        let cursor = (tab.cursor == Some((row_ix, col_ix)) && tab.grid_focus.is_focused(window))
+            .then(cursor_ring);
 
+        if editing && tab.editing_multi {
+            // A multi-line value is edited in the strip under the grid (see
+            // `render_value_editor`); the cell only marks itself as the target.
+            return div()
+                .size_full()
+                .relative()
+                .bg(c.active)
+                .child(sep_line(c))
+                .child(td_text(cell, c))
+                .into_any_element();
+        }
         if editing {
             // Seamless inline edit: `appearance(false)` drops the input's border /
             // background, and `.small()` sets its horizontal padding to 8px — the
@@ -163,7 +362,7 @@ impl TableDelegate for ResultDelegate {
                 .relative()
                 .bg(c.active)
                 .text_sm()
-                .children(col_sep(col_ix, c))
+                .child(sep_line(c))
                 .child(Input::new(&cell_input).appearance(false).small())
                 .into_any_element();
         }
@@ -177,7 +376,7 @@ impl TableDelegate for ResultDelegate {
                 .relative()
                 // Column separator goes in FIRST so the dirty gutter below paints
                 // over it (both sit on the left edge).
-                .children(col_sep(col_ix, c))
+                .child(sep_line(c))
                 // Staged-edit marker: blue fill + a solid blue left bar (the bar
                 // stays visible even over the row-selection tint, like a dirty
                 // gutter in DataGrip / Zed). Hover keeps the blue identity (a bit
@@ -201,21 +400,31 @@ impl TableDelegate for ResultDelegate {
                 .when(!edited, |d| d.hover(|s| s.bg(c.hover)))
                 .cursor_pointer()
                 .child(base)
+                .children(cursor)
                 .on_click(move |ev: &ClickEvent, window, app| {
                     let double = ev.click_count() >= 2;
                     weak.update(app, |w, cx| {
                         if double {
                             w.begin_edit(tab_id, row_ix, col_ix, window, cx);
                         } else {
-                            w.set_current_row(tab_id, row_ix, cx);
+                            w.set_cursor(tab_id, row_ix, col_ix, cx);
                         }
                     })
                     .ok();
                 })
                 .into_any_element()
         } else {
-            base.relative()
-                .children(col_sep(col_ix, c))
+            // Read-only cells still take the cursor (navigation and copy work on
+            // any result, not just editable ones).
+            let weak = self.ws.clone();
+            base.id(SharedString::from(format!("cell-{row_ix}-{col_ix}")))
+                .relative()
+                .child(sep_line(c))
+                .children(cursor)
+                .on_click(move |_: &ClickEvent, _window, app| {
+                    weak.update(app, |w, cx| w.set_cursor(tab_id, row_ix, col_ix, cx))
+                        .ok();
+                })
                 .into_any_element()
         }
     }
@@ -230,27 +439,76 @@ impl TableDelegate for ResultDelegate {
 /// widget pads the header's inner flex on the right (`offset_pr`) so a
 /// right-edge rule would not line up between the two.
 fn col_sep(col_ix: usize, c: Colors) -> Option<gpui::Div> {
-    (col_ix > 0).then(|| {
-        div()
-            .absolute()
-            .left_0()
-            .top_0()
-            .bottom_0()
-            .w(px(1.))
-            .bg(c.grid)
-    })
+    (col_ix > 0).then(|| sep_line(c))
+}
+
+fn sep_line(c: Colors) -> gpui::Div {
+    div()
+        .absolute()
+        .left_0()
+        .top_0()
+        .bottom_0()
+        .w(px(1.))
+        .bg(c.grid)
+}
+
+/// The cell-cursor outline. An absolute overlay like the dirty gutter — a real
+/// border would take part in layout and nudge the text.
+fn cursor_ring() -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .border_1()
+        .border_color(rgba(CURSOR_RING))
 }
 
 fn td_text(cell: Option<CellValue>, c: Colors) -> gpui::Div {
     // Fills the cell (columns are `p_0()`) and carries the padding the widget used
     // to add, so highlights cover the full cell while the text stays put. Vertically
-    // centered, matching the inline edit input.
-    let base = div().size_full().flex().items_center().px_2().text_sm();
+    // centered, matching the inline edit input. `whitespace_nowrap` + clipping keep
+    // a multi-line value one row tall: without them the text WRAPS inside the fixed
+    // 32px row, so a 3-line value shows only its middle line and a tall one bleeds
+    // over its neighbours.
+    let base = div()
+        .size_full()
+        .flex()
+        .items_center()
+        .px_2()
+        .text_sm()
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .text_ellipsis();
     match cell {
-        Some(CellValue::Text(s)) => base.text_color(c.fg).child(s),
+        Some(CellValue::Text(s)) => base.text_color(c.fg).child(display_text(&s)),
         Some(CellValue::Null) => base.text_color(c.fg_null).child("NULL"),
         None => base.child(""),
     }
+}
+
+/// How many characters of a cell value the grid draws. Past this the text is far
+/// wider than any column, and shaping a whole document per cell is wasted work.
+const CELL_MAX_CHARS: usize = 300;
+
+/// Flattens a value for DISPLAY only — the inline editor loads the raw string
+/// from `tab.rows`, and export/copy use the raw rows too, so a newline survives
+/// a round trip through the grid. Line breaks become `⏎` (as in Zed / DataGrip)
+/// rather than vanishing, which would make two different values look identical.
+fn display_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(CELL_MAX_CHARS));
+    for ch in s.chars().take(CELL_MAX_CHARS) {
+        match ch {
+            '\n' => out.push('⏎'),
+            '\r' => {}
+            '\t' => out.push(' '),
+            c => out.push(c),
+        }
+    }
+    if s.chars().nth(CELL_MAX_CHARS).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 // ---- tabs ----------------------------------------------------------------
@@ -279,6 +537,9 @@ pub(crate) struct Tab {
     /// the single source of truth for the generated `ORDER BY`.
     pub(crate) order_input: Entity<InputState>,
     pub(crate) table: Entity<TableState<ResultDelegate>>,
+    /// The grid's focus handle (a clone of the `TableState`'s). Kept here because
+    /// `render_td` runs while that entity is being rendered and can't read it.
+    pub(crate) grid_focus: FocusHandle,
 
     // Current result.
     pub(crate) headers: Vec<String>,
@@ -294,7 +555,18 @@ pub(crate) struct Tab {
 
     // Inline editing.
     pub(crate) editing: Option<(usize, usize)>,
+    /// Whether the cell being edited holds a multi-line value, which is edited in
+    /// the `cell_multi` strip under the grid instead of inline (a single-line
+    /// input panics gpui's text shaper on a newline).
+    pub(crate) editing_multi: bool,
     pub(crate) current_row: Option<usize>,
+    /// Keyboard cell cursor, `(row, result column)`. `current_row` always equals
+    /// its row; go through `Workspace::set_cursor` to keep the two (and the
+    /// widget's row highlight) in step.
+    pub(crate) cursor: Option<(usize, usize)>,
+    /// Put the cursor on the first cell when the next result lands (the tab was
+    /// opened from the keyboard, before it had any rows to stand on).
+    pub(crate) cursor_on_load: bool,
     pub(crate) new_row_idx: Option<usize>,
     pub(crate) pending: Vec<RowEdit>,
     pub(crate) edited_cells: HashSet<(usize, usize)>,
@@ -311,7 +583,20 @@ pub(crate) fn make_grid(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) -> Entity<TableState<ResultDelegate>> {
-    cx.new(|cx| TableState::new(ResultDelegate::new(weak, id), window, cx).row_selectable(true))
+    cx.new(|cx| {
+        TableState::new(ResultDelegate::new(weak, id), window, cx)
+            .row_selectable(true)
+            // We keep our own cell cursor; the widget's whole-column selection
+            // (its left/right keys, header clicks) would only fight it.
+            .col_selectable(false)
+            // The widget's own resize handle is 2px wide and unhittable; we draw
+            // a fat one in `render_th` and do the resize ourselves.
+            .col_resizable(false)
+            // Column moves reorder the widget's `col_groups` only — our rows and
+            // the row-number gutter keep their order, so a move would desync the
+            // grid-column → result-column mapping.
+            .col_movable(false)
+    })
 }
 
 pub(crate) fn make_sql_editor(
@@ -343,7 +628,9 @@ impl Tab {
         where_input: Entity<InputState>,
         order_input: Entity<InputState>,
         table: Entity<TableState<ResultDelegate>>,
+        cx: &App,
     ) -> Self {
+        let grid_focus = table.read(cx).focus_handle(cx);
         Self {
             id,
             kind,
@@ -352,6 +639,7 @@ impl Tab {
             where_input,
             order_input,
             table,
+            grid_focus,
             headers: Vec::new(),
             rows: Vec::new(),
             orig_rows: Vec::new(),
@@ -361,7 +649,10 @@ impl Tab {
             edit_target: None,
             edit_cols: Vec::new(),
             editing: None,
+            editing_multi: false,
             current_row: None,
+            cursor: None,
+            cursor_on_load: false,
             new_row_idx: None,
             pending: Vec::new(),
             edited_cells: HashSet::new(),
@@ -391,6 +682,7 @@ impl Tab {
             where_input,
             order_input,
             table,
+            cx,
         )
     }
 
@@ -429,6 +721,7 @@ impl Tab {
             where_input,
             order_input,
             table,
+            cx,
         )
     }
 
@@ -468,6 +761,62 @@ impl Tab {
             where_input,
             order_input,
             table,
+            cx,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::test_support::*;
+    use gpui::TestAppContext;
+
+    /// Display flattening is DISPLAY-only: newlines become `⏎`, tabs a space,
+    /// and only the drawn text is capped (the editor gets `tab.rows` in full).
+    #[test]
+    fn display_text_flattens_and_caps() {
+        assert_eq!(display_text("a\r\nb\tc"), "a⏎b c");
+        assert_eq!(display_text("plain"), "plain");
+        let long = "x".repeat(CELL_MAX_CHARS + 10);
+        let shown = display_text(&long);
+        assert_eq!(shown.chars().count(), CELL_MAX_CHARS + 1);
+        assert_eq!(shown.chars().last(), Some('…'));
+        // Exactly at the cap: nothing is added.
+        let exact = "y".repeat(CELL_MAX_CHARS);
+        assert_eq!(display_text(&exact), exact);
+    }
+
+    /// The grid has one more column than the result (the row-number gutter),
+    /// dragged widths survive a re-run of the same query, and a column never
+    /// shrinks below its default width.
+    #[gpui::test]
+    fn gutter_column_and_resize_rules(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                let table = ws.tab(id).unwrap().table.clone();
+                let headers = vec!["id".to_string(), "name".to_string()];
+                table.update(cx, |ts, _cx| {
+                    let d = ts.delegate_mut();
+                    d.set(&headers, vec![vec![CellValue::Null, CellValue::Null]]);
+                    assert_eq!(d.columns.len(), headers.len() + 1);
+                    assert_eq!(d.columns[ROWNUM_COL].width, ROWNUM_W);
+                    assert_eq!(d.columns[1].name.as_ref(), "id");
+
+                    // Widen "name", then re-run the same query: the width sticks.
+                    assert!(d.set_col_width(2, px(300.)));
+                    d.set(&headers, vec![]);
+                    assert_eq!(d.columns[2].width, px(300.));
+
+                    // Below the default is clamped (and reported as no change).
+                    assert!(!d.set_col_width(1, px(20.)));
+                    assert_eq!(d.columns[1].width, COL_W);
+                    assert!(!d.set_col_width(ROWNUM_COL, px(1.)));
+                    assert_eq!(d.columns[ROWNUM_COL].width, ROWNUM_W);
+                });
+            })
+            .unwrap();
     }
 }

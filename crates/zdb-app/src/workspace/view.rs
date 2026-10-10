@@ -4,9 +4,13 @@
 //! directly — no visibility bumps needed.
 
 use super::*;
-use gpui::{AnyElement, MouseButton, MouseDownEvent, WeakEntity};
+use gpui::{
+    anchored, canvas, deferred, AnyElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, WeakEntity,
+};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::list::ListItem;
-use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::tree::{tree, TreeEntry};
 use gpui_component::ActiveTheme;
 
@@ -36,6 +40,12 @@ impl Workspace {
                     .icon(Icon::empty().path("icons/settings.svg"))
                     .tooltip("Settings")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_settings(cx))),
+            )
+            .child(
+                Button::new("shortcuts")
+                    .icon(Icon::empty().path("icons/keyboard.svg"))
+                    .tooltip("Keyboard shortcuts (F1)")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_shortcuts(cx))),
             );
         if connected {
             actions = actions.child(
@@ -76,7 +86,9 @@ impl Workspace {
                 .border_color(c.border)
                 .child(tree_icon("icons/search.svg", c.fg_dim))
                 .child(
-                    div().flex_1().child(
+                    // `down` steps from the filter box into the tree (the single-
+                    // line input declines the key, so it reaches this context).
+                    div().flex_1().key_context("TreeFilter").child(
                         Input::new(&self.tree.filter_input)
                             .appearance(false)
                             .small(),
@@ -89,9 +101,15 @@ impl Workspace {
             div()
                 .flex_grow()
                 .min_h(px(0.))
-                .on_action(cx.listener(|this, _: &TreeOpenSelected, window, cx| {
-                    this.open_selected_tree_node(window, cx)
-                }))
+                // Our own focus target + key context around the widget: its focus
+                // handle is private, so the keyboard reaches the tree through
+                // this one (the handlers are on the workspace root).
+                .track_focus(&self.tree.focus)
+                .key_context(if self.settings.vim_navigation {
+                    "SchemaTree vim"
+                } else {
+                    "SchemaTree"
+                })
                 .child(tree(
                     &self.tree.state,
                     move |ix, entry, selected, window, cx| {
@@ -123,7 +141,9 @@ impl Workspace {
         let strip = self.render_tab_strip(c, cx);
         let body = match self.active {
             Some(idx) if idx < self.tabs.len() => {
-                Self::render_tab_body(&self.tabs[idx], c, cx).into_any_element()
+                let vim = self.settings.vim_navigation;
+                Self::render_tab_body(&self.tabs[idx], &self.cell_multi, vim, c, cx)
+                    .into_any_element()
             }
             _ => welcome_pane(c).into_any_element(),
         };
@@ -261,9 +281,22 @@ impl Workspace {
     }
 
     /// The body of one tab: the action toolbar + (editor split | table grid).
-    fn render_tab_body(tab: &Tab, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab_body(
+        tab: &Tab,
+        cell_multi: &Entity<InputState>,
+        vim: bool,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let tab_id = tab.id;
         let editable = tab.edit_target.is_some();
+        // The grid's keys live on a context that exists only while no cell is
+        // being edited — see `keynav.rs` for why it can't be the widget's own.
+        let grid_context = match (tab.editing.is_some(), vim) {
+            (true, _) => "GridEdit",
+            (false, true) => "Grid vim",
+            (false, false) => "Grid",
+        };
         let is_editor = !matches!(tab.kind, TabKind::Table { .. });
         let has_result = !tab.headers.is_empty();
         let has_sql = match &tab.kind {
@@ -440,6 +473,21 @@ impl Workspace {
                     .size_full()
                     .min_w(px(0.))
                     .overflow_hidden()
+                    .key_context(grid_context)
+                    // Type-to-edit: keys no binding claimed.
+                    .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                        this.grid_key_down(tab_id, ev, window, cx)
+                    }))
+                    // Wheel press = autoscroll (see `autoscroll.rs`). Stopping
+                    // propagation keeps the workspace root's "any click exits"
+                    // handler from undoing the press that just started it.
+                    .on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            this.toggle_autoscroll(tab_id, ev.position, cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(Table::new(&tab.table).stripe(true).bordered(true)),
             )
         };
@@ -467,6 +515,77 @@ impl Workspace {
             .bg(c.center)
             .child(toolbar)
             .child(body)
+            .children(Self::render_value_editor(tab, cell_multi, c, cx))
+    }
+
+    /// Full-value editor for a multi-line cell, docked under the grid.
+    ///
+    /// A cell is one row tall and the inline input is single-line (gpui's shaper
+    /// panics on a newline), so a value with line breaks is edited here — in full,
+    /// nothing truncated. Enter inserts a newline, so committing is Ctrl/Cmd+Enter
+    /// or Save; Esc discards like any other cell edit.
+    fn render_value_editor(
+        tab: &Tab,
+        cell_multi: &Entity<InputState>,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if !tab.editing_multi {
+            return None;
+        }
+        let (_, col) = tab.editing?;
+        let name = tab
+            .headers
+            .get(col)
+            .cloned()
+            .unwrap_or_else(|| format!("column {}", col + 1));
+        Some(
+            v_flex()
+                .h(px(160.))
+                .flex_none()
+                .border_t_1()
+                .border_color(c.border)
+                .bg(c.panel)
+                .child(
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .items_center()
+                        .bg(c.header)
+                        .child(
+                            div()
+                                .flex_grow()
+                                .text_xs()
+                                .text_color(c.fg_dim)
+                                .child(format!("{name} — multi-line value")),
+                        )
+                        .child(
+                            Button::new("value-cancel")
+                                .label("Cancel")
+                                .small()
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.cancel_cell_edit(cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("value-save")
+                                .label("Save")
+                                .primary()
+                                .small()
+                                .tooltip("Ctrl/Cmd+Enter")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.commit_cell_edit(cx)
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_grow()
+                        .p_1()
+                        .child(Input::new(cell_multi).h_full()),
+                ),
+        )
     }
 
     /// The EXPLAIN plan view: a header with a close button and a scrollable
@@ -797,34 +916,6 @@ impl Workspace {
                 .child(control)
         };
 
-        // Keybinding reference (display-only).
-        let keys: &[(&str, &str)] = &[
-            ("Run query", "Ctrl+Enter"),
-            ("Command palette", "Ctrl+Shift+P"),
-            ("Connections", "Ctrl+Shift+O"),
-            ("Scratch editor", "Ctrl+Shift+E"),
-            ("Terminal", "Ctrl+`"),
-            ("Cancel query", "Esc"),
-        ];
-        let mut keys_list = v_flex().px_3().py_1().gap(px(2.));
-        for (action, key) in keys.iter().copied() {
-            keys_list = keys_list.child(
-                h_flex()
-                    .py(px(2.))
-                    .justify_between()
-                    .child(div().text_sm().text_color(c.fg).child(action))
-                    .child(
-                        div()
-                            .px_1p5()
-                            .rounded_md()
-                            .bg(c.header)
-                            .text_xs()
-                            .text_color(c.fg_dim)
-                            .child(key),
-                    ),
-            );
-        }
-
         let path = zdb_config::Settings::path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(unavailable)".into());
@@ -840,8 +931,32 @@ impl Workspace {
                         .child(theme_btn("Dark", zdb_config::Theme::Dark))
                         .into_any_element(),
                 ))
-                .child(section_header("KEYBINDINGS", c))
-                .child(keys_list)
+                .child(setting_row(
+                    "Esc saves cell edit",
+                    Checkbox::new("esc-saves")
+                        .checked(self.settings.esc_saves_edit)
+                        .on_click(cx.listener(|this, on: &bool, _, cx| this.set_esc_saves(*on, cx)))
+                        .into_any_element(),
+                ))
+                .child(setting_row(
+                    "Vim navigation (hjkl, gg / G, 0 / $, i, y)",
+                    Checkbox::new("vim-nav")
+                        .checked(self.settings.vim_navigation)
+                        .on_click(
+                            cx.listener(|this, on: &bool, _, cx| this.set_vim_navigation(*on, cx)),
+                        )
+                        .into_any_element(),
+                ))
+                .child(setting_row(
+                    "Keyboard shortcuts",
+                    Button::new("show-shortcuts")
+                        .label("Show (F1)")
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.settings_open = false;
+                            this.toggle_shortcuts(cx)
+                        }))
+                        .into_any_element(),
+                ))
                 .child(section_header("CONFIG FILE", c))
                 .child(
                     div()
@@ -875,6 +990,95 @@ impl Workspace {
                     .border_color(c.border)
                     .rounded_md()
                     .child(body),
+            )
+    }
+
+    /// The keyboard-shortcut reference (F1): every section of
+    /// `keynav::SHORTCUTS`, flowed into two columns.
+    fn render_shortcuts(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = palette(cx);
+        let column = |sections: &'static [ShortcutSection]| {
+            let mut col = v_flex().flex_1().min_w(px(0.));
+            for (title, keys) in sections.iter().copied() {
+                let mut list = v_flex().px_3().py_1().gap(px(2.));
+                for (action, key) in keys.iter().copied() {
+                    list = list.child(
+                        h_flex()
+                            .py(px(2.))
+                            .gap_3()
+                            .justify_between()
+                            .child(div().text_sm().text_color(c.fg).child(action))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .px_1p5()
+                                    .rounded_md()
+                                    .bg(c.header)
+                                    .text_xs()
+                                    .text_color(c.fg_dim)
+                                    .child(key),
+                            ),
+                    );
+                }
+                col = col.child(section_header(title, c)).child(list);
+            }
+            col
+        };
+        // Split so the two columns come out about the same height.
+        let rows = |s: &[ShortcutSection]| s.iter().map(|(_, k)| k.len() + 1).sum::<usize>();
+        let split = (1..SHORTCUTS.len())
+            .min_by_key(|&i| rows(&SHORTCUTS[..i]).abs_diff(rows(&SHORTCUTS[i..])))
+            .unwrap_or(SHORTCUTS.len());
+        let viewport = window.viewport_size();
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_start()
+            .bg(rgba(0x000000aa))
+            .child(
+                v_flex()
+                    .mt(px(48.))
+                    .w(px(760.))
+                    .max_w(viewport.width - px(32.))
+                    .max_h(viewport.height - px(80.))
+                    .bg(c.panel)
+                    .border_1()
+                    .border_color(c.border)
+                    .rounded_md()
+                    .child(
+                        h_flex()
+                            .id("shortcuts-body")
+                            .flex_1()
+                            .min_h(px(0.))
+                            .items_start()
+                            .overflow_y_scroll()
+                            .child(column(&SHORTCUTS[..split]))
+                            .child(column(&SHORTCUTS[split..])),
+                    )
+                    .child(
+                        h_flex()
+                            .p_2()
+                            .justify_between()
+                            .items_center()
+                            .border_t_1()
+                            .border_color(c.border)
+                            .child(
+                                div()
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(c.fg_dim)
+                                    .child("Ctrl is Cmd on macOS"),
+                            )
+                            .child(Button::new("close-shortcuts").label("Close").on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.toggle_shortcuts(cx)
+                                }),
+                            )),
+                    ),
             )
     }
 
@@ -1136,6 +1340,10 @@ impl Render for Workspace {
                 .filter_input
                 .update(cx, |i, cx| i.set_value("", window, cx));
         }
+        self.flush_pending_focus(window);
+        if window.focused(cx).is_none() {
+            self.root_focus.focus(window);
+        }
         let center = self.render_center(cx).into_any_element();
         let mut top = h_resizable("zdb-top")
             .child(
@@ -1193,13 +1401,14 @@ impl Render for Workspace {
                     .child(main),
             );
 
-        let mut root =
+        let root =
             div()
                 .relative()
                 .size_full()
                 // Window-wide default text color (the ambient `window.text_style()`
                 // is otherwise transparent).
                 .text_color(c.fg)
+                .track_focus(&self.root_focus)
                 .key_context("zdb")
                 .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_active_tab(cx)))
                 .on_action(cx.listener(|this, _: &CancelQuery, _, cx| this.cancel(cx)))
@@ -1209,12 +1418,21 @@ impl Render for Workspace {
                 .on_action(cx.listener(|this, _: &TogglePalette, _, cx| this.toggle_palette(cx)))
                 .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
                     this.close_palette(cx);
+                    this.stop_autoscroll(cx);
+                    // Esc discards the inline cell edit (or stages it, per the
+                    // setting). Clearing `editing` first means the blur that
+                    // follows (the input unmounts) finds nothing to commit.
+                    this.escape_cell_edit(cx);
                     if this.conn_manager_open {
                         this.conn_manager_open = false;
                         cx.notify();
                     }
                     if this.settings_open {
                         this.settings_open = false;
+                        cx.notify();
+                    }
+                    if this.shortcuts_open {
+                        this.shortcuts_open = false;
                         cx.notify();
                     }
                 }))
@@ -1224,19 +1442,157 @@ impl Render for Workspace {
                 .on_action(
                     cx.listener(|this, _: &ToggleConnections, _, cx| this.toggle_connections(cx)),
                 )
-                .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| this.toggle_settings(cx)))
-                .child(content);
+                .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| this.toggle_settings(cx)));
+        let mut root = Self::nav_actions(root, cx).child(content);
 
+        // Middle-click autoscroll: the cursor tracking and the exits live on the
+        // root, not on the grid, so they keep working when the pointer wanders
+        // off the table (and off the window's panels entirely). They're only
+        // bound while the mode runs — otherwise the root would swallow the very
+        // press that starts it.
+        if let Some(anchor) = self.autoscroll_anchor() {
+            root = root
+                .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+                    this.autoscroll_move(ev.position, cx)
+                }))
+                .on_mouse_up(
+                    MouseButton::Middle,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.autoscroll_release(cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.stop_autoscroll(cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.stop_autoscroll(cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| this.stop_autoscroll(cx)),
+                )
+                .child(autoscroll_marker(anchor, c));
+        }
+
+        // The tree's keyboard-opened context menu, anchored under its row.
+        if let Some((menu, at)) = &self.tree.menu {
+            root = root.child(
+                deferred(
+                    anchored()
+                        .position(*at)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.clone()),
+                )
+                .with_priority(1),
+            );
+        }
         if self.conn_manager_open {
             root = root.child(self.render_conn_manager(cx));
         }
         if self.settings_open {
             root = root.child(self.render_settings(cx));
         }
+        if self.shortcuts_open {
+            root = root.child(self.render_shortcuts(window, cx));
+        }
         if self.palette_open {
             root = root.child(self.render_palette(cx));
         }
         root
+    }
+}
+
+impl Workspace {
+    /// Keyboard-navigation handlers, all on the workspace root: every action is
+    /// bound to a key context (see `keynav::bind_nav_keys`), so it only ever
+    /// arrives from the pane it belongs to.
+    fn nav_actions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
+        // Pane / tab chords are shell keys inside the terminal: hand them back
+        // (an unhandled action lets the keystroke through to its key handler).
+        macro_rules! unless_terminal {
+            ($action:ty, |$this:ident, $window:ident, $cx:ident| $body:expr) => {
+                cx.listener(|$this, _: &$action, $window, $cx| {
+                    if $this.terminal_focused($window, $cx) {
+                        $cx.propagate();
+                        return;
+                    }
+                    $body
+                })
+            };
+        }
+        macro_rules! grid {
+            ($action:ty, $motion:expr) => {
+                cx.listener(|this, _: &$action, _, cx| this.grid_motion($motion, cx))
+            };
+        }
+        macro_rules! tree {
+            ($action:ty, $motion:expr) => {
+                cx.listener(|this, _: &$action, _, cx| this.tree_move($motion, cx))
+            };
+        }
+        root.on_action(unless_terminal!(FocusTree, |this, window, cx| this.focus_tree(window, cx)))
+            .on_action(unless_terminal!(FocusEditor, |this, window, cx| this
+                .focus_editor(window, cx)))
+            .on_action(unless_terminal!(FocusGrid, |this, window, cx| this.focus_grid(window, cx)))
+            .on_action(unless_terminal!(CloseTab, |this, window, cx| this
+                .close_active_tab(window, cx)))
+            .on_action(unless_terminal!(ApplyEdits, |this, window, cx| this.apply_active(cx)))
+            .on_action(cx.listener(|this, _: &ToggleShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            .on_action(
+                cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(true, window, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &PrevTab, window, cx| this.cycle_tab(false, window, cx)),
+            )
+            .on_action(grid!(GridUp, Motion::Up))
+            .on_action(grid!(GridDown, Motion::Down))
+            .on_action(grid!(GridLeft, Motion::Left))
+            .on_action(grid!(GridRight, Motion::Right))
+            .on_action(grid!(GridRowStart, Motion::RowStart))
+            .on_action(grid!(GridRowEnd, Motion::RowEnd))
+            .on_action(grid!(GridFirst, Motion::First))
+            .on_action(grid!(GridLast, Motion::Last))
+            .on_action(grid!(GridTop, Motion::Top))
+            .on_action(grid!(GridBottom, Motion::Bottom))
+            .on_action(
+                cx.listener(|this, _: &GridPageUp, _, cx| this.grid_page_motion(false, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &GridPageDown, _, cx| this.grid_page_motion(true, false, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &GridHalfPageUp, _, cx| {
+                    this.grid_page_motion(false, true, cx)
+                }),
+            )
+            .on_action(cx.listener(|this, _: &GridHalfPageDown, _, cx| {
+                this.grid_page_motion(true, true, cx)
+            }))
+            .on_action(cx.listener(|this, _: &GridNextCell, _, cx| this.grid_tab(true, cx)))
+            .on_action(cx.listener(|this, _: &GridPrevCell, _, cx| this.grid_tab(false, cx)))
+            .on_action(cx.listener(|this, _: &GridEdit, window, cx| this.grid_edit(window, cx)))
+            .on_action(cx.listener(|this, _: &GridCopyCell, _, cx| this.grid_copy_cell(cx)))
+            .on_action(tree!(TreeUp, TreeMove::Up))
+            .on_action(tree!(TreeDown, TreeMove::Down))
+            .on_action(tree!(TreeFirst, TreeMove::First))
+            .on_action(tree!(TreeLast, TreeMove::Last))
+            .on_action(tree!(TreePageUp, TreeMove::PageUp))
+            .on_action(tree!(TreePageDown, TreeMove::PageDown))
+            .on_action(cx.listener(|this, _: &TreeLeft, _, cx| this.tree_expand(false, cx)))
+            .on_action(cx.listener(|this, _: &TreeRight, _, cx| this.tree_expand(true, cx)))
+            .on_action(cx.listener(|this, _: &TreeOpenSelected, window, cx| {
+                this.open_selected_tree_node(window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TreeEscape, window, cx| this.tree_escape(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &TreeMenu, window, cx| this.open_tree_menu(window, cx)),
+            )
+            .on_action(cx.listener(|this, _: &TreeFocusFilter, window, cx| {
+                this.focus_tree_filter(window, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &FilterToTree, window, cx| this.focus_tree(window, cx)),
+            )
     }
 }
 
@@ -1253,6 +1609,28 @@ fn section_header(label: impl Into<SharedString>, c: Colors) -> impl IntoElement
         .text_xs()
         .font_weight(FontWeight::SEMIBOLD)
         .child(label.into())
+}
+
+/// The anchor puck drawn at the wheel-press point while autoscroll runs, so the
+/// origin the scroll speed is measured from is visible. Purely decorative — it
+/// carries no listeners, so it never takes a hitbox and can't eat the click that
+/// exits the mode. Positioned in window coordinates (the root div is the window).
+fn autoscroll_marker(anchor: gpui::Point<gpui::Pixels>, c: Colors) -> impl IntoElement {
+    const R: f32 = 11.;
+    div()
+        .absolute()
+        .left(anchor.x - px(R))
+        .top(anchor.y - px(R))
+        .w(px(R * 2.))
+        .h(px(R * 2.))
+        .rounded_full()
+        .border_1()
+        .border_color(c.border)
+        .bg(c.header)
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(div().w(px(4.)).h(px(4.)).rounded_full().bg(c.fg_dim))
 }
 
 /// Centered placeholder shown when no tab is open.
@@ -1293,22 +1671,23 @@ fn chevron_icon(expanded: bool) -> &'static str {
 fn schema_tree_row(
     ix: usize,
     entry: &TreeEntry,
-    _selected: bool,
+    selected: bool,
     weak: &WeakEntity<Workspace>,
     _window: &mut Window,
     cx: &mut App,
 ) -> ListItem {
     let c = palette(cx);
     let item = entry.item();
-    let (meta, tree_state) = match weak.upgrade() {
+    let (meta, tree_state, sel_bounds) = match weak.upgrade() {
         Some(ws) => {
             let ws = ws.read(cx);
             (
                 ws.tree.meta.get(&item.id).cloned(),
                 Some(ws.tree.state.clone()),
+                Some(ws.tree.sel_bounds.clone()),
             )
         }
-        None => (None, None),
+        None => (None, None, None),
     };
 
     // Continuous vertical guides: one 12px column per ancestor depth (rows are
@@ -1403,62 +1782,30 @@ fn schema_tree_row(
         _ => row.child(item.label.clone()),
     };
 
-    let content = h_flex().h(px(24.)).items_center().child(guides).child(row);
+    let content = h_flex()
+        .h(px(24.))
+        .items_center()
+        .child(guides)
+        .child(row)
+        // Remember where the selected row is painted: the keyboard-opened
+        // context menu anchors to it.
+        .children(sel_bounds.filter(|_| selected).map(|cell| {
+            canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
+                .absolute()
+                .size_full()
+        }));
 
-    // Per-kind right-click menu.
-    let content: AnyElement = match &meta {
-        Some(NodeMeta::Rel { schema, name, .. }) => {
-            let (s, t, weak) = (schema.clone(), name.clone(), weak.clone());
+    // Per-kind right-click menu (the same items Shift+F10 shows).
+    let content: AnyElement = match meta.filter(has_node_menu) {
+        Some(meta) => {
+            let weak = weak.clone();
             div()
                 .w_full()
                 .child(content)
-                .context_menu(move |menu, _, _| {
-                    let (s1, t1, w1) = (s.clone(), t.clone(), weak.clone());
-                    let (s2, t2) = (s.clone(), t.clone());
-                    menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
-                        w1.update(cx, |this, cx| {
-                            this.open_table_tab(s1.clone(), t1.clone(), window, cx)
-                        })
-                        .ok();
-                    }))
-                    .item(PopupMenuItem::new("Copy name").on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(format!("{s2}.{t2}")));
-                    }))
-                })
+                .context_menu(move |menu, _, _| node_menu(menu, &meta, &weak))
                 .into_any_element()
         }
-        Some(NodeMeta::Schema { name }) => {
-            let (n, weak) = (name.clone(), weak.clone());
-            div()
-                .w_full()
-                .child(content)
-                .context_menu(move |menu, _, _| {
-                    let (n1, w1) = (n.clone(), weak.clone());
-                    let n2 = n.clone();
-                    menu.item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
-                        w1.update(cx, |this, cx| this.load_relations(n1.clone(), cx))
-                            .ok();
-                    }))
-                    .item(PopupMenuItem::new("Copy name").on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(n2.clone()));
-                    }))
-                })
-                .into_any_element()
-        }
-        Some(NodeMeta::Leaf { name, .. }) => {
-            let n = name.clone();
-            div()
-                .w_full()
-                .child(content)
-                .context_menu(move |menu, _, _| {
-                    let n1 = n.clone();
-                    menu.item(PopupMenuItem::new("Copy name").on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(n1.clone()));
-                    }))
-                })
-                .into_any_element()
-        }
-        _ => content.into_any_element(),
+        None => content.into_any_element(),
     };
 
     ListItem::new(ix)
@@ -1468,4 +1815,48 @@ fn schema_tree_row(
         .text_sm()
         .rounded_md()
         .child(content)
+}
+
+/// Whether a tree node has a context menu at all.
+pub(super) fn has_node_menu(meta: &NodeMeta) -> bool {
+    matches!(
+        meta,
+        NodeMeta::Rel { .. } | NodeMeta::Schema { .. } | NodeMeta::Leaf { .. }
+    )
+}
+
+/// The context-menu items for a tree node — shared by the right-click menu and
+/// the keyboard-opened one.
+pub(super) fn node_menu(
+    menu: PopupMenu,
+    meta: &NodeMeta,
+    weak: &WeakEntity<Workspace>,
+) -> PopupMenu {
+    let copy_name = |text: String| {
+        PopupMenuItem::new("Copy name").on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+        })
+    };
+    match meta {
+        NodeMeta::Rel { schema, name, .. } => {
+            let (s, t, weak) = (schema.clone(), name.clone(), weak.clone());
+            menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
+                weak.update(cx, |this, cx| {
+                    this.open_table_tab(s.clone(), t.clone(), window, cx)
+                })
+                .ok();
+            }))
+            .item(copy_name(format!("{schema}.{name}")))
+        }
+        NodeMeta::Schema { name } => {
+            let (n, weak) = (name.clone(), weak.clone());
+            menu.item(PopupMenuItem::new("Refresh").on_click(move |_, _, cx| {
+                weak.update(cx, |this, cx| this.load_relations(n.clone(), cx))
+                    .ok();
+            }))
+            .item(copy_name(name.clone()))
+        }
+        NodeMeta::Leaf { name, .. } => menu.item(copy_name(name.clone())),
+        _ => menu,
+    }
 }

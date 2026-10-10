@@ -63,6 +63,13 @@ impl Workspace {
     /// applied WHERE); a Query/Scratch tab runs the single statement under the
     /// cursor (or the whole editor if there's one statement).
     pub(super) fn run_active_tab(&mut self, cx: &mut Context<Self>) {
+        // Ctrl/Cmd+Enter is also the multi-line cell editor's "save": while that
+        // strip is open it saves the value instead of re-running the query (which
+        // would reload the rows and drop the edit in progress).
+        if self.active_tab().is_some_and(|t| t.editing_multi) {
+            self.commit_cell_edit(cx);
+            return;
+        }
         let (id, is_table, full, cursor) = {
             let Some(tab) = self.active_tab() else { return };
             let ed = tab.editor.read(cx);
@@ -177,7 +184,7 @@ impl Workspace {
     /// Start a new query for `tab_id`: remember it as the sort base, drop stale
     /// editability, then describe (for editability) and execute it.
     pub(super) fn run_new_query(&mut self, tab_id: u64, base: String, cx: &mut Context<Self>) {
-        let table = {
+        {
             let Some(tab) = self.tab_mut(tab_id) else {
                 return;
             };
@@ -186,15 +193,12 @@ impl Workspace {
             tab.edit_target = None;
             tab.edit_cols.clear();
             tab.editing = None;
-            tab.current_row = None;
             tab.pending.clear();
             tab.edited_cells.clear();
             tab.plan = None;
-            tab.table.clone()
-        };
-        // Drop the Table widget's own row highlight; otherwise the previously
-        // selected index stays lit when switching to a different table / reloading.
-        table.update(cx, |ts, cx| ts.clear_selection(cx));
+        }
+        // The cell cursor is deliberately left alone: `run_sql` clamps it to the
+        // rows that come back, so a refresh / re-sort keeps your place.
         self.describe_async(tab_id, base.clone(), cx);
         self.run_sql(tab_id, base, cx);
     }
@@ -274,24 +278,32 @@ impl Workspace {
                 None => {
                     let is_select = !headers.is_empty();
                     let n = rows.len();
-                    let table = {
+                    let (table, cursor) = {
                         let Some(tab) = this.tab_mut(tab_id) else {
                             return;
                         };
                         tab.headers = headers.clone();
                         tab.rows = rows.clone();
                         tab.orig_rows = rows.clone();
-                        // Fresh rows just landed: drop any prior selection so a
-                        // previously-selected index doesn't stay lit on the new
-                        // data (switching tables, re-sorting, reload). Single
-                        // point every result passes through.
-                        tab.current_row = None;
-                        tab.table.clone()
+                        // Fresh rows just landed: keep the cell cursor where it
+                        // was, clamped to the new result (none if it is empty).
+                        // Single point every result passes through, so the
+                        // cursor, `current_row` and the widget's row highlight
+                        // can't drift apart — or point past the data.
+                        let start = tab
+                            .cursor
+                            .or(std::mem::take(&mut tab.cursor_on_load).then_some((0, 0)));
+                        tab.cursor = keynav::clamp_cursor(start, n, headers.len());
+                        tab.current_row = tab.cursor.map(|(r, _)| r);
+                        (tab.table.clone(), tab.cursor)
                     };
                     table.update(cx, |ts, cx| {
-                        ts.clear_selection(cx);
                         ts.delegate_mut().set(&headers, rows);
                         ts.refresh(cx);
+                        match cursor {
+                            Some((r, _)) => ts.set_selected_row(r, cx),
+                            None => ts.clear_selection(cx),
+                        }
                     });
                     this.log.push(&logged, true);
                     if is_select {

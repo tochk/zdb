@@ -32,20 +32,25 @@ use zdb_db::{
     RelationDetail, RelationKind, RowEdit, SchemaObjects,
 };
 
+mod autoscroll;
 mod colors;
 mod conn;
 mod edit;
 mod export;
 mod grid;
+mod keynav;
 mod query;
 mod tabs;
 mod tree;
 mod util;
 mod view;
 
+use autoscroll::AutoScroll;
 use colors::{palette, Colors};
 use conn::ConnForm;
 use grid::{Tab, TabKind};
+pub use keynav::bind_nav_keys;
+use keynav::*;
 use query::QueryLog;
 use tree::{NodeMeta, SchemaTree};
 use util::{entry_to_config, oneline, order_by_sql, rel_icon, window_title};
@@ -78,6 +83,14 @@ enum PaletteCmd {
     Terminal,
     Connections,
     Settings,
+    Shortcuts,
+    FocusTree,
+    FocusEditor,
+    FocusGrid,
+    NextTab,
+    PrevTab,
+    CloseTab,
+    ApplyEdits,
     ExportCsv,
     ExportJson,
     ExportInserts,
@@ -98,7 +111,15 @@ const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
     ("Refresh schemas", PaletteCmd::Refresh),
     ("Manage connections", PaletteCmd::Connections),
     ("Open settings", PaletteCmd::Settings),
+    ("Keyboard shortcuts", PaletteCmd::Shortcuts),
     ("Toggle terminal", PaletteCmd::Terminal),
+    ("Focus schema tree", PaletteCmd::FocusTree),
+    ("Focus editor / filter", PaletteCmd::FocusEditor),
+    ("Focus result grid", PaletteCmd::FocusGrid),
+    ("Next tab", PaletteCmd::NextTab),
+    ("Previous tab", PaletteCmd::PrevTab),
+    ("Close tab", PaletteCmd::CloseTab),
+    ("Apply staged edits", PaletteCmd::ApplyEdits),
 ];
 
 /// Lightweight milestone logging to stderr, enabled by setting `ZDB_LOG`.
@@ -133,6 +154,8 @@ pub struct Workspace {
 
     /// Shared inline-cell editor (only the active tab edits a cell at a time).
     cell_input: Entity<InputState>,
+    /// Full-value editor for cells whose text spans multiple lines.
+    cell_multi: Entity<InputState>,
 
     /// Running `sqls` LSP handle (schema-aware completion), filled on connect.
     /// Shared with every SQL editor's completion provider.
@@ -155,12 +178,25 @@ pub struct Workspace {
     /// Whether the connection manager is showing the add form.
     conn_adding: bool,
     settings_open: bool,
+    /// Whether the keyboard-shortcut reference is showing.
+    shortcuts_open: bool,
     form: ConnForm,
 
     /// Latest window geometry seen in `render`, and whether a debounced write of
     /// it is already scheduled (resizing renders every frame — one write wins).
     pending_geom: Option<zdb_config::WindowState>,
     geom_flush: bool,
+
+    /// Middle-click autoscroll, while it is running (see `autoscroll.rs`).
+    autoscroll: Option<AutoScroll>,
+
+    /// Focus the active grid on the next render (see `flush_pending_focus`).
+    pending_grid_focus: bool,
+    /// Fallback focus for the workspace root, taken whenever nothing else holds
+    /// focus (no tab open, the focused input just unmounted). gpui dispatches
+    /// keys along the focus path, so with nothing focused no binding would
+    /// reach our handlers and the keyboard would be dead.
+    root_focus: gpui::FocusHandle,
 }
 
 /// The window's geometry as stored in settings. A maximized window reports its
@@ -206,16 +242,36 @@ impl Workspace {
     ) -> Self {
         let palette_input = cx.new(|cx| InputState::new(window, cx).placeholder("Type a command…"));
         let cell_input = cx.new(|cx| InputState::new(window, cx));
+        // A value with newlines CANNOT go into the single-line `cell_input`: gpui's
+        // text system panics ("text argument should not contain newlines") when it
+        // shapes such a line. Multi-line values are edited in full in this second
+        // input, shown as a strip under the grid (`render_value_editor`).
+        let cell_multi = cx.new(|cx| InputState::new(window, cx).multi_line(true));
 
-        // Commit/cancel inline edits on Enter / focus loss (acts on the active tab).
+        // Commit inline edits on Enter *and* on focus loss — clicking away from a
+        // cell stages the edit exactly like pressing Enter (Esc is the only way to
+        // discard, handled by the `ClosePalette`/escape action, which clears
+        // `editing` first so the resulting blur commits nothing). Enter also
+        // steps the cursor down a row and keeps the keyboard in the grid.
         cx.subscribe(
             &cell_input,
             |this, _input, event: &InputEvent, cx| match event {
-                InputEvent::PressEnter { .. } => this.commit_cell_edit(cx),
-                InputEvent::Blur => this.cancel_cell_edit(cx),
+                InputEvent::PressEnter { .. } => this.commit_and_advance(cx),
+                InputEvent::Blur => this.commit_cell_edit(cx),
                 _ => {}
             },
         )
+        .detach();
+
+        // The multi-line editor keeps Enter for newlines, so it commits only on
+        // Ctrl/Cmd+Enter (or the Save button / moving to another cell). It must NOT
+        // commit on blur either: clicking its own Cancel button blurs it first.
+        cx.subscribe(&cell_multi, |this, _input, event: &InputEvent, cx| {
+            if let InputEvent::PressEnter { secondary: true } = event {
+                this.pending_grid_focus |= this.active_tab().is_some_and(|t| t.editing.is_some());
+                this.commit_cell_edit(cx);
+            }
+        })
         .detach();
 
         let form = ConnForm::new(window, cx);
@@ -243,6 +299,7 @@ impl Workspace {
             pending_open: None,
             window_title: "zdb".into(),
             cell_input,
+            cell_multi,
             lsp_slot: lsp::new_slot(),
             log: QueryLog::default(),
             palette_open: false,
@@ -254,9 +311,13 @@ impl Workspace {
             conn_manager_open: false,
             conn_adding: false,
             settings_open: false,
+            shortcuts_open: false,
             form,
             pending_geom: None,
             geom_flush: false,
+            autoscroll: None,
+            pending_grid_focus: false,
+            root_focus: cx.focus_handle(),
         };
         if let Some(cfg) = auto {
             if let Some(pw) = &cfg.password {
@@ -370,6 +431,14 @@ impl Workspace {
             PaletteCmd::Terminal => self.toggle_terminal(window, cx),
             PaletteCmd::Connections => self.toggle_connections(cx),
             PaletteCmd::Settings => self.toggle_settings(cx),
+            PaletteCmd::Shortcuts => self.toggle_shortcuts(cx),
+            PaletteCmd::FocusTree => self.focus_tree(window, cx),
+            PaletteCmd::FocusEditor => self.focus_editor(window, cx),
+            PaletteCmd::FocusGrid => self.focus_grid(window, cx),
+            PaletteCmd::NextTab => self.cycle_tab(true, window, cx),
+            PaletteCmd::PrevTab => self.cycle_tab(false, window, cx),
+            PaletteCmd::CloseTab => self.close_active_tab(window, cx),
+            PaletteCmd::ApplyEdits => self.apply_active(cx),
         }
     }
 
