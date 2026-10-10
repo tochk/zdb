@@ -40,6 +40,7 @@ mod export;
 mod grid;
 mod keynav;
 mod query;
+mod session;
 mod tabs;
 mod tree;
 mod util;
@@ -148,6 +149,19 @@ pub struct Workspace {
     /// A table to open on the next render (set from windowless async contexts,
     /// e.g. the selftest, where no `&mut Window` is available).
     pending_open: Option<(String, String)>,
+
+    /// What the current connection's session files are keyed by: the saved
+    /// connection's id, or `session::ENV_CONN_KEY`. `None` = nothing persisted.
+    conn_key: Option<String>,
+    /// The connection's saved tabs have been restored, so the open tabs are now
+    /// its set and may be written back (see `session.rs`).
+    session_ready: bool,
+    /// Connected: restore the saved tabs on the next render (needs the window).
+    pending_restore: bool,
+    /// Whether a debounced session write is already scheduled.
+    session_flush: bool,
+    /// The tab set last read from / written to disk, to skip identical writes.
+    last_saved: Option<zdb_config::SavedTabs>,
     /// Last title pushed to the OS window (taskbar / alt-tab), so `render` only
     /// calls into the platform when it actually changes.
     window_title: String,
@@ -282,8 +296,10 @@ impl Workspace {
         // Fires on the OS close path (Windows close button / Alt+F4); the Linux
         // title-bar button calls `save_window_geometry` itself before removing
         // the window.
-        window.on_window_should_close(cx, |window, _cx| {
+        let weak = cx.weak_entity();
+        window.on_window_should_close(cx, move |window, cx| {
             save_window_geometry(window);
+            let _ = weak.update(cx, |this, cx| this.flush_session(cx));
             true
         });
 
@@ -297,6 +313,11 @@ impl Workspace {
             active: None,
             next_tab_id: 1,
             pending_open: None,
+            conn_key: auto.as_ref().map(|_| session::ENV_CONN_KEY.to_string()),
+            session_ready: false,
+            pending_restore: false,
+            session_flush: false,
+            last_saved: None,
             window_title: "zdb".into(),
             cell_input,
             cell_multi,
