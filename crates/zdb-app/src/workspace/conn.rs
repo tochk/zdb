@@ -42,6 +42,16 @@ impl ConnForm {
     }
 }
 
+/// The id for a connection being saved as `name`: the existing entry's when
+/// one has that name, else a fresh one.
+fn conn_id_for(connections: &[ConnectionEntry], name: &str) -> String {
+    connections
+        .iter()
+        .find(|c| c.name == name && !c.id.is_empty())
+        .map(|c| c.id.clone())
+        .unwrap_or_else(zdb_config::new_conn_id)
+}
+
 impl Workspace {
     // ---- connections -----------------------------------------------------
 
@@ -92,7 +102,21 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(super) fn switch_connection(&mut self, cfg: ConnectionConfig, cx: &mut Context<Self>) {
+    /// `key` is what the new connection's session files are keyed by (see
+    /// `Workspace::conn_key`).
+    pub(super) fn switch_connection(
+        &mut self,
+        cfg: ConnectionConfig,
+        key: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // Save the tabs of the connection being left, then stop saving until
+        // the new one's own set has been restored.
+        self.flush_session(cx);
+        self.session_ready = false;
+        self.pending_restore = false;
+        self.last_saved = None;
+        self.conn_key = key;
         if let Some(old) = self.conn.take() {
             self.db.disconnect(old);
         }
@@ -123,7 +147,8 @@ impl Workspace {
         // `start_connect` resolves the stored password off the UI thread.
         let pw = self.passwords.get(&entry.name).cloned();
         let cfg = entry_to_config(&entry, pw);
-        self.switch_connection(cfg, cx);
+        let key = (!entry.id.is_empty()).then(|| entry.id.clone());
+        self.switch_connection(cfg, key, cx);
     }
 
     pub(super) fn add_connection(&mut self, cx: &mut Context<Self>) {
@@ -148,7 +173,11 @@ impl Workspace {
             return;
         }
 
+        // Saving over an existing name edits that connection: it keeps its id,
+        // and with it its saved tabs and scratch.
+        let id = conn_id_for(&self.settings.connections, &name);
         let entry = ConnectionEntry {
+            id,
             name: name.clone(),
             host,
             port,
@@ -168,12 +197,13 @@ impl Workspace {
                 log(format!("password saved to keychain for '{name}'"));
             }
         }
-        self.switch_connection(entry_to_config(&entry, pw), cx);
+        self.switch_connection(entry_to_config(&entry, pw), Some(entry.id.clone()), cx);
     }
 
     pub(super) fn start_connect(&mut self, cfg: ConnectionConfig, cx: &mut Context<Self>) {
         self.status = format!("Connecting to {}…", cfg.name);
         let db = self.db.clone();
+        let key = self.conn_key.clone();
         // Resolve a stored password off the UI thread: a macOS Keychain read can
         // block (and pop a system prompt), which would freeze the render loop and
         // make the app appear to hang. `background_spawn` runs it on a worker
@@ -196,6 +226,8 @@ impl Workspace {
             Ok(conn) => {
                 log(format!("connected (conn={conn})"));
                 this.conn = Some(conn);
+                // Not if the user has moved on to another connection meanwhile.
+                this.pending_restore = !this.session_ready && this.conn_key == key;
                 this.status = "Connected. Loading schemas…".into();
                 this.start_lsp(&lsp_cfg);
                 this.load_schemas(cx);
@@ -240,6 +272,25 @@ mod tests {
     use crate::workspace::test_support::*;
     use gpui::TestAppContext;
 
+    #[test]
+    fn resaving_a_connection_keeps_its_id() {
+        let entry = |id: &str, name: &str| ConnectionEntry {
+            id: id.into(),
+            name: name.into(),
+            host: "h".into(),
+            port: 5432,
+            dbname: "d".into(),
+            user: "u".into(),
+            ssl_mode: "prefer".into(),
+        };
+        let conns = vec![entry("id-a", "a"), entry("", "old")];
+        assert_eq!(conn_id_for(&conns, "a"), "id-a");
+        // A new name, or an entry that never had an id, gets a fresh one.
+        let fresh = conn_id_for(&conns, "b");
+        assert!(!fresh.is_empty() && fresh != "id-a");
+        assert!(!conn_id_for(&conns, "old").is_empty());
+    }
+
     #[gpui::test]
     fn no_connection_opens_add_form(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
@@ -260,6 +311,7 @@ mod tests {
             .update(cx, |ws, _w, cx| {
                 for name in ["a", "b"] {
                     ws.settings.connections.push(ConnectionEntry {
+                        id: String::new(),
                         name: name.into(),
                         host: "127.0.0.1".into(),
                         port: 1, // nothing listens here: connect fails fast
@@ -314,6 +366,7 @@ mod tests {
         window
             .update(cx, |ws, _w, cx| {
                 ws.settings.connections.push(ConnectionEntry {
+                        id: String::new(),
                     name: NAME.into(),
                     host: "127.0.0.1".into(),
                     port: 1, // nothing listens: the connect itself fails fast
@@ -356,6 +409,7 @@ mod tests {
         window
             .update(cx, |ws, _w, cx| {
                 ws.settings.connections.push(ConnectionEntry {
+                        id: String::new(),
                     name: "x".into(),
                     host: "h".into(),
                     port: 5432,

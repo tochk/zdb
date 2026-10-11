@@ -8227,6 +8227,7 @@ dependencies = [
  "keyring",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

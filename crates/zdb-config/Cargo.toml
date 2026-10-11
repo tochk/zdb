@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 directories.workspace = true
 anyhow.workspace = true
+uuid = { version = "1", features = ["v4"] }
 
 # OS keychain for connection passwords — native backend per platform.
 [target.'cfg(windows)'.dependencies]

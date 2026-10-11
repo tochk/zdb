@@ -948,6 +948,15 @@ impl Workspace {
                         .into_any_element(),
                 ))
                 .child(setting_row(
+                    "Restore tabs per connection",
+                    Checkbox::new("restore-tabs")
+                        .checked(self.settings.restore_tabs)
+                        .on_click(
+                            cx.listener(|this, on: &bool, _, cx| this.set_restore_tabs(*on, cx)),
+                        )
+                        .into_any_element(),
+                ))
+                .child(setting_row(
                     "Keyboard shortcuts",
                     Button::new("show-shortcuts")
                         .label("Show (F1)")
@@ -1294,13 +1303,14 @@ impl Workspace {
         #[cfg(target_os = "windows")]
         let btn = btn.window_control_area(area);
         #[cfg(not(target_os = "windows"))]
-        let btn = btn.on_click(cx.listener(move |_, _: &ClickEvent, window, _| match id {
+        let btn = btn.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| match id {
             "win-min" => window.minimize_window(),
             "win-max" => window.zoom_window(),
             _ => {
-                // `remove_window` bypasses the OS close path, so the geometry
-                // hook in `Workspace::new` never runs — save it here.
+                // `remove_window` bypasses the OS close path, so the hook in
+                // `Workspace::new` never runs — save geometry and tabs here.
                 super::save_window_geometry(window);
+                this.flush_session(cx);
                 window.remove_window()
             }
         }));
@@ -1333,6 +1343,11 @@ impl Render for Workspace {
         if let Some((schema, table)) = self.pending_open.take() {
             self.open_table_tab(schema, table, window, cx);
         }
+        // Just connected: reopen this connection's saved tabs.
+        if std::mem::take(&mut self.pending_restore) {
+            self.restore_session(window, cx);
+        }
+        self.load_restored_tab(cx);
         // Filter cleared from a window-less context (connection switch).
         if self.tree.pending_clear_filter {
             self.tree.pending_clear_filter = false;

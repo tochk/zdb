@@ -41,6 +41,7 @@ impl Workspace {
             self.reveal_relation(&s, &t, cx);
         }
         self.focus_editor(window, cx);
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -65,12 +66,12 @@ impl Workspace {
     pub(super) fn open_query_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let n = self
-            .tabs
-            .iter()
-            .filter(|t| matches!(t.kind, TabKind::Query))
-            .count() as u64
-            + 1;
+        let n = session::next_query_n(
+            self.tabs
+                .iter()
+                .filter(|t| matches!(t.kind, TabKind::Query))
+                .map(|t| t.title.as_str()),
+        );
         let tab = Tab::query(id, n, self.lsp_slot.clone(), window, cx);
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
@@ -111,7 +112,7 @@ impl Workspace {
         }
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let tab = Tab::scratch(id, self.lsp_slot.clone(), window, cx);
+        let tab = Tab::scratch(id, self.conn_key.clone(), self.lsp_slot.clone(), window, cx);
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
     }
@@ -131,6 +132,7 @@ impl Workspace {
             // Some other tab closed: keep the same active tab (index may have shifted).
             self.active = active_id.and_then(|aid| self.tabs.iter().position(|t| t.id == aid));
         }
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -141,6 +143,7 @@ impl Workspace {
         }
         self.tabs.retain(|t| t.id == id);
         self.active = Some(0);
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -157,6 +160,7 @@ impl Workspace {
         if self.active.is_none_or(|a| a > idx) {
             self.active = Some(idx);
         }
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -164,6 +168,7 @@ impl Workspace {
     pub(super) fn close_all_tabs(&mut self, cx: &mut Context<Self>) {
         self.tabs.clear();
         self.active = None;
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 

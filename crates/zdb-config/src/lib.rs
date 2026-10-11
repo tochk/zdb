@@ -9,8 +9,14 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod secret;
+mod tabs;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub use tabs::{
+    load_scratch_for, load_tabs, load_tabs_from, save_scratch_for, save_tabs, save_tabs_to,
+    scratch_path_for, tabs_path, SavedTab, SavedTabKind, SavedTabs, TABS_VERSION,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub connections: Vec<ConnectionEntry>,
@@ -24,6 +30,22 @@ pub struct Settings {
     pub esc_saves_edit: bool,
     /// Vim-style navigation keys (`hjkl`, `gg`/`G`, …) in the grid and schema tree.
     pub vim_navigation: bool,
+    /// Reopen each connection's tabs (see `tabs.rs`) when connecting to it.
+    pub restore_tabs: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            connections: Vec::new(),
+            theme: Theme::default(),
+            keymap: Vec::new(),
+            window: None,
+            esc_saves_edit: false,
+            vim_navigation: false,
+            restore_tabs: true,
+        }
+    }
 }
 
 /// Saved window geometry (logical pixels, global coordinates). `maximized`
@@ -40,6 +62,10 @@ pub struct WindowState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionEntry {
+    /// Stable identity (a UUID) that per-connection files are keyed by. Empty in
+    /// files written before it existed; `Settings::load` fills it in.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub host: String,
     #[serde(default = "default_port")]
@@ -67,6 +93,11 @@ pub enum Theme {
     Dark,
 }
 
+/// A fresh connection id.
+pub fn new_conn_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 fn default_port() -> u16 {
     5432
 }
@@ -87,9 +118,30 @@ impl Settings {
     /// absent. Errors only on a present-but-invalid file.
     pub fn load() -> Result<Self> {
         match Self::path() {
-            Some(p) if p.exists() => Self::load_from(&p),
+            Some(p) if p.exists() => {
+                let mut settings = Self::load_from(&p)?;
+                // Connections saved before ids existed get one now, written
+                // back so the id (and the files keyed by it) stays stable.
+                if settings.ensure_conn_ids() {
+                    let _ = settings.save_to(&p);
+                }
+                Ok(settings)
+            }
             _ => Ok(Self::default()),
         }
+    }
+
+    /// Give every connection without an id a fresh one. Returns whether any
+    /// entry changed.
+    pub fn ensure_conn_ids(&mut self) -> bool {
+        let mut changed = false;
+        for conn in &mut self.connections {
+            if conn.id.is_empty() {
+                conn.id = new_conn_id();
+                changed = true;
+            }
+        }
+        changed
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
@@ -158,6 +210,7 @@ mod tests {
     fn round_trip() {
         let settings = Settings {
             connections: vec![ConnectionEntry {
+                id: "abc".into(),
                 name: "local".into(),
                 host: "127.0.0.1".into(),
                 port: 5433,
@@ -179,6 +232,7 @@ mod tests {
             }),
             esc_saves_edit: true,
             vim_navigation: true,
+            restore_tabs: false,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -188,6 +242,26 @@ mod tests {
         assert_eq!(back.keymap[0].key, "ctrl-enter");
         assert_eq!(back.window.unwrap().width, 1200.);
         assert!(back.esc_saves_edit && back.vim_navigation);
+        assert!(!back.restore_tabs);
+        assert_eq!(back.connections[0].id, "abc");
+    }
+
+    #[test]
+    fn conn_ids_are_backfilled_once() {
+        // A file from before connection ids: the entry loads with an empty one.
+        let json = r#"{ "connections": [
+            { "name": "x", "host": "h", "dbname": "d", "user": "u" },
+            { "id": "keep", "name": "y", "host": "h", "dbname": "d", "user": "u" }
+        ] }"#;
+        let mut s: Settings = serde_json::from_str(json).unwrap();
+        assert!(s.connections[0].id.is_empty());
+        assert!(s.ensure_conn_ids());
+        let id = s.connections[0].id.clone();
+        assert!(!id.is_empty());
+        assert_eq!(s.connections[1].id, "keep");
+        // Already filled: nothing changes, so nothing is rewritten.
+        assert!(!s.ensure_conn_ids());
+        assert_eq!(s.connections[0].id, id);
     }
 
     #[test]
@@ -197,6 +271,8 @@ mod tests {
         assert_eq!(s.window, None);
         // …and so must ones written before the keyboard toggles: both default off.
         assert!(!s.esc_saves_edit && !s.vim_navigation);
+        // Tab restore is on unless the file says otherwise.
+        assert!(s.restore_tabs);
     }
 
     #[test]

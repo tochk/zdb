@@ -33,6 +33,8 @@ crates/
                  tree.rs    schema sidebar: `SchemaTree` (all tree state, incl.
                             reset()), model types, pure build/sync fns, loaders
                  query.rs   run/explain/sort/format, `QueryLog`, `drain_query`
+                 session.rs per-connection saved tabs: snapshot/restore/debounced
+                            save + the `store` disk shim (in-memory under test)
                  edit.rs    inline-edit staging/apply, row add/delete
                  autoscroll.rs  middle-click (wheel-press) autoscroll of the grid
                  keynav.rs  keyboard navigation: cell cursor, tree keys, pane
@@ -421,6 +423,49 @@ The WSL host can run Windows exes directly:
     input there panics (`root.rs` "window first layer should be a Root").
   - Opening a tab needs `&mut Window`; from windowless async contexts (the selftest) set
     `pending_open` and let `render()` consume it next frame.
+
+- **Saved tabs per connection** (`workspace/session.rs`, `zdb-config/src/tabs.rs`).
+  Each connection's tab set — order, active index, and per tab: title + kind +
+  (Query: editor SQL) / (Table: schema, relation, WHERE, ORDER BY) — is written to
+  `<config>/zdb/tabs/<conn id>.json` (`"version": 1`, temp file + rename) and
+  reopened on the next connect to it, so it survives both a restart and an
+  A→B→A switch. Rows, cursor, widths and staged edits are NOT stored.
+  - **Identity is `ConnectionEntry.id`** (uuid), not the name. `Settings::load`
+    backfills entries from older files and writes them back once; the add form
+    re-saving an existing NAME keeps that entry's id (`conn::conn_id_for`). The
+    keychain is still keyed by name. The env (`ZDB_HOST`) connection has no entry
+    and uses the fixed key `session::ENV_CONN_KEY`. `Workspace.conn_key` holds
+    whichever applies; ids are checked to be a plain file stem before they are
+    joined into a path (settings.json is hand-editable).
+  - **`session_ready` is the clobber guard.** It turns true only in
+    `restore_session`, and `flush_session`/`mark_session_dirty` do nothing before
+    that — so a failed connect (tabs closed, nothing restored) can't overwrite the
+    saved set with an empty one. `switch_connection` flushes the old connection
+    FIRST, then clears the flag, then closes the tabs. Same reason the checkbox
+    turned on mid-session doesn't start saving: restore never ran for this connect.
+  - Restore needs `&mut Window`: a successful connect sets `pending_restore`,
+    `render` consumes it. It replaces any tabs opened while not connected (no merge)
+    and is skipped under `ZDB_SELFTEST`.
+  - **Restored tabs don't query on connect.** A Table tab is built with
+    `needs_load`; `render` → `load_restored_tab` runs it when it is the ACTIVE tab
+    (render, not `activate_tab`, because `close_tab` & co. move `active` directly).
+    A Query tab gets its text back and is never auto-run (it may be a `DELETE`).
+  - Saves: `mark_session_dirty` (tab open/close/activate + `InputEvent::Change` on
+    the Query editor / WHERE / ORDER BY) debounces one write 500ms out; explicit
+    flushes on connection switch and both window-close paths. `last_saved` skips
+    writes that would change nothing.
+  - **Scratch is per connection** (`<config>/zdb/scratch/<conn id>.sql`), always
+    saved regardless of the checkbox. The global `scratch.sql` remains the scratch
+    for the not-connected state and seeds a connection that has none yet.
+    `Tab::scratch` captures its key at creation — safe because every tab is closed
+    on a connection switch.
+  - "Query N" = highest N in use + 1 (`next_query_n`), not the tab count, so a
+    restored "Query 3" never gets a twin.
+  - Settings → "Restore tabs per connection" (`Settings.restore_tabs`, default ON —
+    hence the manual `Default` impl; struct-level `#[serde(default)]` takes missing
+    fields from it). Off = no restore, no save, files left alone.
+  - All disk I/O goes through `session::store`, which is a thread-local map under
+    `#[cfg(test)]` — tests must never touch the dev machine's config dir.
 
 - **Keyboard navigation** (`workspace/keynav.rs`; bindings in `bind_nav_keys`, called
   from `main.rs` AFTER `gpui_component::init`; every handler is on the workspace

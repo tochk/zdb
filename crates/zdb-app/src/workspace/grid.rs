@@ -18,6 +18,7 @@ use std::rc::Rc;
 use zdb_db::{CellValue, EditTarget, RowEdit};
 
 use super::colors::{palette, Colors};
+use super::session;
 use super::Workspace;
 use crate::lsp::{LspSlot, SqlCompletion};
 
@@ -572,6 +573,9 @@ pub(crate) struct Tab {
     pub(crate) edited_cells: HashSet<(usize, usize)>,
 
     pub(crate) running: bool,
+    /// A Table tab restored from a saved session that hasn't run its query yet
+    /// (it does the first time it is shown).
+    pub(crate) needs_load: bool,
 
     /// When set, an EXPLAIN plan to show in its own text view instead of the grid.
     pub(crate) plan: Option<String>,
@@ -657,6 +661,7 @@ impl Tab {
             pending: Vec::new(),
             edited_cells: HashSet::new(),
             running: false,
+            needs_load: false,
             plan: None,
         }
     }
@@ -671,6 +676,12 @@ impl Tab {
     ) -> Self {
         let weak = cx.weak_entity();
         let editor = make_sql_editor("SELECT * FROM ... ;  (press Run)", slot, id, window, cx);
+        cx.subscribe(&editor, |this, _i, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                this.mark_session_dirty(cx);
+            }
+        })
+        .detach();
         let where_input = cx.new(|cx| InputState::new(window, cx));
         let order_input = cx.new(|cx| InputState::new(window, cx));
         let table = make_grid(weak, id, window, cx);
@@ -687,8 +698,11 @@ impl Tab {
     }
 
     /// The singleton scratch tab: editor seeded from disk and auto-saved on edit.
+    /// `key` is the connection the text belongs to (`None` = the global scratch,
+    /// used while not connected).
     pub(crate) fn scratch(
         id: u64,
+        key: Option<String>,
         slot: LspSlot,
         window: &mut Window,
         cx: &mut Context<Workspace>,
@@ -699,14 +713,14 @@ impl Tab {
                 .code_editor("sql")
                 .line_number(true)
                 .placeholder("Scratch query — auto-saved")
-                .default_value(zdb_config::load_scratch());
+                .default_value(session::store::load_scratch(key.as_deref()));
             state.lsp.completion_provider = Some(Rc::new(SqlCompletion::new(slot, id)));
             state
         });
         // Persist scratch text to disk on every change.
-        cx.subscribe(&editor, |_this, emitter, event: &InputEvent, cx| {
+        cx.subscribe(&editor, move |_this, emitter, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
-                zdb_config::save_scratch(&emitter.read(cx).value());
+                session::store::save_scratch(key.as_deref(), &emitter.read(cx).value());
             }
         })
         .detach();
@@ -741,10 +755,10 @@ impl Tab {
         let order_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("ORDER BY … (Enter to apply)"));
         for input in [&where_input, &order_input] {
-            cx.subscribe(input, move |this, _i, event: &InputEvent, cx| {
-                if let InputEvent::PressEnter { .. } = event {
-                    this.apply_where(id, cx);
-                }
+            cx.subscribe(input, move |this, _i, event: &InputEvent, cx| match event {
+                InputEvent::PressEnter { .. } => this.apply_where(id, cx),
+                InputEvent::Change => this.mark_session_dirty(cx),
+                _ => {}
             })
             .detach();
         }

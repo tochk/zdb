@@ -512,6 +512,12 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(super) fn set_restore_tabs(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.restore_tabs = on;
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Tests run against the dev machine's real settings file — never write it.
     fn save_settings(&mut self) {
         #[cfg(not(test))]
