@@ -176,36 +176,33 @@ impl Workspace {
     /// The whole statement is rebuilt from the tab's own parts (filter + sort),
     /// so sorting never has to rewrite previously generated SQL.
     pub(super) fn table_query(&self, tab_id: u64, cx: &App) -> String {
-        let Some(tab) = self.tab(tab_id) else {
-            return String::new();
+        self.table_sql(tab_id, cx)
+            .map(|q| q.sql)
+            .unwrap_or_default()
+    }
+
+    fn table_sql(&self, tab_id: u64, cx: &App) -> Option<TableSql> {
+        let tab = self.tab(tab_id)?;
+        let TabKind::Table { schema, table } = &tab.kind else {
+            return None;
         };
-        let TabKind::Table {
-            schema: s,
-            table: t,
-        } = &tab.kind
-        else {
-            return String::new();
-        };
-        let w = tab.where_input.read(cx).value().trim().to_string();
-        let filter = if w.is_empty() {
-            String::new()
-        } else {
-            format!(" WHERE {w}")
-        };
-        let o = tab.order_input.read(cx).value().trim().to_string();
-        let order = if o.is_empty() {
-            String::new()
-        } else {
-            format!(" ORDER BY {o}")
-        };
-        format!(
-            "SELECT * FROM \"{}\".\"{}\"{}{} LIMIT {}",
-            s.replace('"', "\"\""),
-            t.replace('"', "\"\""),
-            filter,
-            order,
-            ROW_LIMIT
-        )
+        let w = tab.where_input.read(cx).value();
+        let o = tab.order_input.read(cx).value();
+        Some(TableSql::new(schema, table, w.trim(), o.trim()))
+    }
+
+    /// Which of a Table tab's boxes a failure of `sql` at 1-based character
+    /// `pos` points into. An error just past a box's text (`WHERE id >` fails
+    /// at the next keyword) belongs to that box too. `None` if the boxes no
+    /// longer produce `sql` (edited since) or the error is in the fixed part.
+    pub(super) fn clause_at(&self, tab_id: u64, sql: &str, pos: u32, cx: &App) -> Option<Clause> {
+        let q = self.table_sql(tab_id, cx).filter(|q| q.sql == sql)?;
+        let at = pos.checked_sub(1)? as usize;
+        match (q.where_at, q.order_at) {
+            (_, Some(o)) if at >= o => Some(Clause::OrderBy),
+            (Some(w), _) if at >= w => Some(Clause::Where),
+            _ => None,
+        }
     }
 
     /// Re-run a table tab from its WHERE / ORDER BY inputs. A hand-typed ORDER BY
@@ -222,6 +219,40 @@ impl Workspace {
         }
         let sql = self.table_query(tab_id, cx);
         self.run_new_query(tab_id, sql, cx);
+    }
+}
+
+/// A Table tab's generated `SELECT`, and where (in characters, as Postgres
+/// counts error positions) its WHERE / ORDER BY text starts.
+pub(super) struct TableSql {
+    pub(super) sql: String,
+    where_at: Option<usize>,
+    order_at: Option<usize>,
+}
+
+impl TableSql {
+    fn new(schema: &str, table: &str, filter: &str, order: &str) -> Self {
+        let mut sql = format!(
+            "SELECT * FROM \"{}\".\"{}\"",
+            schema.replace('"', "\"\""),
+            table.replace('"', "\"\"")
+        );
+        let mut clause = |keyword: &str, text: &str| {
+            (!text.is_empty()).then(|| {
+                sql.push_str(keyword);
+                let at = sql.chars().count();
+                sql.push_str(text);
+                at
+            })
+        };
+        let where_at = clause(" WHERE ", filter);
+        let order_at = clause(" ORDER BY ", order);
+        sql.push_str(&format!(" LIMIT {ROW_LIMIT}"));
+        Self {
+            sql,
+            where_at,
+            order_at,
+        }
     }
 }
 

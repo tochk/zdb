@@ -5,7 +5,7 @@
 
 use super::*;
 use gpui::{
-    anchored, canvas, deferred, AnyElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    anchored, canvas, deferred, relative, AnyElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, WeakEntity,
 };
 use gpui_component::checkbox::Checkbox;
@@ -29,6 +29,7 @@ impl Workspace {
             .items_center()
             .child(
                 Button::new("connections")
+                    .tab_stop(false)
                     .icon(IconName::Globe)
                     .tooltip("Connections")
                     .on_click(
@@ -37,12 +38,14 @@ impl Workspace {
             )
             .child(
                 Button::new("settings")
+                    .tab_stop(false)
                     .icon(Icon::empty().path("icons/settings.svg"))
                     .tooltip("Settings")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_settings(cx))),
             )
             .child(
                 Button::new("shortcuts")
+                    .tab_stop(false)
                     .icon(Icon::empty().path("icons/keyboard.svg"))
                     .tooltip("Keyboard shortcuts (F1)")
                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_shortcuts(cx))),
@@ -50,6 +53,7 @@ impl Workspace {
         if connected {
             actions = actions.child(
                 Button::new("refresh")
+                    .tab_stop(false)
                     .icon(Icon::empty().path("icons/refresh-cw.svg"))
                     .tooltip("Refresh schemas")
                     .on_click(
@@ -136,13 +140,13 @@ impl Workspace {
             .child(body)
     }
 
-    fn render_center(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_center(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
         let strip = self.render_tab_strip(c, cx);
         let body = match self.active {
             Some(idx) if idx < self.tabs.len() => {
                 let vim = self.settings.vim_navigation;
-                Self::render_tab_body(&self.tabs[idx], &self.cell_multi, vim, c, cx)
+                Self::render_tab_body(&self.tabs[idx], &self.cell_multi, vim, window, c, cx)
                     .into_any_element()
             }
             _ => welcome_pane(c).into_any_element(),
@@ -264,6 +268,7 @@ impl Workspace {
         strip
             .child(
                 Button::new("tab-add")
+                    .tab_stop(false)
                     .icon(IconName::Plus)
                     .tooltip("New query")
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -272,6 +277,7 @@ impl Workspace {
             )
             .child(
                 Button::new("tab-scratch")
+                    .tab_stop(false)
                     .icon(IconName::File)
                     .tooltip("Scratch (Ctrl/Cmd+Shift+E)")
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -285,6 +291,7 @@ impl Workspace {
         tab: &Tab,
         cell_multi: &Entity<InputState>,
         vim: bool,
+        window: &Window,
         c: Colors,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -307,6 +314,7 @@ impl Workspace {
         // Run toggles to Stop while a query is in flight.
         let run_btn = if tab.running {
             Button::new("run")
+                .tab_stop(false)
                 .icon(
                     Icon::empty()
                         .path("icons/circle-x.svg")
@@ -316,6 +324,7 @@ impl Workspace {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)))
         } else {
             Button::new("run")
+                .tab_stop(false)
                 .icon(
                     Icon::empty()
                         .path("icons/play.svg")
@@ -350,6 +359,7 @@ impl Workspace {
             .child(run_btn)
             .child(
                 Button::new("add-row")
+                    .tab_stop(false)
                     .icon(IconName::Plus)
                     .tooltip("Add row")
                     .disabled(!editable)
@@ -359,6 +369,7 @@ impl Workspace {
             )
             .child(
                 Button::new("del-row")
+                    .tab_stop(false)
                     .icon(Icon::empty().path("icons/minus.svg").text_color(del_color))
                     .tooltip(del_tip)
                     .disabled(!del_enabled)
@@ -368,6 +379,7 @@ impl Workspace {
             )
             .child(
                 Button::new("reload")
+                    .tab_stop(false)
                     .icon(Icon::empty().path("icons/refresh-cw.svg").text_color(c.fg))
                     .tooltip("Refresh data")
                     .disabled(tab.base_sql.is_none())
@@ -380,6 +392,7 @@ impl Workspace {
             // EXPLAIN the current statement (plan shown in the grid).
             .child(
                 Button::new("explain")
+                    .tab_stop(false)
                     .label("Explain")
                     .tooltip("EXPLAIN this query")
                     .disabled(!has_sql)
@@ -390,6 +403,7 @@ impl Workspace {
             // Export / copy the current result.
             .child(
                 Button::new("export-csv")
+                    .tab_stop(false)
                     .label("Export")
                     .tooltip("Export result to CSV (more formats in the palette)")
                     .disabled(!has_result)
@@ -399,6 +413,7 @@ impl Workspace {
             )
             .child(
                 Button::new("copy-tsv")
+                    .tab_stop(false)
                     .label("Copy")
                     .tooltip("Copy result to clipboard (TSV)")
                     .disabled(!has_result)
@@ -407,6 +422,7 @@ impl Workspace {
         if is_editor {
             toolbar = toolbar.child(
                 Button::new("format-sql")
+                    .tab_stop(false)
                     .label("Format")
                     .tooltip("Format SQL")
                     .disabled(!has_sql)
@@ -418,6 +434,7 @@ impl Workspace {
         if tab.new_row_idx.is_some() {
             toolbar = toolbar.child(
                 Button::new("save-row")
+                    .tab_stop(false)
                     .icon(IconName::Check)
                     .tooltip("Save row")
                     .primary()
@@ -435,33 +452,8 @@ impl Workspace {
         // table believes it fits, its internal horizontal scroll never engages, and
         // the off-window columns are simply clipped by the root `overflow_hidden`.
         let mut results = v_flex().size_full().min_w(px(0.)).overflow_hidden();
-        if let TabKind::Table { schema, table } = &tab.kind {
-            results = results.child(
-                h_flex()
-                    .px_2()
-                    .py_1()
-                    .gap_2()
-                    .items_center()
-                    .bg(c.header)
-                    .border_b_1()
-                    .border_color(c.border)
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(c.fg_dim)
-                            .child(format!("{schema}.{table}  WHERE")),
-                    )
-                    .child(div().flex_grow().child(Input::new(&tab.where_input)))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_xs()
-                            .text_color(c.fg_dim)
-                            .child("ORDER BY"),
-                    )
-                    .child(div().flex_grow().child(Input::new(&tab.order_input))),
-            );
+        if matches!(tab.kind, TabKind::Table { .. }) {
+            results = results.child(Self::render_filter_bar(tab, window, c, cx));
         }
         // The results area shows the grid, or — after EXPLAIN — the plan text in
         // that same place (query data vs. plan, same spot).
@@ -518,6 +510,105 @@ impl Workspace {
             .children(Self::render_value_editor(tab, cell_multi, c, cx))
     }
 
+    /// A Table tab's WHERE / ORDER BY strip, built like Zed's "Search threads…"
+    /// box: one full-width bar with no field chrome — a muted icon and the SQL
+    /// keyword, a borderless input that reads as the rest of the clause, and a
+    /// clear button once there's something to clear. The focused half lights up
+    /// in place of a focus border, and turns red when the last run failed on
+    /// its text (the error itself is in MESSAGES). Enter (or Run / refresh)
+    /// applies both.
+    fn render_filter_bar(
+        tab: &Tab,
+        window: &Window,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let tab_id = tab.id;
+        let field = |id: &'static str,
+                     icon: &'static str,
+                     keyword: &'static str,
+                     clause: Clause,
+                     input: &Entity<InputState>,
+                     cx: &mut Context<Self>| {
+            let state = input.read(cx);
+            let tint = if tab.clause_error == Some(clause) {
+                c.danger
+            } else if state.focus_handle(cx).is_focused(window) {
+                c.fg
+            } else {
+                c.fg_dim
+            };
+            let clear = (!state.value().is_empty()).then(|| {
+                let input = input.clone();
+                Button::new(id)
+                    .ghost()
+                    .xsmall()
+                    .tab_stop(false)
+                    .icon(Icon::empty().path("icons/close.svg").text_color(c.fg_dim))
+                    .tooltip("Clear")
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        input.update(cx, |i, cx| {
+                            i.set_value("", window, cx);
+                            i.focus(window, cx);
+                        });
+                        this.apply_where(tab_id, cx);
+                    }))
+            });
+            h_flex()
+                .h_full()
+                .min_w(px(0.))
+                .gap_1p5()
+                .items_center()
+                .child(tree_icon(icon, tint))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(tint)
+                        .child(keyword),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .child(Input::new(input).appearance(false).small()),
+                )
+                .children(clear)
+        };
+        let filter = field(
+            "clear-where",
+            "icons/list-filter.svg",
+            "WHERE",
+            Clause::Where,
+            &tab.where_input,
+            cx,
+        );
+        let order = field(
+            "clear-order",
+            "icons/arrow-up-down.svg",
+            "ORDER BY",
+            Clause::OrderBy,
+            &tab.order_input,
+            cx,
+        );
+        h_flex()
+            .h(px(32.))
+            .flex_none()
+            .pl_3()
+            .pr_2()
+            .gap_3()
+            .items_center()
+            .bg(c.center)
+            .border_b_1()
+            .border_color(c.border)
+            // The inputs hold SQL: set them (and their keywords) in the code font.
+            .font_family(cx.theme().mono_font_family.clone())
+            .child(filter.flex_1())
+            .child(div().flex_none().w(px(1.)).h(px(16.)).bg(c.border))
+            .child(order.flex_none().w(relative(0.36)))
+    }
+
     /// Full-value editor for a multi-line cell, docked under the grid.
     ///
     /// A cell is one row tall and the inline input is single-line (gpui's shaper
@@ -562,6 +653,7 @@ impl Workspace {
                         )
                         .child(
                             Button::new("value-cancel")
+                                .tab_stop(false)
                                 .label("Cancel")
                                 .small()
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -570,6 +662,7 @@ impl Workspace {
                         )
                         .child(
                             Button::new("value-save")
+                                .tab_stop(false)
                                 .label("Save")
                                 .primary()
                                 .small()
@@ -623,6 +716,7 @@ impl Workspace {
                     )
                     .child(
                         Button::new("close-plan")
+                            .tab_stop(false)
                             .icon(Icon::empty().path("icons/close.svg").text_color(c.fg))
                             .tooltip("Close plan")
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -682,66 +776,72 @@ impl Workspace {
             .active_tab()
             .filter(|t| !t.pending.is_empty())
             .map(|t| (t.id, t.pending.len()));
-        let right =
-            if let Some((tab_id, n)) = pending_tab {
-                let sql = self.pending_sql(tab_id).unwrap_or_default();
-                v_flex()
-                    .flex_grow()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(section_header(
-                        format!("PENDING — {n} CHANGE(S), REVIEW THEN APPLY"),
-                        c,
-                    ))
-                    .child(
-                        div()
-                            .id("pending-scroll")
-                            .flex_1()
-                            .min_h(px(0.))
-                            .overflow_y_scroll()
-                            .px_3()
-                            .py_2()
-                            .text_sm()
-                            .text_color(c.fg)
-                            .child(sql),
-                    )
-                    .child(
-                        h_flex()
-                            .px_2()
-                            .pb_2()
-                            .gap_2()
-                            .child(Button::new("apply").label("Apply").primary().on_click(
-                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+        let right = if let Some((tab_id, n)) = pending_tab {
+            let sql = self.pending_sql(tab_id).unwrap_or_default();
+            v_flex()
+                .flex_grow()
+                .h_full()
+                .overflow_hidden()
+                .child(section_header(
+                    format!("PENDING — {n} CHANGE(S), REVIEW THEN APPLY"),
+                    c,
+                ))
+                .child(
+                    div()
+                        .id("pending-scroll")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .text_color(c.fg)
+                        .child(sql),
+                )
+                .child(
+                    h_flex()
+                        .px_2()
+                        .pb_2()
+                        .gap_2()
+                        .child(
+                            Button::new("apply")
+                                .tab_stop(false)
+                                .label("Apply")
+                                .primary()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.apply_pending(tab_id, cx)
-                                }),
-                            ))
-                            .child(Button::new("cancel-edit").label("Cancel").on_click(
-                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                })),
+                        )
+                        .child(
+                            Button::new("cancel-edit")
+                                .tab_stop(false)
+                                .label("Cancel")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.cancel_pending(tab_id, cx)
-                                }),
-                            )),
-                    )
-                    .into_any_element()
-            } else {
-                v_flex()
-                    .flex_grow()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(section_header("MESSAGES", c))
-                    .child(
-                        div()
-                            .id("messages-scroll")
-                            .flex_1()
-                            .min_h(px(0.))
-                            .overflow_y_scroll()
-                            .px_3()
-                            .py_2()
-                            .text_sm()
-                            .text_color(c.fg)
-                            .child(self.status.clone()),
-                    )
-                    .into_any_element()
-            };
+                                })),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            v_flex()
+                .flex_grow()
+                .h_full()
+                .overflow_hidden()
+                .child(section_header("MESSAGES", c))
+                .child(
+                    div()
+                        .id("messages-scroll")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .px_3()
+                        .py_2()
+                        .text_sm()
+                        .text_color(c.fg)
+                        .child(self.status.clone()),
+                )
+                .into_any_element()
+        };
 
         h_flex()
             .size_full()
@@ -867,25 +967,7 @@ impl Workspace {
                 .into_any_element()
         };
 
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .justify_center()
-            .items_start()
-            .bg(rgba(0x000000aa))
-            .child(
-                v_flex()
-                    .mt(px(60.))
-                    .w(px(520.))
-                    .bg(c.panel)
-                    .border_1()
-                    .border_color(c.border)
-                    .rounded_md()
-                    .child(body),
-            )
+        self.modal_layer(v_flex().mt(px(26.)).w(px(520.)).child(body), cx)
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -960,10 +1042,9 @@ impl Workspace {
                     "Keyboard shortcuts",
                     Button::new("show-shortcuts")
                         .label("Show (F1)")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.settings_open = false;
-                            this.toggle_shortcuts(cx)
-                        }))
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_shortcuts(cx)),
+                        )
                         .into_any_element(),
                 ))
                 .child(section_header("CONFIG FILE", c))
@@ -981,25 +1062,7 @@ impl Workspace {
                     ),
                 ));
 
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .justify_center()
-            .items_start()
-            .bg(rgba(0x000000aa))
-            .child(
-                v_flex()
-                    .mt(px(60.))
-                    .w(px(520.))
-                    .bg(c.panel)
-                    .border_1()
-                    .border_color(c.border)
-                    .rounded_md()
-                    .child(body),
-            )
+        self.modal_layer(v_flex().mt(px(26.)).w(px(520.)).child(body), cx)
     }
 
     /// The keyboard-shortcut reference (F1): every section of
@@ -1039,56 +1102,42 @@ impl Workspace {
             .min_by_key(|&i| rows(&SHORTCUTS[..i]).abs_diff(rows(&SHORTCUTS[i..])))
             .unwrap_or(SHORTCUTS.len());
         let viewport = window.viewport_size();
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .justify_center()
-            .items_start()
-            .bg(rgba(0x000000aa))
-            .child(
-                v_flex()
-                    .mt(px(48.))
-                    .w(px(760.))
-                    .max_w(viewport.width - px(32.))
-                    .max_h(viewport.height - px(80.))
-                    .bg(c.panel)
-                    .border_1()
-                    .border_color(c.border)
-                    .rounded_md()
-                    .child(
-                        h_flex()
-                            .id("shortcuts-body")
-                            .flex_1()
-                            .min_h(px(0.))
-                            .items_start()
-                            .overflow_y_scroll()
-                            .child(column(&SHORTCUTS[..split]))
-                            .child(column(&SHORTCUTS[split..])),
-                    )
-                    .child(
-                        h_flex()
-                            .p_2()
-                            .justify_between()
-                            .items_center()
-                            .border_t_1()
-                            .border_color(c.border)
-                            .child(
-                                div()
-                                    .px_1()
-                                    .text_xs()
-                                    .text_color(c.fg_dim)
-                                    .child("Ctrl is Cmd on macOS"),
-                            )
-                            .child(Button::new("close-shortcuts").label("Close").on_click(
-                                cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.toggle_shortcuts(cx)
-                                }),
-                            )),
-                    ),
-            )
+        self.modal_layer(
+            v_flex()
+                .mt(px(14.))
+                .w(px(760.))
+                .max_w(viewport.width - px(32.))
+                .max_h(viewport.height - px(80.))
+                .child(
+                    h_flex()
+                        .id("shortcuts-body")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .items_start()
+                        .overflow_y_scroll()
+                        .child(column(&SHORTCUTS[..split]))
+                        .child(column(&SHORTCUTS[split..])),
+                )
+                .child(
+                    h_flex()
+                        .p_2()
+                        .justify_between()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(c.border)
+                        .child(
+                            div()
+                                .px_1()
+                                .text_xs()
+                                .text_color(c.fg_dim)
+                                .child("Ctrl is Cmd on macOS"),
+                        )
+                        .child(Button::new("close-shortcuts").label("Close").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_shortcuts(cx)),
+                        )),
+                ),
+            cx,
+        )
     }
 
     fn render_palette(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1114,32 +1163,20 @@ impl Workspace {
             );
         }
 
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .flex()
-            .justify_center()
-            .items_start()
-            .bg(rgba(0x000000aa))
-            .child(
-                v_flex()
-                    .mt(px(80.))
-                    .w(px(540.))
-                    .bg(c.panel)
-                    .border_1()
-                    .border_color(c.border)
-                    .rounded_md()
-                    .child(
-                        div()
-                            .p_2()
-                            .border_b_1()
-                            .border_color(c.border)
-                            .child(Input::new(&self.palette_input)),
-                    )
-                    .child(list),
-            )
+        self.modal_layer(
+            v_flex()
+                .mt(px(46.))
+                .w(px(540.))
+                .child(
+                    div()
+                        .p_2()
+                        .border_b_1()
+                        .border_color(c.border)
+                        .child(Input::new(&self.palette_input)),
+                )
+                .child(list),
+            cx,
+        )
     }
 
     /// Zed-style custom title bar: replaces the OS title bar (the window is
@@ -1253,7 +1290,7 @@ impl Workspace {
         // width pins the right edge.
         let mut bar = h_flex()
             .w(window.viewport_size().width)
-            .h(px(34.))
+            .h(modal::TITLEBAR_H)
             .flex_shrink_0()
             .items_center()
             .bg(c.header)
@@ -1356,10 +1393,11 @@ impl Render for Workspace {
                 .update(cx, |i, cx| i.set_value("", window, cx));
         }
         self.flush_pending_focus(window);
+        self.sync_modal_focus(window, cx);
         if window.focused(cx).is_none() {
             self.root_focus.focus(window);
         }
-        let center = self.render_center(cx).into_any_element();
+        let center = self.render_center(window, cx).into_any_element();
         let mut top = h_resizable("zdb-top")
             .child(
                 resizable_panel()
@@ -1374,7 +1412,13 @@ impl Render for Workspace {
                     resizable_panel()
                         .size(px(480.))
                         .size_range(px(200.)..px(900.))
-                        .child(div().size_full().child(t.view.clone())),
+                        // Tab / Esc are shell keys here (see `bind_nav_keys`).
+                        .child(
+                            div()
+                                .size_full()
+                                .key_context("Terminal")
+                                .child(t.view.clone()),
+                        ),
                 );
             }
         }
@@ -1416,47 +1460,53 @@ impl Render for Workspace {
                     .child(main),
             );
 
-        let root =
-            div()
-                .relative()
-                .size_full()
-                // Window-wide default text color (the ambient `window.text_style()`
-                // is otherwise transparent).
-                .text_color(c.fg)
-                .key_context("zdb")
-                .on_action(cx.listener(|this, _: &RunQuery, _, cx| this.run_active_tab(cx)))
-                .on_action(cx.listener(|this, _: &CancelQuery, _, cx| this.cancel(cx)))
-                .on_action(cx.listener(|this, _: &ToggleScratch, window, cx| {
+        let root = div()
+            .relative()
+            .size_full()
+            // Window-wide default text color (the ambient `window.text_style()`
+            // is otherwise transparent).
+            .text_color(c.fg)
+            .key_context("zdb")
+            // The query / tab chords act on the panes, which a dialog
+            // covers: swallowed while one is open.
+            .on_action(cx.listener(|this, _: &RunQuery, _, cx| {
+                if !this.modal_open() {
+                    this.run_active_tab(cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CancelQuery, _, cx| this.cancel(cx)))
+            .on_action(cx.listener(|this, _: &ToggleScratch, window, cx| {
+                if !this.modal_open() {
                     this.focus_scratch_tab(window, cx)
-                }))
-                .on_action(cx.listener(|this, _: &TogglePalette, _, cx| this.toggle_palette(cx)))
-                .on_action(cx.listener(|this, _: &ClosePalette, _, cx| {
-                    this.close_palette(cx);
-                    this.stop_autoscroll(cx);
-                    // Esc discards the inline cell edit (or stages it, per the
-                    // setting). Clearing `editing` first means the blur that
-                    // follows (the input unmounts) finds nothing to commit.
-                    this.escape_cell_edit(cx);
-                    if this.conn_manager_open {
-                        this.conn_manager_open = false;
-                        cx.notify();
-                    }
-                    if this.settings_open {
-                        this.settings_open = false;
-                        cx.notify();
-                    }
-                    if this.shortcuts_open {
-                        this.shortcuts_open = false;
-                        cx.notify();
-                    }
-                }))
-                .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                }
+            }))
+            .on_action(cx.listener(|this, _: &TogglePalette, _, cx| this.toggle_palette(cx)))
+            .on_action(cx.listener(|this, _: &ClosePalette, window, cx| {
+                // An open completion menu takes Esc first (see the fn).
+                let escape = Box::new(gpui_component::input::Escape);
+                if this.completion_menu_action(escape, window, cx) {
+                    return;
+                }
+                // Esc closes the dialog; behind one, nothing else is live.
+                if this.modal_open() {
+                    this.close_modal(cx);
+                    return;
+                }
+                this.stop_autoscroll(cx);
+                // Esc discards the inline cell edit (or stages it, per the
+                // setting). Clearing `editing` first means the blur that
+                // follows (the input unmounts) finds nothing to commit.
+                this.escape_cell_edit(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
+                if !this.modal_open() {
                     this.toggle_terminal(window, cx)
-                }))
-                .on_action(
-                    cx.listener(|this, _: &ToggleConnections, _, cx| this.toggle_connections(cx)),
-                )
-                .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| this.toggle_settings(cx)));
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &ToggleConnections, _, cx| this.toggle_connections(cx)),
+            )
+            .on_action(cx.listener(|this, _: &ToggleSettings, _, cx| this.toggle_settings(cx)));
         let mut root = Self::nav_actions(root, cx)
             // The fallback focus target is a ZERO-SIZE child, not the root itself.
             // A focusable element claims every mouse-down inside it (focus +
@@ -1509,19 +1559,14 @@ impl Render for Workspace {
                 .with_priority(1),
             );
         }
-        if self.conn_manager_open {
-            root = root.child(self.render_conn_manager(cx));
-        }
-        if self.settings_open {
-            root = root.child(self.render_settings(cx));
-        }
-        if self.shortcuts_open {
-            root = root.child(self.render_shortcuts(window, cx));
-        }
-        if self.palette_open {
-            root = root.child(self.render_palette(cx));
-        }
-        root
+        let dialog = match self.modal {
+            Some(Modal::Connections) => Some(self.render_conn_manager(cx).into_any_element()),
+            Some(Modal::Settings) => Some(self.render_settings(cx).into_any_element()),
+            Some(Modal::Shortcuts) => Some(self.render_shortcuts(window, cx).into_any_element()),
+            Some(Modal::Palette) => Some(self.render_palette(cx).into_any_element()),
+            None => None,
+        };
+        root.children(dialog)
     }
 }
 
@@ -1530,11 +1575,15 @@ impl Workspace {
     /// bound to a key context (see `keynav::bind_nav_keys`), so it only ever
     /// arrives from the pane it belongs to.
     fn nav_actions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
-        // Pane / tab chords are shell keys inside the terminal: hand them back
-        // (an unhandled action lets the keystroke through to its key handler).
+        // Pane / tab chords: swallowed behind a dialog (they act on what it
+        // covers), and shell keys inside the terminal — handed back there (an
+        // unhandled action lets the keystroke through to its key handler).
         macro_rules! unless_terminal {
             ($action:ty, |$this:ident, $window:ident, $cx:ident| $body:expr) => {
                 cx.listener(|$this, _: &$action, $window, $cx| {
+                    if $this.modal_open() {
+                        return;
+                    }
                     if $this.terminal_focused($window, $cx) {
                         $cx.propagate();
                         return;
@@ -1561,12 +1610,27 @@ impl Workspace {
                 .close_active_tab(window, cx)))
             .on_action(unless_terminal!(ApplyEdits, |this, window, cx| this.apply_active(cx)))
             .on_action(cx.listener(|this, _: &ToggleShortcuts, _, cx| this.toggle_shortcuts(cx)))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                if !this.modal_open() {
+                    this.cycle_tab(true, window, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PrevTab, window, cx| {
+                if !this.modal_open() {
+                    this.cycle_tab(false, window, cx)
+                }
+            }))
             .on_action(
-                cx.listener(|this, _: &NextTab, window, cx| this.cycle_tab(true, window, cx)),
+                cx.listener(|this, _: &FocusNextField, window, cx| {
+                    this.step_focus(true, window, cx)
+                }),
             )
-            .on_action(
-                cx.listener(|this, _: &PrevTab, window, cx| this.cycle_tab(false, window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &FocusPrevField, window, cx| {
+                this.step_focus(false, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &AcceptCompletion, window, cx| {
+                this.accept_completion(window, cx)
+            }))
             .on_action(grid!(GridUp, Motion::Up))
             .on_action(grid!(GridDown, Motion::Down))
             .on_action(grid!(GridLeft, Motion::Left))
@@ -1751,15 +1815,16 @@ fn schema_tree_row(
                 let weak = weak.clone();
                 let ts = tree_state.clone();
                 let (s, t) = (schema.clone(), name.clone());
-                move |_: &MouseDownEvent, window: &mut Window, cx: &mut App| {
+                move |ev: &MouseDownEvent, window: &mut Window, cx: &mut App| {
                     // Keep the widget's row handler (select+toggle) from also
                     // firing; select manually, then open the tab.
                     cx.stop_propagation();
                     if let Some(ts) = &ts {
                         ts.update(cx, |ts, cx| ts.set_selected_index(Some(ix), cx));
                     }
+                    let double = ev.click_count >= 2;
                     weak.update(cx, |this, cx| {
-                        this.open_table_tab(s.clone(), t.clone(), window, cx)
+                        this.click_tree_relation(s.clone(), t.clone(), double, window, cx)
                     })
                     .ok();
                 }

@@ -11,6 +11,12 @@
 //! `sqls` opens its **own** Postgres connection to introspect (separate from
 //! zdb's). Its password is passed via the `PGPASSWORD` environment variable, not
 //! written to the on-disk config — matching zdb's keychain policy.
+//!
+//! sqls can die under us (v0.2.47 overflowed its stack on any `CASE` without an
+//! `END` — i.e. while one is being typed). When its stdout closes, everything
+//! still waiting resolves to "no completions" instead of hanging (a hung
+//! request froze gpui-component's menu on screen), and the next request
+//! starts a fresh server.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -18,17 +24,18 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use futures_channel::oneshot;
 use gpui::{AppContext as _, Context, Task, Window};
 use gpui_component::input::{CompletionProvider, InputState};
 use gpui_component::{Rope, RopeExt};
 use lsp_types::{
-    CompletionContext, CompletionItem, CompletionResponse, CompletionTextEdit, Position, Range,
-    TextEdit,
+    CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
+    Documentation, Position, Range, TextEdit,
 };
 use serde_json::{json, Value};
 use zdb_db::{ConnectionConfig, SslMode};
@@ -43,11 +50,22 @@ pub fn new_slot() -> LspSlot {
     Rc::new(RefCell::new(None))
 }
 
+/// A server that died sooner than this after starting isn't restarted until
+/// this long has passed — in case it dies on every request.
+const RESTART_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Numbers each spawned server (its config file name, and which server a
+/// document was opened on — see `SqlCompletion::opened`).
+static SPAWNS: AtomicU64 = AtomicU64::new(0);
+
 /// Cloneable handle to a running `sqls` subprocess. Dropping the last clone
 /// kills the process and removes its temp config.
 #[derive(Clone)]
 pub struct LspHandle {
     inner: Arc<Inner>,
+    /// What it was started from, to start it again (`restart`).
+    exe: PathBuf,
+    cfg: ConnectionConfig,
 }
 
 struct Inner {
@@ -57,6 +75,10 @@ struct Inner {
     version: AtomicI64,
     pending: Mutex<HashMap<i64, oneshot::Sender<Value>>>,
     config_path: PathBuf,
+    /// Its stdout closed: the process is gone. Set under the `pending` lock.
+    dead: AtomicBool,
+    started: Instant,
+    generation: u64,
 }
 
 impl Inner {
@@ -79,20 +101,19 @@ impl Drop for Inner {
 }
 
 impl LspHandle {
-    /// Spawn `sqls -config <config_path>` and run the initialize handshake.
-    /// `password`, if present, is passed via `PGPASSWORD` (never on disk).
-    pub fn spawn(
-        exe: &Path,
-        config_path: PathBuf,
-        password: Option<String>,
-    ) -> std::io::Result<LspHandle> {
+    /// Write a config for `cfg`, spawn `sqls -config <it>` and run the
+    /// initialize handshake. The password, if any, is passed via `PGPASSWORD`
+    /// (never on disk).
+    pub fn spawn(exe: &Path, cfg: &ConnectionConfig) -> std::io::Result<LspHandle> {
+        let generation = SPAWNS.fetch_add(1, Ordering::Relaxed) + 1;
+        let config_path = write_config(cfg, generation)?;
         let mut cmd = Command::new(exe);
         cmd.arg("-config")
             .arg(&config_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        if let Some(pw) = password {
+        if let Some(pw) = &cfg.password {
             cmd.env("PGPASSWORD", pw);
         }
         // sqls is a console subprocess; without this a GUI-subsystem zdb.exe pops
@@ -114,6 +135,9 @@ impl LspHandle {
             version: AtomicI64::new(1),
             pending: Mutex::new(HashMap::new()),
             config_path,
+            dead: AtomicBool::new(false),
+            started: Instant::now(),
+            generation,
         });
 
         // The reader holds only a Weak ref so it never keeps the process alive:
@@ -125,7 +149,11 @@ impl LspHandle {
             .spawn(move || reader_loop(BufReader::new(stdout), weak))
             .ok();
 
-        let handle = LspHandle { inner };
+        let handle = LspHandle {
+            inner,
+            exe: exe.to_path_buf(),
+            cfg: cfg.clone(),
+        };
         let init_id = handle.inner.next_id.fetch_add(1, Ordering::Relaxed);
         handle.inner.send(json!({
             "jsonrpc": "2.0", "id": init_id, "method": "initialize",
@@ -139,6 +167,17 @@ impl LspHandle {
             .inner
             .send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
         Ok(handle)
+    }
+
+    /// A fresh server for the same connection.
+    pub fn restart(&self) -> std::io::Result<LspHandle> {
+        Self::spawn(&self.exe, &self.cfg)
+    }
+
+    /// Whether the process has gone and a `restart` is due (not straight away
+    /// if it died young — see `RESTART_BACKOFF`).
+    fn needs_restart(&self) -> bool {
+        self.inner.dead.load(Ordering::Relaxed) && self.inner.started.elapsed() >= RESTART_BACKOFF
     }
 
     pub fn did_open(&self, uri: &str, text: &str) {
@@ -158,10 +197,18 @@ impl LspHandle {
 
     /// Request completion at `(line, character)` (UTF-16). The reply arrives as
     /// the raw `result` value on the returned channel.
+    /// On a dead server the channel is closed at once (the caller treats that
+    /// as no completions).
     pub fn completion(&self, uri: &str, line: u32, character: u32) -> oneshot::Receiver<Value> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().unwrap().insert(id, tx);
+        {
+            let mut pending = self.inner.pending.lock().unwrap();
+            if self.inner.dead.load(Ordering::Relaxed) {
+                return rx;
+            }
+            pending.insert(id, tx);
+        }
         self.inner.send(json!({
             "jsonrpc": "2.0", "id": id, "method": "textDocument/completion",
             "params": {"textDocument": {"uri": uri}, "position": {"line": line, "character": character}}
@@ -170,7 +217,18 @@ impl LspHandle {
     }
 }
 
-fn reader_loop(mut r: BufReader<ChildStdout>, weak: Weak<Inner>) {
+fn reader_loop(r: BufReader<ChildStdout>, weak: Weak<Inner>) {
+    read_messages(r, &weak);
+    // stdout closed: the server exited or crashed. Fail what's waiting (the
+    // dropped senders read as "no completions") and mark the handle dead.
+    if let Some(inner) = weak.upgrade() {
+        let mut pending = inner.pending.lock().unwrap();
+        inner.dead.store(true, Ordering::Relaxed);
+        pending.clear();
+    }
+}
+
+fn read_messages(mut r: BufReader<ChildStdout>, weak: &Weak<Inner>) {
     loop {
         // Parse the Content-Length header block.
         let mut length = 0usize;
@@ -255,8 +313,9 @@ fn ssl_str(mode: SslMode) -> &'static str {
 }
 
 /// Write a temp `sqls` config for `cfg` (no password — that goes via env).
-/// Values are JSON-quoted, which is valid YAML, to avoid injection.
-pub fn write_config(cfg: &ConnectionConfig) -> std::io::Result<PathBuf> {
+/// Values are JSON-quoted, which is valid YAML, to avoid injection. Each
+/// server gets its own file (`n`): a dying one deletes its config on drop.
+fn write_config(cfg: &ConnectionConfig, n: u64) -> std::io::Result<PathBuf> {
     let q = |s: &str| serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into());
     let yaml = format!(
         "connections:\n  - alias: zdb\n    driver: postgresql\n    proto: tcp\n    \
@@ -268,7 +327,7 @@ pub fn write_config(cfg: &ConnectionConfig) -> std::io::Result<PathBuf> {
         db = q(&cfg.dbname),
         ssl = ssl_str(cfg.ssl_mode),
     );
-    let path = std::env::temp_dir().join(format!("zdb-sqls-{}.yml", std::process::id()));
+    let path = std::env::temp_dir().join(format!("zdb-sqls-{}-{n}.yml", std::process::id()));
     std::fs::write(&path, yaml)?;
     Ok(path)
 }
@@ -314,12 +373,119 @@ fn with_word_range(resp: CompletionResponse, start: Position, end: Position) -> 
     }
 }
 
+/// Shape sqls' items for a compact menu. sqls attaches markdown docs, which
+/// gpui-component shows in a side panel — for a table, a full column listing
+/// taller than the window — so the docs go, and a column's type (the one
+/// useful line of them) becomes its inline detail instead of `column from "t"`.
+/// `clause` (a WHERE / ORDER BY box over one table) also drops table names,
+/// which have no place there.
+///
+/// `typed` is the word under the cursor. Each item's `filter_text` is set to
+/// the part of its label that word matches: the menu highlights the first
+/// `filter_text.len()` bytes of the label, else the first `query.len()` — and
+/// its query runs on across spaces while the menu stays open (`WHERE c` against
+/// a label `c1`), which made gpui panic on a highlight past the label's end.
+fn tidy_items(resp: CompletionResponse, clause: bool, typed: &str) -> CompletionResponse {
+    let tidy = |items: Vec<CompletionItem>| -> Vec<CompletionItem> {
+        items
+            .into_iter()
+            .filter(|i| !(clause && i.kind == Some(CompletionItemKind::CLASS)))
+            .map(|mut i| {
+                i.filter_text = Some(i.label[..matched_prefix(&i.label, typed)].to_string());
+                let doc = match i.documentation.take() {
+                    Some(Documentation::String(s)) => s,
+                    Some(Documentation::MarkupContent(m)) => m.value,
+                    None => String::new(),
+                };
+                if i.kind == Some(CompletionItemKind::FIELD) {
+                    if let Some(ty) = column_type(&doc) {
+                        i.detail = Some(ty);
+                    }
+                }
+                i
+            })
+            .collect()
+    };
+    match resp {
+        CompletionResponse::Array(items) => CompletionResponse::Array(tidy(items)),
+        CompletionResponse::List(mut list) => {
+            list.items = tidy(list.items);
+            CompletionResponse::List(list)
+        }
+    }
+}
+
+/// Byte length of the longest prefix of `label` that matches `typed`, ignoring
+/// case (always a char boundary of `label`).
+fn matched_prefix(label: &str, typed: &str) -> usize {
+    label
+        .char_indices()
+        .zip(typed.chars())
+        .take_while(|((_, a), b)| a.to_lowercase().eq(b.to_lowercase()))
+        .last()
+        .map_or(0, |((i, a), _)| i + a.len_utf8())
+}
+
+/// `integer PK` out of sqls' column doc (`` `t`.`c` column\n\n`integer` PRIMARY KEY ``).
+fn column_type(doc: &str) -> Option<String> {
+    let ty = doc.split("\n\n").nth(1)?.replace('`', "");
+    let ty = ty.trim().replace("PRIMARY KEY", "PK");
+    (!ty.is_empty()).then_some(ty)
+}
+
+/// Byte offset where the comma-separated item under `offset` starts: just past
+/// the last top-level comma before it (none inside quotes or parentheses), else
+/// 0. sqls loses track of the columns after `col DESC,`, so a clause box only
+/// ever shows it the item being typed.
+fn list_item_start(text: &str, offset: usize) -> usize {
+    let mut start = 0;
+    let mut depth = 0i32;
+    let mut quote = None;
+    for (i, &b) in text.as_bytes()[..offset.min(text.len())].iter().enumerate() {
+        match (quote, b) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, b'\'' | b'"') => quote = Some(b),
+            (None, b'(') => depth += 1,
+            (None, b')') => depth -= 1,
+            (None, b',') if depth <= 0 => start = i + 1,
+            _ => {}
+        }
+    }
+    start
+}
+
+/// `SELECT * FROM s.t <keyword> ` — the statement a Table tab's WHERE / ORDER
+/// BY box continues, as sqls should see it. Plain names stay unquoted: sqls
+/// resolves no columns at all for a quoted `"s"."t"`.
+pub fn clause_head(schema: &str, table: &str, keyword: &str) -> String {
+    let ident = |s: &str| {
+        let plain = s.starts_with(|c: char| c.is_ascii_lowercase() || c == '_')
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if plain {
+            s.to_string()
+        } else {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+    };
+    format!(
+        "SELECT * FROM {}.{} {keyword} ",
+        ident(schema),
+        ident(table)
+    )
+}
+
 /// A per-editor `CompletionProvider` that forwards to the shared `sqls` handle.
 /// Each editor gets a unique document URI so the server tracks them separately.
 pub struct SqlCompletion {
     slot: LspSlot,
     uri: String,
-    opened: AtomicBool,
+    /// Generation of the server this document was opened on (0 = none): a
+    /// restarted server needs a fresh `didOpen`.
+    opened: AtomicU64,
+    /// For a clause box: the statement its text continues (see `clause`).
+    head: Option<String>,
 }
 
 impl SqlCompletion {
@@ -327,7 +493,21 @@ impl SqlCompletion {
         Self {
             slot,
             uri: format!("file:///zdb/tab-{tab_id}.sql"),
-            opened: AtomicBool::new(false),
+            opened: AtomicU64::new(0),
+            head: None,
+        }
+    }
+
+    /// For a one-line box that holds a single clause of a generated statement
+    /// (a Table tab's WHERE / ORDER BY). On its own, `id > 3 AND na` names no
+    /// table, so sqls has no columns to offer; it is shown `head` (from
+    /// `clause_head`) followed by the item being typed instead.
+    pub fn clause(slot: LspSlot, key: &str, head: String) -> Self {
+        Self {
+            slot,
+            uri: format!("file:///zdb/{key}.sql"),
+            opened: AtomicU64::new(0),
+            head: Some(head),
         }
     }
 }
@@ -344,9 +524,15 @@ impl CompletionProvider for SqlCompletion {
         let empty = || -> Task<anyhow::Result<CompletionResponse>> {
             Task::ready(Ok(CompletionResponse::Array(vec![])))
         };
-        let handle = match self.slot.borrow().as_ref() {
-            Some(h) => h.clone(),
-            None => return empty(),
+        let handle = {
+            let mut slot = self.slot.borrow_mut();
+            if slot.as_ref().is_some_and(LspHandle::needs_restart) {
+                *slot = slot.as_ref().and_then(|h| h.restart().ok());
+            }
+            match slot.as_ref() {
+                Some(h) => h.clone(),
+                None => return empty(),
+            }
         };
         let pos = rope.offset_to_position(offset);
         let text = rope.to_string();
@@ -355,22 +541,43 @@ impl CompletionProvider for SqlCompletion {
         // gpui-component would fall back to its own trigger-offset range — which
         // mis-replaces and duplicates/eats characters. We attach an explicit
         // textEdit over this range so insertion is deterministic.
-        let start_pos = rope.offset_to_position(word_start(&text, offset));
+        let word_at = word_start(&text, offset);
+        let typed = text[word_at..offset].to_string();
+        let start_pos = rope.offset_to_position(word_at);
         let end_pos = pos;
-        // Full-text sync: open once, then change on every request.
-        if self.opened.swap(true, Ordering::Relaxed) {
-            handle.did_change(&self.uri, &text);
+        // What sqls sees: the editor's text, or for a (one-line) clause box its
+        // statement head + the item being typed, asked about at its end.
+        let (doc, at) = match &self.head {
+            Some(head) => {
+                let doc = format!("{head}{}", &text[list_item_start(&text, offset)..offset]);
+                let at = Position {
+                    line: 0,
+                    character: doc.encode_utf16().count() as u32,
+                };
+                (doc, at)
+            }
+            None => (text, pos),
+        };
+        // Full-text sync: open once (per server), then change on every request.
+        let generation = handle.inner.generation;
+        if self.opened.swap(generation, Ordering::Relaxed) == generation {
+            handle.did_change(&self.uri, &doc);
         } else {
-            handle.did_open(&self.uri, &text);
+            handle.did_open(&self.uri, &doc);
         }
-        let rx = handle.completion(&self.uri, pos.line, pos.character);
+        let rx = handle.completion(&self.uri, at.line, at.character);
+        let clause = self.head.is_some();
         cx.background_spawn(async move {
             let resp = match rx.await {
                 Ok(v) => serde_json::from_value::<CompletionResponse>(v)
                     .unwrap_or(CompletionResponse::Array(vec![])),
                 Err(_) => CompletionResponse::Array(vec![]),
             };
-            Ok(with_word_range(resp, start_pos, end_pos))
+            Ok(tidy_items(
+                with_word_range(resp, start_pos, end_pos),
+                clause,
+                &typed,
+            ))
         })
     }
 
@@ -411,8 +618,8 @@ mod tests {
 
         let mut cfg = ConnectionConfig::new("test".to_string(), host, db, user);
         cfg.ssl_mode = SslMode::Disable;
-        let config_path = write_config(&cfg).expect("write config");
-        let handle = LspHandle::spawn(&exe, config_path, pw).expect("spawn sqls");
+        cfg.password = pw;
+        let handle = LspHandle::spawn(&exe, &cfg).expect("spawn sqls");
 
         let uri = "file:///zdb_test.sql";
         let doc = "SELECT * FROM ";
@@ -441,6 +648,32 @@ mod tests {
                 Err(_) => panic!("completion channel cancelled"),
             }
         }
+    }
+
+    /// A server that dies leaves nothing hanging: a waiting request and every
+    /// later one resolve (as no completions) instead of freezing the menu.
+    #[cfg(unix)]
+    #[test]
+    fn dead_server_never_leaves_a_request_waiting() {
+        let cfg = ConnectionConfig::new("t", "h", "d", "u");
+        // `true` exits at once: a server that dies right after starting.
+        let handle = LspHandle::spawn(Path::new("true"), &cfg).expect("spawn");
+        let mut rx = handle.completion("file:///t.sql", 0, 0);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Err(_) => break,
+                Ok(Some(v)) => panic!("unexpected reply {v}"),
+                Ok(None) => {
+                    assert!(Instant::now() < deadline, "request left waiting");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        assert!(handle.inner.dead.load(Ordering::Relaxed));
+        assert!(handle.completion("file:///t.sql", 0, 0).try_recv().is_err());
+        // It died young: no restart until the backoff has passed.
+        assert!(!handle.needs_restart());
     }
 
     #[test]
@@ -481,6 +714,85 @@ mod tests {
             }
             other => panic!("expected Edit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn clause_boxes_send_only_the_current_item() {
+        assert_eq!(list_item_start("\"name\" DESC, i", 14), 12);
+        assert_eq!(list_item_start("id > 3 AND na", 13), 0);
+        // Commas inside calls, strings and quoted names don't split.
+        assert_eq!(list_item_start("coalesce(a, n", 13), 0);
+        assert_eq!(list_item_start("name = 'a,b' AND i", 18), 0);
+        assert_eq!(list_item_start("\"a,b\" ASC, c", 12), 10);
+        assert_eq!(
+            clause_head("public", "bbb", "WHERE"),
+            "SELECT * FROM public.bbb WHERE "
+        );
+        assert_eq!(
+            clause_head("Sales", "my table", "ORDER BY"),
+            "SELECT * FROM \"Sales\".\"my table\" ORDER BY "
+        );
+    }
+
+    #[test]
+    fn items_lose_docs_and_columns_show_their_type() {
+        let doc = |v: &str| {
+            Some(Documentation::MarkupContent(lsp_types::MarkupContent {
+                kind: lsp_types::MarkupKind::Markdown,
+                value: v.into(),
+            }))
+        };
+        let items = vec![
+            CompletionItem {
+                label: "id".into(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some("column from \"bbb\"".into()),
+                documentation: doc("`bbb`.`id` column\n\n`integer` PRIMARY KEY\n"),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "bbb".into(),
+                kind: Some(CompletionItemKind::CLASS),
+                detail: Some("table".into()),
+                documentation: doc("# `bbb` table\n\n| Name | Type |"),
+                ..Default::default()
+            },
+        ];
+        let CompletionResponse::Array(all) =
+            tidy_items(CompletionResponse::Array(items.clone()), false, "")
+        else {
+            panic!("expected array");
+        };
+        assert_eq!(all[0].detail.as_deref(), Some("integer PK"));
+        assert!(all.iter().all(|i| i.documentation.is_none()));
+        assert_eq!(all[1].detail.as_deref(), Some("table"));
+        // A clause box has no use for table names.
+        let CompletionResponse::Array(clause) =
+            tidy_items(CompletionResponse::Array(items), true, "")
+        else {
+            panic!("expected array");
+        };
+        assert_eq!(clause.len(), 1);
+    }
+
+    /// The menu highlights `filter_text.len()` bytes of the label, so that must
+    /// never run past it (it used to be the whole query: a gpui panic).
+    #[test]
+    fn highlight_covers_only_the_matched_prefix() {
+        assert_eq!(matched_prefix("c1", "WHERE c"), 0);
+        assert_eq!(matched_prefix("name", "NA"), 2);
+        assert_eq!(matched_prefix("id", "id_long"), 2);
+        assert_eq!(matched_prefix("ñandú", "ÑA"), "ña".len());
+        let items = vec![CompletionItem {
+            label: "SELECT".into(),
+            ..Default::default()
+        }];
+        let CompletionResponse::Array(items) =
+            tidy_items(CompletionResponse::Array(items), false, "sel")
+        else {
+            panic!("expected array");
+        };
+        assert_eq!(items[0].filter_text.as_deref(), Some("SEL"));
     }
 
     #[test]

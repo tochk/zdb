@@ -20,7 +20,7 @@ use zdb_db::{CellValue, EditTarget, RowEdit};
 use super::colors::{palette, Colors};
 use super::session;
 use super::Workspace;
-use crate::lsp::{LspSlot, SqlCompletion};
+use crate::lsp::{self, LspSlot, SqlCompletion};
 
 /// Translucent blue fill for a cell with a staged (unsaved) edit, plus a solid
 /// blue left bar. Fixed so it reads on both light and dark themes.
@@ -579,6 +579,30 @@ pub(crate) struct Tab {
 
     /// When set, an EXPLAIN plan to show in its own text view instead of the grid.
     pub(crate) plan: Option<String>,
+
+    /// The statement last run from the editor, and its byte offset in the
+    /// editor text: where a failure's error position goes back as a mark.
+    pub(crate) editor_run: Option<(String, usize)>,
+    /// Table tabs: the box the last failed run's error points into.
+    pub(crate) clause_error: Option<Clause>,
+}
+
+/// A Table tab's WHERE / ORDER BY box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Clause {
+    Where,
+    OrderBy,
+}
+
+/// Drop an editor's error marks. They are byte offsets into the text they
+/// were made for, so any edit invalidates them (and one past the new end would
+/// trip gpui's text layout).
+pub(crate) fn clear_marks(input: &Entity<InputState>, cx: &mut App) {
+    input.update(cx, |state, _| {
+        if let Some(marks) = state.diagnostics_mut() {
+            marks.clear();
+        }
+    });
 }
 
 pub(crate) fn make_grid(
@@ -634,7 +658,10 @@ impl Tab {
         table: Entity<TableState<ResultDelegate>>,
         cx: &App,
     ) -> Self {
-        let grid_focus = table.read(cx).focus_handle(cx);
+        // A tab stop, so Tab from the filter / editor lands in the grid. The
+        // flag lives on the shared focus entry, so the widget's own copy (which
+        // it tracks) picks it up too.
+        let grid_focus = table.read(cx).focus_handle(cx).tab_stop(true);
         Self {
             id,
             kind,
@@ -663,6 +690,8 @@ impl Tab {
             running: false,
             needs_load: false,
             plan: None,
+            editor_run: None,
+            clause_error: None,
         }
     }
 
@@ -676,8 +705,9 @@ impl Tab {
     ) -> Self {
         let weak = cx.weak_entity();
         let editor = make_sql_editor("SELECT * FROM ... ;  (press Run)", slot, id, window, cx);
-        cx.subscribe(&editor, |this, _i, event: &InputEvent, cx| {
+        cx.subscribe(&editor, |this, input, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
+                clear_marks(&input, cx);
                 this.mark_session_dirty(cx);
             }
         })
@@ -720,6 +750,7 @@ impl Tab {
         // Persist scratch text to disk on every change.
         cx.subscribe(&editor, move |_this, emitter, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
+                clear_marks(&emitter, cx);
                 session::store::save_scratch(key.as_deref(), &emitter.read(cx).value());
             }
         })
@@ -749,15 +780,43 @@ impl Tab {
         cx: &mut Context<Workspace>,
     ) -> Self {
         let weak = cx.weak_entity();
-        let editor = make_sql_editor("", slot, id, window, cx);
-        let where_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("WHERE … (Enter to filter)"));
-        let order_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("ORDER BY … (Enter to apply)"));
+        let editor = make_sql_editor("", slot.clone(), id, window, cx);
+        // The bar labels each field with its keyword, so the placeholder only
+        // shows what goes after it. Both complete the table's columns.
+        let clause_input = |key: &str,
+                            keyword: &str,
+                            example: &str,
+                            window: &mut Window,
+                            cx: &mut Context<Workspace>| {
+            let completion = SqlCompletion::clause(
+                slot.clone(),
+                &format!("tab-{id}-{key}"),
+                lsp::clause_head(&schema, &table_name, keyword),
+            );
+            let example = example.to_string();
+            cx.new(|cx| {
+                let mut state = InputState::new(window, cx).placeholder(example);
+                state.lsp.completion_provider = Some(Rc::new(completion));
+                state
+            })
+        };
+        let where_input = clause_input(
+            "where",
+            "WHERE",
+            "e.g. id > 10 AND name ILIKE 'a%'",
+            window,
+            cx,
+        );
+        let order_input = clause_input("order", "ORDER BY", "e.g. created_at DESC", window, cx);
         for input in [&where_input, &order_input] {
             cx.subscribe(input, move |this, _i, event: &InputEvent, cx| match event {
                 InputEvent::PressEnter { .. } => this.apply_where(id, cx),
-                InputEvent::Change => this.mark_session_dirty(cx),
+                InputEvent::Change => {
+                    if let Some(tab) = this.tab_mut(id) {
+                        tab.clause_error = None;
+                    }
+                    this.mark_session_dirty(cx);
+                }
                 _ => {}
             })
             .detach();

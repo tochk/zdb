@@ -88,6 +88,14 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/settings.svg",
         include_bytes!("../assets/icons/settings.svg"),
     ),
+    (
+        "icons/list-filter.svg",
+        include_bytes!("../assets/icons/list-filter.svg"),
+    ),
+    (
+        "icons/arrow-up-down.svg",
+        include_bytes!("../assets/icons/arrow-up-down.svg"),
+    ),
 ];
 
 pub struct Assets;

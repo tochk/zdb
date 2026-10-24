@@ -14,9 +14,17 @@
 //! - Keys the single-line inline input binds but doesn't handle (`tab`, `up`,
 //!   `down`) fall through to the next match — that is how `tab` reaches
 //!   `"GridEdit"` and `down` in the filter box reaches `"TreeFilter"`.
+//! - Tab everywhere else is ours (`FocusNextField` on `"zdb"`), not
+//!   gpui-component's `Root` binding: that one walks EVERY tab stop in the
+//!   window, behind an open dialog too. Only the filter box, the tree, the
+//!   editor / WHERE / ORDER BY and the grid are tab stops (the panes' buttons
+//!   opt out), so Tab walks those fields in order; with a dialog up it stays in
+//!   the dialog (`modal.rs`). Panes that use Tab themselves win by depth: grid
+//!   cells, code-editor indent, and the terminal, where `NoAction` masks every
+//!   outer binding so the key reaches the shell.
 
 use super::*;
-use gpui::{DismissEvent, KeyBinding, KeyDownEvent, Pixels, Point};
+use gpui::{DismissEvent, KeyBinding, KeyDownEvent, NoAction, Pixels, Point};
 use gpui_component::menu::PopupMenu;
 
 actions!(
@@ -60,6 +68,9 @@ actions!(
         TreeMenu,
         TreeFocusFilter,
         FilterToTree,
+        FocusNextField,
+        FocusPrevField,
+        AcceptCompletion,
     ]
 );
 
@@ -93,6 +104,17 @@ pub fn bind_nav_keys(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("ctrl-s", ApplyEdits, None),
         KeyBinding::new("cmd-s", ApplyEdits, None),
+        // Field to field (see the module docs).
+        KeyBinding::new("tab", FocusNextField, Some("zdb")),
+        // Tab takes the highlighted completion, as in Zed. Same context as the
+        // input's own `tab` (indent), so registering later puts it first.
+        KeyBinding::new("tab", AcceptCompletion, Some("Input")),
+        KeyBinding::new("shift-tab", FocusPrevField, Some("zdb")),
+        // The terminal's own keys: mask every outer binding so they reach the
+        // shell (completion, vi's Esc) instead of moving focus / closing things.
+        KeyBinding::new("tab", NoAction, Some("Terminal")),
+        KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
+        KeyBinding::new("escape", NoAction, Some("Terminal")),
         // Grid: the keys the Table widget binds itself. Its `escape` would
         // clear the row highlight out from under the cursor.
         KeyBinding::new("up", GridUp, TABLE),
@@ -189,6 +211,7 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
             ("Focus schema tree", "Ctrl+1"),
             ("Focus editor / filter", "Ctrl+2"),
             ("Focus result grid", "Ctrl+3"),
+            ("Next / previous field", "Tab / Shift+Tab"),
             ("Next / previous tab", "Ctrl+Tab / Ctrl+Shift+Tab"),
             ("Close tab", "Ctrl+W"),
             ("Scratch editor", "Ctrl+Shift+E"),
@@ -198,6 +221,7 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
         "QUERY",
         &[
             ("Run statement under cursor", "Ctrl+Enter"),
+            ("Accept completion", "Enter / Tab"),
             ("Apply staged edits", "Ctrl+S"),
         ],
     ),
@@ -421,8 +445,7 @@ impl Workspace {
     }
 
     pub(super) fn toggle_shortcuts(&mut self, cx: &mut Context<Self>) {
-        self.shortcuts_open = !self.shortcuts_open;
-        cx.notify();
+        self.toggle_modal(Modal::Shortcuts, cx);
     }
 
     pub(super) fn focus_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -582,6 +605,46 @@ impl Workspace {
         // `set_cursor` stages the edit in progress.
         self.move_cursor(if forward { Motion::Next } else { Motion::Prev }, cx);
         self.pending_grid_focus |= was_editing;
+    }
+
+    /// Tab with a completion menu open (SQL editor, WHERE, ORDER BY) takes the
+    /// highlighted item, as Enter does; otherwise the key goes on to indent or
+    /// to the next field.
+    pub(super) fn accept_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let enter = gpui_component::input::Enter { secondary: false };
+        if !self.completion_menu_action(Box::new(enter), window, cx) {
+            cx.propagate();
+        }
+    }
+
+    /// Offer `action` (Enter / Escape) to the completion menu of the focused
+    /// SQL input, if one is open; true when the menu took it. Needed for Esc
+    /// because a binding with NO context matches at the deepest level in gpui,
+    /// so the global `escape` → `ClosePalette` outranks the input's own escape
+    /// and the menu would never see it (it could not be closed at all).
+    pub(super) fn completion_menu_action(
+        &mut self,
+        action: Box<dyn gpui::Action>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let focused = self.active_tab().and_then(|t| {
+            [&t.editor, &t.where_input, &t.order_input]
+                .into_iter()
+                .find(|i| i.read(cx).focus_handle(cx).is_focused(window))
+                .cloned()
+        });
+        let handled = focused.is_some_and(|input| {
+            input.update(cx, |state, cx| {
+                state.handle_action_for_context_menu(action, window, cx)
+            })
+        });
+        // The menu marks the event to propagate even when it handles it; the
+        // key must not go on to indent / change field / close something too.
+        if handled {
+            cx.stop_propagation();
+        }
+        handled
     }
 
     /// Enter / F2 / `i`: edit the cell under the cursor.
