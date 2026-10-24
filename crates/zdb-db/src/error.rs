@@ -36,6 +36,10 @@ pub enum DbError {
     #[error("no such connection: {0}")]
     NoConnection(ConnId),
 
+    /// The job was cancelled before it ran (`DbHandle::cancel`).
+    #[error("cancelled")]
+    Cancelled,
+
     #[error("database worker stopped")]
     WorkerGone,
 }

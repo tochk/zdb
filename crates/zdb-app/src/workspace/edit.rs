@@ -406,7 +406,7 @@ impl Workspace {
             let edits = std::mem::take(&mut tab.pending);
             (target, edits, tab.last_sql.clone())
         };
-        let Some(conn) = self.conn else {
+        let Some(session) = self.tab_session(tab_id) else {
             // No connection: put the edits back so they aren't lost.
             if let Some(tab) = self.tab_mut(tab_id) {
                 tab.pending = edits;
@@ -421,7 +421,7 @@ impl Workspace {
         let db = self.db.clone();
         // The future owns the edits and hands them back for retry-on-failure.
         let fut = async move {
-            let res = db.apply_edits(conn, &target, &edits).await;
+            let res = db.apply_edits(session, &target, &edits).await;
             (res, edits)
         };
         self.spawn_db(cx, fut, move |this, (res, edits), cx| {

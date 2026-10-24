@@ -197,6 +197,22 @@ mod tests {
             .unwrap();
     }
 
+    /// Settings → connections per database stays within its range.
+    #[gpui::test]
+    fn pool_size_setting_stays_in_range(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, _w, cx| {
+                ws.set_pool_size(0, cx);
+                assert_eq!(ws.settings.pool_size, 1);
+                ws.set_pool_size(99, cx);
+                assert_eq!(ws.settings.pool_size, zdb_config::POOL_SIZE_MAX);
+                ws.set_pool_size(6, cx);
+                assert_eq!(ws.settings.pool_size, 6);
+            })
+            .unwrap();
+    }
+
     /// The pane / tab chords do nothing behind a dialog.
     #[gpui::test]
     fn chords_are_ignored_behind_a_dialog(cx: &mut TestAppContext) {

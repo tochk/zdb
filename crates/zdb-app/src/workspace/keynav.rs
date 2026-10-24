@@ -541,6 +541,21 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Connections per database (the pool size), kept within
+    /// `1..=POOL_SIZE_MAX`; takes effect on the live connection at once.
+    pub(super) fn set_pool_size(&mut self, size: usize, cx: &mut Context<Self>) {
+        let size = size.clamp(1, zdb_config::POOL_SIZE_MAX);
+        if size == self.settings.pool_size {
+            return;
+        }
+        self.settings.pool_size = size;
+        if let Some(conn) = self.conn {
+            self.db.set_pool_size(conn, size);
+        }
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Tests run against the dev machine's real settings file — never write it.
     fn save_settings(&mut self) {
         #[cfg(not(test))]

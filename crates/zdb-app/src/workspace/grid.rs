@@ -15,7 +15,7 @@ use gpui_component::{
 };
 use std::collections::HashSet;
 use std::rc::Rc;
-use zdb_db::{CellValue, EditTarget, RowEdit};
+use zdb_db::{CellValue, DbHandle, EditTarget, RowEdit, Session};
 
 use super::colors::{palette, Colors};
 use super::session;
@@ -128,6 +128,17 @@ impl ResultDelegate {
             .collect();
         self.rows = rows;
         self.resize_grab = None;
+    }
+
+    /// Widen the row-number gutter to fit numbers up to `last` (deep pages
+    /// count into the millions). Never narrows it.
+    pub(crate) fn fit_gutter(&mut self, last: usize) {
+        let digits = last.max(1).ilog10() as f32 + 1.;
+        // ~8px a digit at `text_sm`, plus the cell's `px_2` either side.
+        let fit = px(digits * 8. + 16.);
+        if let Some(gutter) = self.columns.first_mut() {
+            gutter.width = gutter.width.max(fit);
+        }
     }
 
     /// Left edge (within the scrollable columns, i.e. past the pinned row-number
@@ -562,6 +573,9 @@ pub(crate) struct Tab {
     pub(crate) orig_rows: Vec<Vec<CellValue>>,
     pub(crate) base_sql: Option<String>,
     pub(crate) last_sql: Option<String>,
+    /// `last_sql`'s page: its first row's number and whether it was read
+    /// end-first (`Workspace::table_page_of`).
+    pub(crate) last_page: (usize, bool),
     pub(crate) sort_state: Option<(usize, bool)>,
 
     // Editability (from DbHandle::describe of `base_sql`).
@@ -587,6 +601,16 @@ pub(crate) struct Tab {
     pub(crate) edited_cells: HashSet<(usize, usize)>,
 
     pub(crate) running: bool,
+    /// Bumped by every run (and by Stop): a result that comes back for an
+    /// older one is stale and dropped.
+    pub(crate) run_gen: u64,
+    /// The tab's database session (its place in the connection pool), once
+    /// it has run something.
+    pub(crate) db_session: Option<TabSession>,
+    /// The last query left the session inside a transaction, so it holds a
+    /// connection of its own until a COMMIT / ROLLBACK (closing the tab rolls
+    /// it back).
+    pub(crate) in_transaction: bool,
     /// A Table tab restored from a saved session that hasn't run its query yet
     /// (it does the first time it is shown).
     pub(crate) needs_load: bool,
@@ -599,6 +623,20 @@ pub(crate) struct Tab {
     pub(crate) editor_run: Option<(String, usize)>,
     /// Table tabs: the box the last failed run's error points into.
     pub(crate) clause_error: Option<Clause>,
+}
+
+/// A tab's database session (`Workspace::tab_session`). Dropping it — the tab
+/// closed, or a connection switch — cancels its work and closes a connection
+/// it holds for an open transaction (rolling that back).
+pub(crate) struct TabSession {
+    pub(crate) db: DbHandle,
+    pub(crate) session: Session,
+}
+
+impl Drop for TabSession {
+    fn drop(&mut self) {
+        self.db.close_session(self.session);
+    }
 }
 
 /// A Table tab's WHERE / ORDER BY / LIMIT box.
@@ -705,6 +743,7 @@ impl Tab {
             orig_rows: Vec::new(),
             base_sql: None,
             last_sql: None,
+            last_page: (0, false),
             sort_state: None,
             edit_target: None,
             edit_cols: Vec::new(),
@@ -717,6 +756,9 @@ impl Tab {
             pending: Vec::new(),
             edited_cells: HashSet::new(),
             running: false,
+            run_gen: 0,
+            db_session: None,
+            in_transaction: false,
             needs_load: false,
             plan: None,
             editor_run: None,
@@ -928,6 +970,12 @@ mod tests {
                     assert_eq!(d.columns[1].width, COL_W);
                     assert!(!d.set_col_width(ROWNUM_COL, px(1.)));
                     assert_eq!(d.columns[ROWNUM_COL].width, ROWNUM_W);
+
+                    // The gutter grows to fit deep pages' row numbers.
+                    d.fit_gutter(4_200);
+                    assert_eq!(d.columns[ROWNUM_COL].width, ROWNUM_W);
+                    d.fit_gutter(10_000_000);
+                    assert_eq!(d.columns[ROWNUM_COL].width, px(8. * 8. + 16.));
                 });
             })
             .unwrap();

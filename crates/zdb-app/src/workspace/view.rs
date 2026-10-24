@@ -14,6 +14,9 @@ use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::tree::{tree, TreeEntry};
 use gpui_component::ActiveTheme;
 
+/// Amber of the "transaction open" markers (tab chip dot, toolbar badge).
+const TX_AMBER: u32 = 0xf59e0bff;
+
 impl Workspace {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
@@ -197,6 +200,10 @@ impl Workspace {
                 .when(!is_active, |d| d.hover(|s| s.bg(c.hover)))
                 .child(tree_icon(kind_icon, tint))
                 .child(div().max_w(px(160.)).truncate().child(tab.title.clone()))
+                // Inside a transaction (see the toolbar badge).
+                .when(tab.in_transaction, |d| {
+                    d.child(div().size(px(6.)).rounded_full().bg(rgba(TX_AMBER)))
+                })
                 .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                     this.activate_tab(idx, window, cx)
                 }));
@@ -350,13 +357,12 @@ impl Workspace {
         } else {
             "Delete row"
         };
-        // Red only when actionable; neutral (theme fg) when disabled.
+        // Red only when actionable. Disabled, it takes the button's own (dimmed)
+        // text color — a fixed one would make it look live.
         let del_enabled = editable && tab.current_row.is_some();
-        let del_color: Hsla = if del_enabled {
-            rgba(0xef4444ff).into()
-        } else {
-            c.fg
-        };
+        let del_icon = Icon::empty()
+            .path("icons/minus.svg")
+            .when(del_enabled, |i| i.text_color(rgba(0xef4444ff)));
         let mut toolbar = h_flex()
             .px_2()
             .py_1()
@@ -379,7 +385,7 @@ impl Workspace {
             .child(
                 Button::new("del-row")
                     .tab_stop(false)
-                    .icon(Icon::empty().path("icons/minus.svg").text_color(del_color))
+                    .icon(del_icon)
                     .tooltip(del_tip)
                     .disabled(!del_enabled)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -453,6 +459,26 @@ impl Workspace {
                 action("format-sql", "icons/braces.svg", "Format SQL", has_sql).on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| this.format_active(window, cx)),
                 ),
+            );
+        }
+        if tab.in_transaction {
+            toolbar = toolbar.child(divider()).child(
+                div()
+                    .id("tx-badge")
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .bg(rgba(TX_AMBER & 0xffffff00 | 0x26))
+                    .text_xs()
+                    .text_color(rgba(TX_AMBER))
+                    .child("Transaction open")
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(
+                            "This tab holds its own connection until COMMIT or ROLLBACK. \
+                             Closing the tab rolls the transaction back.",
+                        )
+                        .build(window, cx)
+                    }),
             );
         }
         if tab.new_row_idx.is_some() {
@@ -669,10 +695,11 @@ impl Workspace {
         let mut label = if loaded == 0 {
             "No rows".to_string()
         } else {
-            format!("{}–{}", tab.first_row + 1, tab.first_row + loaded)
+            let (from, to) = (tab.first_row + 1, tab.first_row + loaded);
+            format!("{}–{}", util::grouped(from), util::grouped(to))
         };
         if let Some(total) = tab.total_rows {
-            label.push_str(&format!(" of {total}"));
+            label.push_str(&format!(" of {}", util::grouped(total)));
         }
         let step =
             |id: &'static str, icon: &'static str, tip: &'static str, to: PageMove, on: bool| {
@@ -1160,6 +1187,10 @@ impl Workspace {
                         .into_any_element(),
                 ))
                 .child(setting_row(
+                    "Connections per database",
+                    self.render_pool_size(c, cx).into_any_element(),
+                ))
+                .child(setting_row(
                     "Keyboard shortcuts",
                     Button::new("show-shortcuts")
                         .label("Show (F1)")
@@ -1184,6 +1215,37 @@ impl Workspace {
                 ));
 
         self.modal_layer(v_flex().mt(px(26.)).w(px(520.)).child(body), cx)
+    }
+
+    /// `− N +` for the pool size. Tabs inside a transaction hold one more
+    /// each (see `zdb_db::Session`).
+    fn render_pool_size(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let n = self.settings.pool_size;
+        let step = |id: &'static str, icon: &'static str, to: usize, on: bool| {
+            Button::new(id)
+                .small()
+                .icon(Icon::empty().path(icon))
+                .disabled(!on)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pool_size(to, cx)))
+        };
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(step("pool-less", "icons/minus.svg", n.saturating_sub(1), n > 1))
+            .child(
+                div()
+                    .w(px(28.))
+                    .text_center()
+                    .text_sm()
+                    .text_color(c.fg)
+                    .child(n.to_string()),
+            )
+            .child(step(
+                "pool-more",
+                "icons/plus.svg",
+                n + 1,
+                n < zdb_config::POOL_SIZE_MAX,
+            ))
     }
 
     /// The keyboard-shortcut reference (F1): every section of

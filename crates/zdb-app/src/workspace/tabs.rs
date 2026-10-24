@@ -227,7 +227,25 @@ impl Workspace {
             o.trim(),
             l.trim(),
             tab.page,
+            tab.total_rows,
         ))
+    }
+
+    /// Where the rows of `sql`, run in `tab_id`, start in the table (the
+    /// OFFSET; it numbers the row gutter) and whether they come back end-first
+    /// (a page read from the far end). `(0, false)` unless it is a Table
+    /// tab's page.
+    pub(super) fn table_page_of(&self, tab_id: u64, sql: &str, cx: &App) -> (usize, bool) {
+        let Some(tab) = self.tab(tab_id) else {
+            return (0, false);
+        };
+        match self.table_sql(tab_id, cx) {
+            Some(q) if q.sql == sql => (q.first_row, q.reversed),
+            // Boxes edited since, then a re-run of the last query (the reload
+            // after Apply): it is still the page it was.
+            Some(_) if tab.last_sql.as_deref() == Some(sql) => tab.last_page,
+            _ => (0, false),
+        }
     }
 
     /// `SELECT count(*)` over a Table tab's rows under its WHERE (for the
@@ -286,12 +304,32 @@ pub(super) struct TableSql {
     where_at: Option<usize>,
     order_at: Option<usize>,
     limit_at: Option<usize>,
+    /// Number (0-based) of the page's first row.
+    first_row: usize,
+    /// The page is read from the far end: ORDER BY reversed, so its rows
+    /// arrive last-first and are flipped back.
+    reversed: bool,
 }
 
 impl TableSql {
     /// An empty box adds nothing (no LIMIT = every row); `page` > 0 adds the
     /// OFFSET of that many pages of `limit` rows.
-    fn new(schema: &str, table: &str, filter: &str, order: &str, limit: &str, page: usize) -> Self {
+    ///
+    /// With the row count (`total`) known, a page nearer the end than the
+    /// start is read from the end instead — ORDER BY reversed, OFFSET counting
+    /// the rows after it — when the ORDER BY can be reversed. OFFSET makes the
+    /// server walk every row it skips, so the last page of a big table then
+    /// costs nothing extra (instant with an index on the order) instead of
+    /// another pass over the whole table.
+    fn new(
+        schema: &str,
+        table: &str,
+        filter: &str,
+        order: &str,
+        limit: &str,
+        page: usize,
+        total: Option<usize>,
+    ) -> Self {
         let mut sql = format!(
             "SELECT * FROM \"{}\".\"{}\"",
             schema.replace('"', "\"\""),
@@ -308,17 +346,43 @@ impl TableSql {
         }
         let where_at = clause(&mut sql, " WHERE ", filter);
         let count_sql = sql.replacen("SELECT * FROM", "SELECT count(*) FROM", 1);
-        let order_at = clause(&mut sql, " ORDER BY ", order);
-        let limit_at = clause(&mut sql, " LIMIT ", limit);
-        if let Some(size) = page_size(limit).filter(|_| page > 0) {
-            sql.push_str(&format!(" OFFSET {}", size * page));
-        }
+        let size = page_size(limit).filter(|_| page > 0);
+        let first_row = size.map_or(0, |n| n * page);
+        let from_end = size.zip(total).and_then(|(n, total)| {
+            let len = n.min(total.saturating_sub(first_row));
+            let after = total.saturating_sub(first_row + len);
+            (len > 0 && after < first_row)
+                .then(|| util::reverse_order(order))
+                .flatten()
+                .map(|rev| (rev, len, after))
+        });
+        let reversed = from_end.is_some();
+        let (order_at, limit_at) = match from_end {
+            Some((rev, len, after)) => {
+                let order_at = clause(&mut sql, " ORDER BY ", &rev);
+                let limit_at = clause(&mut sql, " LIMIT ", &len.to_string());
+                if after > 0 {
+                    sql.push_str(&format!(" OFFSET {after}"));
+                }
+                (order_at, limit_at)
+            }
+            None => {
+                let order_at = clause(&mut sql, " ORDER BY ", order);
+                let limit_at = clause(&mut sql, " LIMIT ", limit);
+                if size.is_some() {
+                    sql.push_str(&format!(" OFFSET {first_row}"));
+                }
+                (order_at, limit_at)
+            }
+        };
         Self {
             sql,
             count_sql,
             where_at,
             order_at,
             limit_at,
+            first_row,
+            reversed,
         }
     }
 }
@@ -429,6 +493,78 @@ mod tests {
                 assert_eq!(page_size("0"), None);
                 assert_eq!(page_size("abc"), None);
                 assert_eq!(page_size(" 25 "), Some(25));
+            })
+            .unwrap();
+    }
+
+    /// Once the rows are counted, pages past the middle are read from the end
+    /// (ORDER BY reversed) — the last page needs no OFFSET at all.
+    #[gpui::test]
+    fn far_pages_are_read_from_the_end(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                let base = "SELECT * FROM \"public\".\"users\"";
+                let tab = ws.tab(id).unwrap();
+                tab.limit_input
+                    .update(cx, |i, cx| i.set_value("50", window, cx));
+                tab.order_input
+                    .update(cx, |i, cx| i.set_value("id", window, cx));
+                let page = |ws: &Workspace, cx: &App| {
+                    let sql = ws.table_query(id, cx);
+                    let at = ws.table_page_of(id, &sql, cx);
+                    (sql, at)
+                };
+
+                // Not counted yet: forward, as always.
+                ws.go_page(id, PageMove::Next, cx);
+                assert_eq!(
+                    page(ws, cx),
+                    (
+                        format!("{base} ORDER BY id LIMIT 50 OFFSET 50"),
+                        (50, false)
+                    )
+                );
+
+                ws.tab_mut(id).unwrap().total_rows = Some(120);
+                ws.go_page(id, PageMove::Last, cx);
+                assert_eq!(
+                    page(ws, cx),
+                    (format!("{base} ORDER BY id DESC LIMIT 20"), (100, true))
+                );
+                ws.go_page(id, PageMove::Prev, cx);
+                assert_eq!(
+                    page(ws, cx),
+                    (
+                        format!("{base} ORDER BY id DESC LIMIT 50 OFFSET 20"),
+                        (50, true)
+                    )
+                );
+                ws.go_page(id, PageMove::Prev, cx);
+                assert_eq!(
+                    page(ws, cx),
+                    (format!("{base} ORDER BY id LIMIT 50"), (0, false))
+                );
+
+                // An ORDER BY that can't be flipped, or none: forward.
+                let tab = ws.tab_mut(id).unwrap();
+                tab.page = 2;
+                tab.order_input
+                    .update(cx, |i, cx| i.set_value("id USING <", window, cx));
+                assert_eq!(
+                    page(ws, cx).0,
+                    format!("{base} ORDER BY id USING < LIMIT 50 OFFSET 100")
+                );
+                ws.tab(id)
+                    .unwrap()
+                    .order_input
+                    .update(cx, |i, cx| i.set_value("", window, cx));
+                assert_eq!(
+                    page(ws, cx),
+                    (format!("{base} LIMIT 50 OFFSET 100"), (100, false))
+                );
             })
             .unwrap();
     }

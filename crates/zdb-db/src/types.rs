@@ -72,8 +72,12 @@ pub enum QueryEvent {
         affected: u64,
         elapsed: Duration,
     },
-    /// Execution failed; the stream ends after this.
+    /// Execution failed; no results follow.
     Failed(DbError),
+    /// Sent last: whether the query's session is now inside a transaction
+    /// block — one it opened and left open, or one that failed and awaits
+    /// ROLLBACK. Its pooled connection stays reserved for it until then.
+    Transaction(bool),
 }
 
 #[cfg(test)]

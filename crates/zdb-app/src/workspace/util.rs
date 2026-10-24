@@ -50,6 +50,91 @@ fn split_trailing_limit(q: &str) -> (&str, Option<&str>) {
     (q, None)
 }
 
+/// `n` with thousands separators (`10000000` → `10,000,000`).
+pub(crate) fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() * 4 / 3);
+    for (i, d) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(d);
+    }
+    out
+}
+
+/// An `ORDER BY` list with every item's direction flipped (`a, b DESC NULLS
+/// LAST` → `a DESC, b ASC NULLS FIRST`), so the end of the ordering can be read
+/// from its start. Flipping only the direction also flips where NULLs go by
+/// default, which is what reversing needs. `None` when it can't be done
+/// safely: empty text or item, a `USING` operator, a comment, a `$$` string.
+pub(crate) fn reverse_order(order: &str) -> Option<String> {
+    if order.contains("--") || order.contains("/*") || order.contains("$$") {
+        return None;
+    }
+    // Split on top-level commas (not inside parens or quotes).
+    let mut items = Vec::new();
+    let (mut depth, mut quote, mut start) = (0i32, None, 0);
+    for (i, ch) in order.char_indices() {
+        match (quote, ch) {
+            (Some(q), _) if ch == q => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') => depth -= 1,
+            (None, ',') if depth == 0 => {
+                items.push(&order[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || depth != 0 {
+        return None;
+    }
+    items.push(&order[start..]);
+    items
+        .into_iter()
+        .map(reverse_item)
+        .collect::<Option<Vec<_>>>()
+        .map(|v| v.join(", "))
+}
+
+/// One `ORDER BY` item, reversed (see `reverse_order`).
+fn reverse_item(item: &str) -> Option<String> {
+    let item = item.trim();
+    // Each word with the byte offset it starts at, to cut the expression off
+    // before its trailing keywords without touching its own spacing.
+    let words: Vec<(usize, &str)> = item
+        .split_whitespace()
+        .map(|w| (w.as_ptr() as usize - item.as_ptr() as usize, w))
+        .collect();
+    let is = |w: &str, kw: &str| w.eq_ignore_ascii_case(kw);
+    if words.iter().any(|(_, w)| is(w, "using")) {
+        return None;
+    }
+    let mut end = words.len();
+    let mut nulls = "";
+    if end >= 3 && is(words[end - 2].1, "nulls") {
+        nulls = match words[end - 1].1 {
+            w if is(w, "first") => " NULLS LAST",
+            w if is(w, "last") => " NULLS FIRST",
+            _ => return None,
+        };
+        end -= 2;
+    }
+    let mut dir = " DESC";
+    if end >= 2 && (is(words[end - 1].1, "asc") || is(words[end - 1].1, "desc")) {
+        if is(words[end - 1].1, "desc") {
+            dir = " ASC";
+        }
+        end -= 1;
+    }
+    let cut = words.get(end).map_or(item.len(), |&(at, _)| at);
+    let expr = item[..cut].trim_end();
+    (!expr.is_empty()).then(|| format!("{expr}{dir}{nulls}"))
+}
+
 /// Byte range of the single SQL statement containing byte offset `cursor`,
 /// trimmed. Splits on top-level `;`, honoring single/double quotes, line (`--`)
 /// and block (`/* */`) comments, and dollar-quoted bodies (`$$ … $$`,
@@ -278,6 +363,47 @@ mod tests {
 
     fn statement_at(sql: &str, cursor: usize) -> &str {
         &sql[statement_range(sql, cursor)]
+    }
+
+    #[test]
+    fn groups_thousands() {
+        assert_eq!(grouped(0), "0");
+        assert_eq!(grouped(999), "999");
+        assert_eq!(grouped(1000), "1,000");
+        assert_eq!(grouped(9999501), "9,999,501");
+        assert_eq!(grouped(10000000), "10,000,000");
+    }
+
+    #[test]
+    fn reverses_order_by_lists() {
+        assert_eq!(reverse_order("\"id\"").as_deref(), Some("\"id\" DESC"));
+        assert_eq!(
+            reverse_order("name, id desc").as_deref(),
+            Some("name DESC, id ASC")
+        );
+        assert_eq!(
+            reverse_order("a ASC NULLS FIRST, b nulls last").as_deref(),
+            Some("a DESC NULLS LAST, b DESC NULLS FIRST")
+        );
+        // Commas / keywords inside calls, quotes and collations stay put.
+        assert_eq!(
+            reverse_order("coalesce(a, b)  DESC, \"x desc\", lower(n) COLLATE \"C\"").as_deref(),
+            Some("coalesce(a, b) ASC, \"x desc\" DESC, lower(n) COLLATE \"C\" DESC")
+        );
+        assert_eq!(
+            reverse_order("'a,b' || c").as_deref(),
+            Some("'a,b' || c DESC")
+        );
+        for unsafe_or_bad in [
+            "",
+            "a,",
+            "a using <",
+            "a -- note",
+            "f(a",
+            "a nulls sometimes",
+        ] {
+            assert_eq!(reverse_order(unsafe_or_bad), None, "{unsafe_or_bad}");
+        }
     }
 
     #[test]

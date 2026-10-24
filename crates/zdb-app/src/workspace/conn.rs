@@ -226,6 +226,7 @@ impl Workspace {
             Ok(conn) => {
                 log(format!("connected (conn={conn})"));
                 this.conn = Some(conn);
+                this.db.set_pool_size(conn, this.settings.pool_size);
                 // Not if the user has moved on to another connection meanwhile.
                 this.pending_restore = !this.session_ready && this.conn_key == key;
                 this.status = "Connected. Loading schemas…".into();
