@@ -161,16 +161,17 @@ impl Workspace {
     }
 
     /// The Zed-style tab strip: one chip per open tab + `+` (new query) and a
-    /// scratch button.
+    /// scratch button. The chips scroll sideways once they overflow (the wheel
+    /// scrolls them — gpui turns vertical wheel into horizontal on an x-only
+    /// scroller) and `render` keeps the active one in view; the buttons stay
+    /// right after them, never scrolled away.
     fn render_tab_strip(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut strip = h_flex()
-            .h(px(34.))
-            .flex_shrink_0()
-            .items_center()
-            .bg(c.header)
-            .border_b_1()
-            .border_color(c.border)
-            .overflow_hidden();
+        let mut chips = h_flex()
+            .id("tab-strip")
+            .h_full()
+            .min_w(px(0.))
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_strip);
         let weak = cx.weak_entity();
         let n_tabs = self.tabs.len();
         for (idx, tab) in self.tabs.iter().enumerate() {
@@ -256,7 +257,7 @@ impl Workspace {
                             w.update(cx, |this, cx| this.close_all_tabs(cx)).ok();
                         }))
                 });
-            strip = strip.child(
+            chips = chips.child(
                 div()
                     .id(SharedString::from(format!("tabchip-{id}")))
                     .h_full()
@@ -265,7 +266,15 @@ impl Workspace {
                     .child(chip),
             );
         }
-        strip
+        h_flex()
+            .h(px(34.))
+            .flex_shrink_0()
+            .items_center()
+            .bg(c.header)
+            .border_b_1()
+            .border_color(c.border)
+            .overflow_hidden()
+            .child(chips)
             .child(
                 Button::new("tab-add")
                     .tab_stop(false)
@@ -380,7 +389,7 @@ impl Workspace {
             .child(
                 Button::new("reload")
                     .tab_stop(false)
-                    .icon(Icon::empty().path("icons/refresh-cw.svg").text_color(c.fg))
+                    .icon(Icon::empty().path("icons/refresh-cw.svg"))
                     .tooltip("Refresh data")
                     .disabled(tab.base_sql.is_none())
                     .on_click(
@@ -388,47 +397,62 @@ impl Workspace {
                             this.reload_data(tab_id, cx)
                         }),
                     ),
-            )
+            );
+        // Groups: row actions | pager (Table tabs) | what to do with the result.
+        // The icons carry no color of their own, so a disabled one dims.
+        let divider = || div().flex_none().w(px(1.)).h(px(16.)).bg(c.border);
+        let action = |id: &'static str, icon: &'static str, tip: &'static str, enabled: bool| {
+            Button::new(id)
+                .tab_stop(false)
+                .icon(Icon::empty().path(icon))
+                .tooltip(tip)
+                .disabled(!enabled)
+        };
+        if matches!(tab.kind, TabKind::Table { .. }) {
+            toolbar = toolbar
+                .child(divider())
+                .child(Self::render_pager(tab, c, cx));
+        }
+        toolbar = toolbar
+            .child(divider())
             // EXPLAIN the current statement (plan shown in the grid).
             .child(
-                Button::new("explain")
-                    .tab_stop(false)
-                    .label("Explain")
-                    .tooltip("EXPLAIN this query")
-                    .disabled(!has_sql)
-                    .on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.explain_active(false, cx)),
-                    ),
+                action(
+                    "explain",
+                    "icons/list-tree.svg",
+                    "Explain (query plan)",
+                    has_sql,
+                )
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.explain_active(false, cx)),
+                ),
             )
             // Export / copy the current result.
             .child(
-                Button::new("export-csv")
-                    .tab_stop(false)
-                    .label("Export")
-                    .tooltip("Export result to CSV (more formats in the palette)")
-                    .disabled(!has_result)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.export_active(ExportFormat::Csv, cx)
-                    })),
+                action(
+                    "export-csv",
+                    "icons/download.svg",
+                    "Export result to CSV (more formats in the palette)",
+                    has_result,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.export_active(ExportFormat::Csv, cx)
+                })),
             )
             .child(
-                Button::new("copy-tsv")
-                    .tab_stop(false)
-                    .label("Copy")
-                    .tooltip("Copy result to clipboard (TSV)")
-                    .disabled(!has_result)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.copy_active_tsv(cx))),
+                action(
+                    "copy-tsv",
+                    "icons/copy.svg",
+                    "Copy result to clipboard (TSV)",
+                    has_result,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.copy_active_tsv(cx))),
             );
         if is_editor {
             toolbar = toolbar.child(
-                Button::new("format-sql")
-                    .tab_stop(false)
-                    .label("Format")
-                    .tooltip("Format SQL")
-                    .disabled(!has_sql)
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.format_active(window, cx)
-                    })),
+                action("format-sql", "icons/braces.svg", "Format SQL", has_sql).on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| this.format_active(window, cx)),
+                ),
             );
         }
         if tab.new_row_idx.is_some() {
@@ -510,13 +534,13 @@ impl Workspace {
             .children(Self::render_value_editor(tab, cell_multi, c, cx))
     }
 
-    /// A Table tab's WHERE / ORDER BY strip, built like Zed's "Search threads…"
-    /// box: one full-width bar with no field chrome — a muted icon and the SQL
-    /// keyword, a borderless input that reads as the rest of the clause, and a
-    /// clear button once there's something to clear. The focused half lights up
-    /// in place of a focus border, and turns red when the last run failed on
-    /// its text (the error itself is in MESSAGES). Enter (or Run / refresh)
-    /// applies both.
+    /// A Table tab's WHERE / ORDER BY / LIMIT strip, built like Zed's "Search
+    /// threads…" box: one full-width bar with no field chrome — a muted icon and
+    /// the SQL keyword, a borderless input that reads as the rest of the clause,
+    /// and a clear button once there's something to clear (not on LIMIT, where
+    /// empty means every row). The focused box lights up in place of a focus
+    /// border, and turns red when the last run failed on its text (the error
+    /// itself is in MESSAGES). Enter (or Run / refresh) applies them all.
     fn render_filter_bar(
         tab: &Tab,
         window: &Window,
@@ -529,6 +553,7 @@ impl Workspace {
                      keyword: &'static str,
                      clause: Clause,
                      input: &Entity<InputState>,
+                     clearable: bool,
                      cx: &mut Context<Self>| {
             let state = input.read(cx);
             let tint = if tab.clause_error == Some(clause) {
@@ -538,7 +563,7 @@ impl Workspace {
             } else {
                 c.fg_dim
             };
-            let clear = (!state.value().is_empty()).then(|| {
+            let clear = (clearable && !state.value().is_empty()).then(|| {
                 let input = input.clone();
                 Button::new(id)
                     .ghost()
@@ -582,6 +607,7 @@ impl Workspace {
             "WHERE",
             Clause::Where,
             &tab.where_input,
+            true,
             cx,
         );
         let order = field(
@@ -590,8 +616,19 @@ impl Workspace {
             "ORDER BY",
             Clause::OrderBy,
             &tab.order_input,
+            true,
             cx,
         );
+        let limit = field(
+            "clear-limit",
+            "icons/hash.svg",
+            "LIMIT",
+            Clause::Limit,
+            &tab.limit_input,
+            false,
+            cx,
+        );
+        let divider = || div().flex_none().w(px(1.)).h(px(16.)).bg(c.border);
         h_flex()
             .h(px(32.))
             .flex_none()
@@ -605,8 +642,92 @@ impl Workspace {
             // The inputs hold SQL: set them (and their keywords) in the code font.
             .font_family(cx.theme().mono_font_family.clone())
             .child(filter.flex_1())
-            .child(div().flex_none().w(px(1.)).h(px(16.)).bg(c.border))
-            .child(order.flex_none().w(relative(0.36)))
+            .child(divider())
+            .child(order.flex_none().w(relative(0.32)))
+            .child(divider())
+            .child(limit.flex_none().w(px(124.)))
+    }
+
+    /// A Table tab's pager: `« ‹ 501–1000 of 12000 › »`. A page is LIMIT rows,
+    /// so without a LIMIT there's nothing to page; it also holds still while a
+    /// query runs and over staged edits (turning the page re-reads the rows,
+    /// which would drop them). There's more to see while a page comes back full
+    /// — or, once the total is known, until it's reached. The total comes from
+    /// the `count(*)` that "last page" runs (not one per load: it can be slow on
+    /// a big table).
+    fn render_pager(tab: &Tab, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let tab_id = tab.id;
+        let size = tabs::page_size(&tab.limit_input.read(cx).value());
+        let loaded = tab.orig_rows.len();
+        let idle = size.is_some() && !tab.running && tab.pending.is_empty();
+        let back = idle && tab.page > 0;
+        let more = idle
+            && match tab.total_rows {
+                Some(total) => tab.first_row + loaded < total,
+                None => size.is_some_and(|n| loaded >= n),
+            };
+        let mut label = if loaded == 0 {
+            "No rows".to_string()
+        } else {
+            format!("{}–{}", tab.first_row + 1, tab.first_row + loaded)
+        };
+        if let Some(total) = tab.total_rows {
+            label.push_str(&format!(" of {total}"));
+        }
+        let step =
+            |id: &'static str, icon: &'static str, tip: &'static str, to: PageMove, on: bool| {
+                Button::new(id)
+                    .tab_stop(false)
+                    .icon(Icon::empty().path(icon))
+                    .tooltip(tip)
+                    .disabled(!on)
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.go_page(tab_id, to, cx)
+                        }),
+                    )
+            };
+        h_flex()
+            .gap_1()
+            .items_center()
+            .child(step(
+                "page-first",
+                "icons/chevrons-left.svg",
+                "First page",
+                PageMove::First,
+                back,
+            ))
+            .child(step(
+                "page-prev",
+                "icons/chevron-left.svg",
+                "Previous page",
+                PageMove::Prev,
+                back,
+            ))
+            .child(
+                div()
+                    .min_w(px(72.))
+                    .px_1()
+                    .flex()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(label),
+            )
+            .child(step(
+                "page-next",
+                "icons/chevron-right.svg",
+                "Next page",
+                PageMove::Next,
+                more,
+            ))
+            .child(step(
+                "page-last",
+                "icons/chevrons-right.svg",
+                "Last page",
+                PageMove::Last,
+                more,
+            ))
     }
 
     /// Full-value editor for a multi-line cell, docked under the grid.
@@ -1396,6 +1517,21 @@ impl Render for Workspace {
         self.sync_modal_focus(window, cx);
         if window.focused(cx).is_none() {
             self.root_focus.focus(window);
+        }
+        // Keep the active tab's chip in view in the scrolling strip — only when
+        // the active tab changes (so scrolling it by hand isn't undone), and a
+        // frame later: chip positions come from the last layout, which has to
+        // show the current tabs already.
+        let active = self.active_id();
+        if active != self.strip_revealed {
+            if active != self.strip_seen {
+                self.strip_seen = active;
+                cx.notify();
+            } else if self.reveal_active_chip() {
+                self.strip_revealed = active;
+            } else {
+                cx.notify();
+            }
         }
         let center = self.render_center(window, cx).into_any_element();
         let mut top = h_resizable("zdb-top")

@@ -62,6 +62,37 @@ impl Workspace {
         }
     }
 
+    /// Scroll the tab strip just far enough to show the active tab's chip; false
+    /// while the chip hasn't been laid out yet (try again next frame).
+    ///
+    /// Not `ScrollHandle::scroll_to_item`: gpui applies that in prepaint BEFORE
+    /// it refreshes the scroller's own bounds, so on the first frame with chips
+    /// it measured against the empty strip (0 wide) and scrolled a chip too far.
+    /// Here both the chip and the strip bounds come from the same, finished,
+    /// layout. Chip bounds are unscrolled; the offset is 0 at the start and
+    /// negative when scrolled right.
+    pub(super) fn reveal_active_chip(&self) -> bool {
+        let Some(ix) = self.active else {
+            return true;
+        };
+        let (Some(chip), strip) = (self.tab_strip.bounds_for_item(ix), self.tab_strip.bounds())
+        else {
+            return false;
+        };
+        if strip.size.width <= px(0.) {
+            return false;
+        }
+        let offset = self.tab_strip.offset();
+        let x = keynav::reveal_offset(
+            offset.x,
+            chip.left() - strip.left(),
+            chip.size.width,
+            strip.size.width,
+        );
+        self.tab_strip.set_offset(gpui::point(x, offset.y));
+        true
+    }
+
     /// Open a fresh blank "Query N" tab and focus it.
     pub(super) fn open_query_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = self.next_tab_id;
@@ -188,7 +219,21 @@ impl Workspace {
         };
         let w = tab.where_input.read(cx).value();
         let o = tab.order_input.read(cx).value();
-        Some(TableSql::new(schema, table, w.trim(), o.trim()))
+        let l = tab.limit_input.read(cx).value();
+        Some(TableSql::new(
+            schema,
+            table,
+            w.trim(),
+            o.trim(),
+            l.trim(),
+            tab.page,
+        ))
+    }
+
+    /// `SELECT count(*)` over a Table tab's rows under its WHERE (for the
+    /// pager's last page).
+    pub(super) fn table_count_query(&self, tab_id: u64, cx: &App) -> Option<String> {
+        self.table_sql(tab_id, cx).map(|q| q.count_sql)
     }
 
     /// Which of a Table tab's boxes a failure of `sql` at 1-based character
@@ -198,15 +243,18 @@ impl Workspace {
     pub(super) fn clause_at(&self, tab_id: u64, sql: &str, pos: u32, cx: &App) -> Option<Clause> {
         let q = self.table_sql(tab_id, cx).filter(|q| q.sql == sql)?;
         let at = pos.checked_sub(1)? as usize;
-        match (q.where_at, q.order_at) {
-            (_, Some(o)) if at >= o => Some(Clause::OrderBy),
-            (Some(w), _) if at >= w => Some(Clause::Where),
-            _ => None,
-        }
+        [
+            (q.limit_at, Clause::Limit),
+            (q.order_at, Clause::OrderBy),
+            (q.where_at, Clause::Where),
+        ]
+        .into_iter()
+        .find_map(|(start, clause)| start.filter(|&s| at >= s).map(|_| clause))
     }
 
-    /// Re-run a table tab from its WHERE / ORDER BY inputs. A hand-typed ORDER BY
-    /// replaces whatever a header click had set, so the header arrows are cleared.
+    /// Re-run a table tab from its WHERE / ORDER BY / LIMIT inputs, from its first
+    /// page. A hand-typed ORDER BY replaces whatever a header click had set, so
+    /// the header arrows are cleared.
     pub(super) fn apply_where(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         if !matches!(
             self.tab(tab_id).map(|t| &t.kind),
@@ -216,42 +264,61 @@ impl Workspace {
         }
         if let Some(tab) = self.tab_mut(tab_id) {
             tab.sort_state = None;
+            tab.page = 0;
+            tab.total_rows = None;
         }
         let sql = self.table_query(tab_id, cx);
         self.run_new_query(tab_id, sql, cx);
     }
 }
 
+/// The LIMIT box as a page size: a positive whole number, else no paging.
+pub(super) fn page_size(limit: &str) -> Option<usize> {
+    limit.trim().parse().ok().filter(|&n| n > 0)
+}
+
 /// A Table tab's generated `SELECT`, and where (in characters, as Postgres
-/// counts error positions) its WHERE / ORDER BY text starts.
+/// counts error positions) its WHERE / ORDER BY / LIMIT text starts.
 pub(super) struct TableSql {
     pub(super) sql: String,
+    /// `count(*)` of the rows the WHERE lets through.
+    count_sql: String,
     where_at: Option<usize>,
     order_at: Option<usize>,
+    limit_at: Option<usize>,
 }
 
 impl TableSql {
-    fn new(schema: &str, table: &str, filter: &str, order: &str) -> Self {
+    /// An empty box adds nothing (no LIMIT = every row); `page` > 0 adds the
+    /// OFFSET of that many pages of `limit` rows.
+    fn new(schema: &str, table: &str, filter: &str, order: &str, limit: &str, page: usize) -> Self {
         let mut sql = format!(
             "SELECT * FROM \"{}\".\"{}\"",
             schema.replace('"', "\"\""),
             table.replace('"', "\"\"")
         );
-        let mut clause = |keyword: &str, text: &str| {
+        // Appends ` <keyword> <text>`, giving where `text` starts.
+        fn clause(sql: &mut String, keyword: &str, text: &str) -> Option<usize> {
             (!text.is_empty()).then(|| {
                 sql.push_str(keyword);
                 let at = sql.chars().count();
                 sql.push_str(text);
                 at
             })
-        };
-        let where_at = clause(" WHERE ", filter);
-        let order_at = clause(" ORDER BY ", order);
-        sql.push_str(&format!(" LIMIT {ROW_LIMIT}"));
+        }
+        let where_at = clause(&mut sql, " WHERE ", filter);
+        let count_sql = sql.replacen("SELECT * FROM", "SELECT count(*) FROM", 1);
+        let order_at = clause(&mut sql, " ORDER BY ", order);
+        let limit_at = clause(&mut sql, " LIMIT ", limit);
+        if let Some(size) = page_size(limit).filter(|_| page > 0) {
+            sql.push_str(&format!(" OFFSET {}", size * page));
+        }
         Self {
             sql,
+            count_sql,
             where_at,
             order_at,
+            limit_at,
         }
     }
 }
@@ -279,6 +346,112 @@ mod tests {
                 assert_eq!(
                     ws.table_query(id, cx),
                     "SELECT * FROM \"public\".\"users\" LIMIT 500"
+                );
+            })
+            .unwrap();
+    }
+
+    /// LIMIT comes from its box (empty = no LIMIT) and doubles as the page size:
+    /// later pages add an OFFSET; a new filter or sort starts again at page 1.
+    #[gpui::test]
+    fn limit_box_and_pages(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                let base = "SELECT * FROM \"public\".\"users\"";
+                let limit = ws.tab(id).unwrap().limit_input.clone();
+                limit.update(cx, |i, cx| i.set_value("50", window, cx));
+
+                ws.go_page(id, PageMove::Next, cx);
+                ws.go_page(id, PageMove::Next, cx);
+                assert_eq!(ws.tab(id).unwrap().page, 2);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    format!("{base} LIMIT 50 OFFSET 100")
+                );
+                ws.go_page(id, PageMove::Prev, cx);
+                assert_eq!(ws.table_query(id, cx), format!("{base} LIMIT 50 OFFSET 50"));
+                // Refresh stays on the page.
+                ws.reload_data(id, cx);
+                let shown = ws.tab(id).unwrap().base_sql.clone().unwrap();
+                assert!(shown.ends_with("OFFSET 50"), "{shown}");
+
+                ws.go_page(id, PageMove::First, cx);
+                assert_eq!(ws.tab(id).unwrap().page, 0);
+                // Last page: from the counted total (counting needs a connection,
+                // so without one nothing moves).
+                ws.go_page(id, PageMove::Last, cx);
+                assert_eq!(ws.tab(id).unwrap().page, 0);
+                ws.tab_mut(id).unwrap().total_rows = Some(120);
+                ws.go_page(id, PageMove::Last, cx);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    format!("{base} LIMIT 50 OFFSET 100")
+                );
+
+                // Applying the boxes starts over: first page, total forgotten.
+                ws.tab(id)
+                    .unwrap()
+                    .where_input
+                    .update(cx, |i, cx| i.set_value("id > 5", window, cx));
+                ws.apply_where(id, cx);
+                assert_eq!(ws.tab(id).unwrap().page, 0);
+                assert_eq!(ws.tab(id).unwrap().total_rows, None);
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    format!("{base} WHERE id > 5 LIMIT 50")
+                );
+                // The count ignores ORDER BY / LIMIT / OFFSET.
+                assert_eq!(
+                    ws.table_count_query(id, cx).unwrap(),
+                    "SELECT count(*) FROM \"public\".\"users\" WHERE id > 5"
+                );
+                ws.tab(id)
+                    .unwrap()
+                    .where_input
+                    .update(cx, |i, cx| i.set_value("", window, cx));
+
+                ws.go_page(id, PageMove::Next, cx);
+                ws.tab_mut(id).unwrap().headers = vec!["id".into()];
+                ws.toggle_sort(id, 0, window, cx);
+                assert_eq!(ws.tab(id).unwrap().page, 0);
+
+                // No LIMIT: every row, and nothing to page by.
+                limit.update(cx, |i, cx| i.set_value("", window, cx));
+                ws.tab_mut(id).unwrap().page = 3;
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    format!("{base} ORDER BY \"id\" ASC")
+                );
+                assert_eq!(page_size(""), None);
+                assert_eq!(page_size("0"), None);
+                assert_eq!(page_size("abc"), None);
+                assert_eq!(page_size(" 25 "), Some(25));
+            })
+            .unwrap();
+    }
+
+    /// A bad LIMIT is reported on the LIMIT box; one at the LIMIT keyword is
+    /// still the box before it.
+    #[gpui::test]
+    fn limit_errors_point_at_the_limit_box(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                let tab = ws.tab(id).unwrap();
+                let (filter, limit) = (tab.where_input.clone(), tab.limit_input.clone());
+                filter.update(cx, |i, cx| i.set_value("id >", window, cx));
+                limit.update(cx, |i, cx| i.set_value("ten", window, cx));
+                let sql = ws.table_query(id, cx);
+                let at = |s: &str| sql.find(s).unwrap() as u32 + 1;
+                assert_eq!(ws.clause_at(id, &sql, at("ten"), cx), Some(Clause::Limit));
+                assert_eq!(
+                    ws.clause_at(id, &sql, at(" LIMIT"), cx),
+                    Some(Clause::Where)
                 );
             })
             .unwrap();

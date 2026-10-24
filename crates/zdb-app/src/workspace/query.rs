@@ -206,6 +206,72 @@ impl Workspace {
         self.start_query(tab_id, base, shown, sort, cx);
     }
 
+    /// The pager: show another page (`LIMIT` rows) of a Table tab, keeping its
+    /// WHERE, ORDER BY and header sort. The last page needs the row count;
+    /// without one yet it is counted first (`count_rows`).
+    pub(super) fn go_page(&mut self, tab_id: u64, to: PageMove, cx: &mut Context<Self>) {
+        let Some(size) = self
+            .tab(tab_id)
+            .and_then(|t| tabs::page_size(&t.limit_input.read(cx).value()))
+        else {
+            return;
+        };
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        tab.page = match to {
+            PageMove::First => 0,
+            PageMove::Prev => tab.page.saturating_sub(1),
+            PageMove::Next => tab.page + 1,
+            PageMove::Last => match tab.total_rows {
+                Some(total) => total.saturating_sub(1) / size,
+                None => return self.count_rows(tab_id, cx),
+            },
+        };
+        self.reload_data(tab_id, cx);
+    }
+
+    /// `count(*)` a Table tab under its WHERE, then go to its last page.
+    fn count_rows(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(conn) = self.conn else { return };
+        let Some(sql) = self.table_count_query(tab_id, cx) else {
+            return;
+        };
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        tab.running = true;
+        self.status = "Counting rows…".into();
+        let db = self.db.clone();
+        let logged = sql.clone();
+        let fut = async move { drain_query(db.query(conn, sql)).await };
+        self.spawn_db(cx, fut, move |this, out, cx| {
+            let Some(tab) = this.tab_mut(tab_id) else {
+                return;
+            };
+            tab.running = false;
+            let total = out.rows.first().and_then(|row| match row.first() {
+                Some(CellValue::Text(n)) => n.parse::<usize>().ok(),
+                _ => None,
+            });
+            match (out.error, total) {
+                (None, Some(total)) => {
+                    tab.total_rows = Some(total);
+                    this.log.push(&logged, true);
+                    this.go_page(tab_id, PageMove::Last, cx);
+                }
+                (error, _) => {
+                    this.log.push(&logged, false);
+                    this.status = match error {
+                        Some(e) => format!("Error: {e}"),
+                        None => "Couldn't count the rows".into(),
+                    };
+                }
+            }
+        });
+        cx.notify();
+    }
+
     /// Start a new query for `tab_id`: remember it as the sort base, drop stale
     /// editability, then describe (for editability) and execute it.
     pub(super) fn run_new_query(&mut self, tab_id: u64, base: String, cx: &mut Context<Self>) {
@@ -289,6 +355,13 @@ impl Workspace {
             tab.new_row_idx = None;
             tab.last_sql = Some(sql.clone());
         }
+        // Where these rows start in the table (the OFFSET), as of the request.
+        let first_row = self.tab(tab_id).map_or(0, |tab| match tab.kind {
+            TabKind::Table { .. } => {
+                tabs::page_size(&tab.limit_input.read(cx).value()).map_or(0, |n| n * tab.page)
+            }
+            _ => 0,
+        });
         self.status = "Running…".into();
         log(format!("run: {sql}"));
         let db = self.db.clone();
@@ -328,6 +401,7 @@ impl Workspace {
                         tab.headers = headers.clone();
                         tab.rows = rows.clone();
                         tab.orig_rows = rows.clone();
+                        tab.first_row = first_row;
                         // Fresh rows just landed: keep the cell cursor where it
                         // was, clamped to the new result (none if it is empty).
                         // Single point every result passes through, so the
@@ -483,6 +557,10 @@ impl Workspace {
         // ORDER BY input and rebuild, instead of rewriting the SQL it produced
         // last time.
         if is_table {
+            // A new order starts from the first page.
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.page = 0;
+            }
             let clause = sort_clause(&headers, next);
             if let Some(input) = self.tab(tab_id).map(|t| t.order_input.clone()) {
                 input.update(cx, |state, cx| state.set_value(clause, window, cx));

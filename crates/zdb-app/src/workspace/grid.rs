@@ -297,6 +297,10 @@ impl TableDelegate for ResultDelegate {
         // it selects the row like any other cell.
         if col_ix == ROWNUM_COL {
             let weak = self.ws.clone();
+            let first = weak
+                .upgrade()
+                .and_then(|ws| ws.read(cx).tab(tab_id).map(|t| t.first_row))
+                .unwrap_or(0);
             return div()
                 .id(SharedString::from(format!("rownum-{row_ix}")))
                 .size_full()
@@ -307,7 +311,7 @@ impl TableDelegate for ResultDelegate {
                 .text_sm()
                 .text_color(c.fg_dim)
                 .cursor_pointer()
-                .child((row_ix + 1).to_string())
+                .child((first + row_ix + 1).to_string())
                 .on_click(move |_: &ClickEvent, _window, app| {
                     weak.update(app, |w, cx| w.set_cursor_row(tab_id, row_ix, cx))
                         .ok();
@@ -537,6 +541,16 @@ pub(crate) struct Tab {
     /// ORDER BY input (Table tabs). Header clicks write into it, so the text is
     /// the single source of truth for the generated `ORDER BY`.
     pub(crate) order_input: Entity<InputState>,
+    /// LIMIT input (Table tabs; empty = no limit). Also the page size.
+    pub(crate) limit_input: Entity<InputState>,
+    /// Table tabs: which page of `limit` rows is shown (`OFFSET page * limit`).
+    pub(crate) page: usize,
+    /// Number (0-based) of the result's first row in the whole table — the
+    /// page's OFFSET when the rows were fetched. The row gutter counts from it.
+    pub(crate) first_row: usize,
+    /// Table tabs: rows under the current WHERE, once "last page" has counted
+    /// them (forgotten when the boxes are applied again).
+    pub(crate) total_rows: Option<usize>,
     pub(crate) table: Entity<TableState<ResultDelegate>>,
     /// The grid's focus handle (a clone of the `TableState`'s). Kept here because
     /// `render_td` runs while that entity is being rendered and can't read it.
@@ -587,11 +601,21 @@ pub(crate) struct Tab {
     pub(crate) clause_error: Option<Clause>,
 }
 
-/// A Table tab's WHERE / ORDER BY box.
+/// A Table tab's WHERE / ORDER BY / LIMIT box.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Clause {
     Where,
     OrderBy,
+    Limit,
+}
+
+/// Where the pager goes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum PageMove {
+    First,
+    Prev,
+    Next,
+    Last,
 }
 
 /// Drop an editor's error marks. They are byte offsets into the text they
@@ -655,6 +679,7 @@ impl Tab {
         editor: Entity<InputState>,
         where_input: Entity<InputState>,
         order_input: Entity<InputState>,
+        limit_input: Entity<InputState>,
         table: Entity<TableState<ResultDelegate>>,
         cx: &App,
     ) -> Self {
@@ -669,6 +694,10 @@ impl Tab {
             editor,
             where_input,
             order_input,
+            limit_input,
+            page: 0,
+            first_row: 0,
+            total_rows: None,
             table,
             grid_focus,
             headers: Vec::new(),
@@ -714,6 +743,7 @@ impl Tab {
         .detach();
         let where_input = cx.new(|cx| InputState::new(window, cx));
         let order_input = cx.new(|cx| InputState::new(window, cx));
+        let limit_input = cx.new(|cx| InputState::new(window, cx));
         let table = make_grid(weak, id, window, cx);
         Tab::base(
             id,
@@ -722,6 +752,7 @@ impl Tab {
             editor,
             where_input,
             order_input,
+            limit_input,
             table,
             cx,
         )
@@ -757,6 +788,7 @@ impl Tab {
         .detach();
         let where_input = cx.new(|cx| InputState::new(window, cx));
         let order_input = cx.new(|cx| InputState::new(window, cx));
+        let limit_input = cx.new(|cx| InputState::new(window, cx));
         let table = make_grid(weak, id, window, cx);
         Tab::base(
             id,
@@ -765,12 +797,14 @@ impl Tab {
             editor,
             where_input,
             order_input,
+            limit_input,
             table,
             cx,
         )
     }
 
-    /// A table-browse tab; the WHERE / ORDER BY inputs re-run the query on Enter.
+    /// A table-browse tab; the WHERE / ORDER BY / LIMIT inputs re-run the query
+    /// on Enter.
     pub(crate) fn table(
         id: u64,
         schema: String,
@@ -808,7 +842,12 @@ impl Tab {
             cx,
         );
         let order_input = clause_input("order", "ORDER BY", "e.g. created_at DESC", window, cx);
-        for input in [&where_input, &order_input] {
+        let limit_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("none")
+                .default_value(super::ROW_LIMIT.to_string())
+        });
+        for input in [&where_input, &order_input, &limit_input] {
             cx.subscribe(input, move |this, _i, event: &InputEvent, cx| match event {
                 InputEvent::PressEnter { .. } => this.apply_where(id, cx),
                 InputEvent::Change => {
@@ -833,6 +872,7 @@ impl Tab {
             editor,
             where_input,
             order_input,
+            limit_input,
             table,
             cx,
         )

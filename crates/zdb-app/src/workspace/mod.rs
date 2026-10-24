@@ -12,7 +12,7 @@ use gpui::ClipboardItem;
 use gpui::{
     actions, div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context,
     Entity, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds,
     WindowControlArea,
 };
 use gpui_component::{
@@ -50,7 +50,7 @@ mod view;
 use autoscroll::AutoScroll;
 use colors::{palette, Colors};
 use conn::ConnForm;
-use grid::{Clause, Tab, TabKind};
+use grid::{Clause, PageMove, Tab, TabKind};
 pub use keynav::bind_nav_keys;
 use keynav::*;
 use modal::{Modal, ModalFocus};
@@ -148,6 +148,11 @@ pub struct Workspace {
     active: Option<usize>,
     /// Monotonic id source for tabs + the "Query N" counter.
     next_tab_id: u64,
+    /// Scroll state of the tab strip; the active tab it last saw, and the one
+    /// it last scrolled into view (see `render`).
+    tab_strip: ScrollHandle,
+    strip_seen: Option<u64>,
+    strip_revealed: Option<u64>,
     /// A table to open on the next render (set from windowless async contexts,
     /// e.g. the selftest, where no `&mut Window` is available).
     pending_open: Option<(String, String)>,
@@ -311,6 +316,9 @@ impl Workspace {
             tabs: Vec::new(),
             active: None,
             next_tab_id: 1,
+            tab_strip: ScrollHandle::new(),
+            strip_seen: None,
+            strip_revealed: None,
             pending_open: None,
             conn_key: auto.as_ref().map(|_| session::ENV_CONN_KEY.to_string()),
             session_ready: false,
