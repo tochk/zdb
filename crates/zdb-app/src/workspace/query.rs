@@ -4,7 +4,8 @@
 use super::*;
 use gpui_component::highlighter::{Diagnostic, DiagnosticSeverity};
 use gpui_component::RopeExt as _;
-use zdb_db::DbError;
+use grid::TabSession;
+use zdb_db::{DbError, Session};
 
 const LOG_CAP: usize = 500;
 
@@ -39,6 +40,8 @@ struct QueryOutcome {
     affected: u64,
     elapsed: std::time::Duration,
     error: Option<DbError>,
+    /// The tab's session is left inside a transaction.
+    in_transaction: bool,
 }
 
 /// Collect a query's whole event stream into one `QueryOutcome`.
@@ -53,6 +56,7 @@ async fn drain_query(mut rx: zdb_db::QueryStream) -> QueryOutcome {
                 out.elapsed = elapsed;
             }
             QueryEvent::Failed(e) => out.error = Some(e),
+            QueryEvent::Transaction(t) => out.in_transaction = t,
         }
     }
     out
@@ -60,6 +64,42 @@ async fn drain_query(mut rx: zdb_db::QueryStream) -> QueryOutcome {
 
 impl Workspace {
     // ---- query execution -------------------------------------------------
+
+    /// `tab_id`'s own database session: a connection only that tab uses, so
+    /// its work never queues behind another tab's and Stop cancels only its
+    /// own. Dialed by the first job given to it; closed with the tab.
+    pub(super) fn tab_session(&mut self, tab_id: u64) -> Option<Session> {
+        let session = Session::new(self.conn?, tab_id);
+        let db = self.db.clone();
+        let tab = self.tab_mut(tab_id)?;
+        if tab.db_session.as_ref().map(|s| s.session) != Some(session) {
+            tab.db_session = Some(TabSession { db, session });
+        }
+        Some(session)
+    }
+
+    /// Start a run of `tab_id`: whatever it still has in flight is stale from
+    /// here on. Returns the run's number for `current_run`.
+    fn begin_run(&mut self, tab_id: u64) -> Option<u64> {
+        let tab = self.tab_mut(tab_id)?;
+        tab.run_gen += 1;
+        tab.running = true;
+        Some(tab.run_gen)
+    }
+
+    /// `tab_id`, if run `gen` is still its latest (not stopped or superseded).
+    fn current_run(&mut self, tab_id: u64, gen: u64) -> Option<&mut Tab> {
+        self.tab_mut(tab_id).filter(|t| t.run_gen == gen)
+    }
+
+    /// Record whether a finished query left the tab's session in a
+    /// transaction — for a stopped run too: the session is in that state
+    /// either way (a tab's jobs run in order, so a later run reports later).
+    fn note_transaction(&mut self, tab_id: u64, in_transaction: bool) {
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.in_transaction = in_transaction;
+        }
+    }
 
     /// Run the active tab: a Table tab rebuilds its query from the CURRENT
     /// filter input (not the stale `base_sql`, which still holds the last
@@ -130,21 +170,22 @@ impl Workspace {
     /// Execute an `EXPLAIN …` query and collect the `QUERY PLAN` text into the
     /// tab's plan view (leaves the grid untouched).
     pub(super) fn run_explain(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
-        let Some(conn) = self.conn else {
+        let Some(session) = self.tab_session(tab_id) else {
             self.status = "Not connected".into();
             cx.notify();
             return;
         };
-        if let Some(tab) = self.tab_mut(tab_id) {
-            tab.running = true;
-        }
+        let Some(gen) = self.begin_run(tab_id) else {
+            return;
+        };
         self.status = "Explaining…".into();
         log(format!("explain: {sql}"));
         let db = self.db.clone();
         let logged = sql.clone();
-        let fut = async move { drain_query(db.query(conn, sql)).await };
+        let fut = async move { drain_query(db.query(session, sql)).await };
         self.spawn_db(cx, fut, move |this, out, _cx| {
-            let Some(tab) = this.tab_mut(tab_id) else {
+            this.note_transaction(tab_id, out.in_transaction);
+            let Some(tab) = this.current_run(tab_id, gen) else {
                 return;
             };
             tab.running = false;
@@ -206,6 +247,74 @@ impl Workspace {
         self.start_query(tab_id, base, shown, sort, cx);
     }
 
+    /// The pager: show another page (`LIMIT` rows) of a Table tab, keeping its
+    /// WHERE, ORDER BY and header sort. The last page needs the row count;
+    /// without one yet it is counted first (`count_rows`).
+    pub(super) fn go_page(&mut self, tab_id: u64, to: PageMove, cx: &mut Context<Self>) {
+        let Some(size) = self
+            .tab(tab_id)
+            .and_then(|t| tabs::page_size(&t.limit_input.read(cx).value()))
+        else {
+            return;
+        };
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        tab.page = match to {
+            PageMove::First => 0,
+            PageMove::Prev => tab.page.saturating_sub(1),
+            PageMove::Next => tab.page + 1,
+            PageMove::Last => match tab.total_rows {
+                Some(total) => total.saturating_sub(1) / size,
+                None => return self.count_rows(tab_id, cx),
+            },
+        };
+        self.reload_data(tab_id, cx);
+    }
+
+    /// `count(*)` a Table tab under its WHERE, then go to its last page.
+    fn count_rows(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(sql) = self.table_count_query(tab_id, cx) else {
+            return;
+        };
+        let Some(session) = self.tab_session(tab_id) else {
+            return;
+        };
+        let Some(gen) = self.begin_run(tab_id) else {
+            return;
+        };
+        self.status = "Counting rows…".into();
+        let db = self.db.clone();
+        let logged = sql.clone();
+        let fut = async move { drain_query(db.query(session, sql)).await };
+        self.spawn_db(cx, fut, move |this, out, cx| {
+            this.note_transaction(tab_id, out.in_transaction);
+            let Some(tab) = this.current_run(tab_id, gen) else {
+                return;
+            };
+            tab.running = false;
+            let total = out.rows.first().and_then(|row| match row.first() {
+                Some(CellValue::Text(n)) => n.parse::<usize>().ok(),
+                _ => None,
+            });
+            match (out.error, total) {
+                (None, Some(total)) => {
+                    tab.total_rows = Some(total);
+                    this.log.push(&logged, true);
+                    this.go_page(tab_id, PageMove::Last, cx);
+                }
+                (error, _) => {
+                    this.log.push(&logged, false);
+                    this.status = match error {
+                        Some(e) => format!("Error: {e}"),
+                        None => "Couldn't count the rows".into(),
+                    };
+                }
+            }
+        });
+        cx.notify();
+    }
+
     /// Start a new query for `tab_id`: remember it as the sort base, drop stale
     /// editability, then describe (for editability) and execute it.
     pub(super) fn run_new_query(&mut self, tab_id: u64, base: String, cx: &mut Context<Self>) {
@@ -237,18 +346,26 @@ impl Workspace {
         }
         // The cell cursor is deliberately left alone: `run_sql` clamps it to the
         // rows that come back, so a refresh / re-sort keeps your place.
-        self.describe_async(tab_id, base, cx);
         self.run_sql(tab_id, shown, cx);
+        self.describe_async(tab_id, base, cx);
     }
 
-    pub(super) fn describe_async(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
-        let Some(conn) = self.conn else { return };
+    /// Find out whether `sql`'s rows are editable, as part of the run just
+    /// started (it queues behind that run on the tab's session, and is
+    /// dropped with it).
+    fn describe_async(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
+        let Some(session) = self.tab_session(tab_id) else {
+            return;
+        };
+        let Some(gen) = self.tab(tab_id).map(|t| t.run_gen) else {
+            return;
+        };
         let db = self.db.clone();
         self.spawn_db(
             cx,
-            async move { db.describe(conn, sql).await },
+            async move { db.describe(session, sql).await },
             move |this, res, _cx| {
-                let Some(tab) = this.tab_mut(tab_id) else {
+                let Some(tab) = this.current_run(tab_id, gen) else {
                     return;
                 };
                 match res {
@@ -267,11 +384,11 @@ impl Workspace {
 
     /// Execute `sql` for display in `tab_id` (does not change editability or sort base).
     pub(super) fn run_sql(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
-        let Some(conn) = self.conn else {
+        if self.conn.is_none() {
             self.status = "Not connected".into();
             cx.notify();
             return;
-        };
+        }
         if sql.trim().is_empty() {
             if let Some(tab) = self.tab_mut(tab_id) {
                 tab.running = false;
@@ -280,23 +397,36 @@ impl Workspace {
             cx.notify();
             return;
         }
+        let Some(session) = self.tab_session(tab_id) else {
+            return;
+        };
+        let Some(gen) = self.begin_run(tab_id) else {
+            return;
+        };
+        // Where these rows start in the table (the OFFSET), as of the request,
+        // and whether they come back end-first (a page read from the far end).
+        let page = self.table_page_of(tab_id, &sql, cx);
+        let (first_row, reversed) = page;
         {
             let Some(tab) = self.tab_mut(tab_id) else {
                 return;
             };
-            tab.running = true;
             tab.editing = None;
             tab.new_row_idx = None;
             tab.last_sql = Some(sql.clone());
+            tab.last_page = page;
         }
         self.status = "Running…".into();
         log(format!("run: {sql}"));
         let db = self.db.clone();
         let logged = sql.clone();
-        let fut = async move { drain_query(db.query(conn, sql)).await };
+        let fut = async move { drain_query(db.query(session, sql)).await };
         self.spawn_db(cx, fut, move |this, out, cx| {
-            // The tab may have been closed while the query ran.
-            let Some(tab) = this.tab_mut(tab_id) else {
+            this.note_transaction(tab_id, out.in_transaction);
+            // The tab may have been closed or stopped while the query ran (or
+            // run again).
+            let Some(tab) = this.current_run(tab_id, gen) else {
+                this.log.push(&logged, out.error.is_none());
                 return;
             };
             tab.running = false;
@@ -306,11 +436,15 @@ impl Workspace {
             grid::clear_marks(&editor, cx);
             let QueryOutcome {
                 headers,
-                rows,
+                mut rows,
                 affected,
                 elapsed,
                 error,
+                ..
             } = out;
+            if reversed {
+                rows.reverse();
+            }
             let status = match error {
                 Some(e) => {
                     let s = format!("Error: {e}");
@@ -328,6 +462,7 @@ impl Workspace {
                         tab.headers = headers.clone();
                         tab.rows = rows.clone();
                         tab.orig_rows = rows.clone();
+                        tab.first_row = first_row;
                         // Fresh rows just landed: keep the cell cursor where it
                         // was, clamped to the new result (none if it is empty).
                         // Single point every result passes through, so the
@@ -342,6 +477,7 @@ impl Workspace {
                     };
                     table.update(cx, |ts, cx| {
                         ts.delegate_mut().set(&headers, rows);
+                        ts.delegate_mut().fit_gutter(first_row + n);
                         ts.refresh(cx);
                         match cursor {
                             Some((r, _)) => ts.set_selected_row(r, cx),
@@ -361,12 +497,23 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Stop the active tab's run. The tab is free again at once — whatever
+    /// comes back for the stopped run is dropped — while the server cancels it
+    /// in the background (only this tab's session: other tabs' work goes on).
     pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
-        if let Some(conn) = self.conn {
-            self.db.cancel(conn);
-            self.status = "Cancel requested".into();
-            cx.notify();
+        let Some(tab) = self.active_id().and_then(|id| self.tab_mut(id)) else {
+            return;
+        };
+        if !tab.running {
+            return;
         }
+        tab.running = false;
+        tab.run_gen += 1;
+        if let Some(s) = &tab.db_session {
+            s.db.cancel(s.session);
+        }
+        self.status = "Cancelled".into();
+        cx.notify();
     }
 
     // ---- formatting ------------------------------------------------------
@@ -483,6 +630,10 @@ impl Workspace {
         // ORDER BY input and rebuild, instead of rewriting the SQL it produced
         // last time.
         if is_table {
+            // A new order starts from the first page.
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.page = 0;
+            }
             let clause = sort_clause(&headers, next);
             if let Some(input) = self.tab(tab_id).map(|t| t.order_input.clone()) {
                 input.update(cx, |state, cx| state.set_value(clause, window, cx));
@@ -678,6 +829,29 @@ mod tests {
                     sorted_sql("SELECT * FROM t", &tab.headers, tab.sort_state),
                     order_by_sql("SELECT * FROM t", "qty", ColumnSort::Ascending)
                 );
+            })
+            .unwrap();
+    }
+
+    /// Stop frees the tab at once; whatever the stopped run sends back later
+    /// is dropped.
+    #[gpui::test]
+    fn stop_frees_the_tab_and_drops_the_late_result(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.close_modal(cx);
+                ws.open_query_tab(window, cx);
+                let id = ws.active_id().unwrap();
+                let gen = ws.begin_run(id).unwrap();
+                assert!(ws.tab(id).unwrap().running);
+                ws.cancel(cx);
+                assert!(!ws.tab(id).unwrap().running);
+                assert!(ws.current_run(id, gen).is_none());
+                // Nothing running: Stop does nothing.
+                let now = ws.tab(id).unwrap().run_gen;
+                ws.cancel(cx);
+                assert_eq!(ws.tab(id).unwrap().run_gen, now);
             })
             .unwrap();
     }

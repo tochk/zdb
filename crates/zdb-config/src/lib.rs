@@ -32,7 +32,14 @@ pub struct Settings {
     pub vim_navigation: bool,
     /// Reopen each connection's tabs (see `tabs.rs`) when connecting to it.
     pub restore_tabs: bool,
+    /// Most Postgres connections the app opens per database for running
+    /// queries (its connection pool). A tab inside a transaction holds one
+    /// more until it ends.
+    pub pool_size: usize,
 }
+
+/// `Settings::pool_size` range the UI allows.
+pub const POOL_SIZE_MAX: usize = 32;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -44,6 +51,7 @@ impl Default for Settings {
             esc_saves_edit: false,
             vim_navigation: false,
             restore_tabs: true,
+            pool_size: 4,
         }
     }
 }
@@ -233,6 +241,7 @@ mod tests {
             esc_saves_edit: true,
             vim_navigation: true,
             restore_tabs: false,
+            pool_size: 7,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -243,6 +252,7 @@ mod tests {
         assert_eq!(back.window.unwrap().width, 1200.);
         assert!(back.esc_saves_edit && back.vim_navigation);
         assert!(!back.restore_tabs);
+        assert_eq!(back.pool_size, 7);
         assert_eq!(back.connections[0].id, "abc");
     }
 
@@ -273,6 +283,7 @@ mod tests {
         assert!(!s.esc_saves_edit && !s.vim_navigation);
         // Tab restore is on unless the file says otherwise.
         assert!(s.restore_tabs);
+        assert_eq!(s.pool_size, 4);
     }
 
     #[test]

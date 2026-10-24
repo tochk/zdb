@@ -99,6 +99,7 @@ impl Workspace {
                         table: table.clone(),
                         filter: tab.where_input.read(cx).value().to_string(),
                         order_by: tab.order_input.read(cx).value().to_string(),
+                        limit: Some(tab.limit_input.read(cx).value().to_string()),
                     },
                 },
             })
@@ -182,6 +183,7 @@ impl Workspace {
                     table,
                     filter,
                     order_by,
+                    limit,
                 } => {
                     if self.tabs.iter().any(|t| {
                         matches!(&t.kind, TabKind::Table { schema: s, table: tt }
@@ -194,6 +196,11 @@ impl Workspace {
                         .update(cx, |i, cx| i.set_value(filter.clone(), window, cx));
                     t.order_input
                         .update(cx, |i, cx| i.set_value(order_by.clone(), window, cx));
+                    // Files from before the LIMIT box keep its default.
+                    if let Some(limit) = limit {
+                        t.limit_input
+                            .update(cx, |i, cx| i.set_value(limit.clone(), window, cx));
+                    }
                     t.needs_load = true;
                     t
                 }
@@ -260,8 +267,10 @@ mod tests {
         ws.open_table_tab("public".into(), "users".into(), window, cx);
         let tab = ws.active_tab().unwrap();
         let (filter, order) = (tab.where_input.clone(), tab.order_input.clone());
+        let limit = tab.limit_input.clone();
         filter.update(cx, |i, cx| i.set_value("id > 5", window, cx));
         order.update(cx, |i, cx| i.set_value("\"name\" DESC", window, cx));
+        limit.update(cx, |i, cx| i.set_value("100", window, cx));
         ws.focus_scratch_tab(window, cx);
         ws.activate_tab(1, window, cx);
     }
@@ -295,7 +304,7 @@ mod tests {
                 assert!(ws.tabs.iter().all(|t| t.last_sql.is_none()));
                 assert_eq!(
                     ws.table_query(ws.tabs[1].id, cx),
-                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 ORDER BY \"name\" DESC LIMIT 500"
+                    "SELECT * FROM \"public\".\"users\" WHERE id > 5 ORDER BY \"name\" DESC LIMIT 100"
                 );
                 // A new tab doesn't reuse the restored tab's number.
                 ws.open_query_tab(window, cx);

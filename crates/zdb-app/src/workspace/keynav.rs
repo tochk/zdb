@@ -17,11 +17,12 @@
 //! - Tab everywhere else is ours (`FocusNextField` on `"zdb"`), not
 //!   gpui-component's `Root` binding: that one walks EVERY tab stop in the
 //!   window, behind an open dialog too. Only the filter box, the tree, the
-//!   editor / WHERE / ORDER BY and the grid are tab stops (the panes' buttons
-//!   opt out), so Tab walks those fields in order; with a dialog up it stays in
-//!   the dialog (`modal.rs`). Panes that use Tab themselves win by depth: grid
-//!   cells, code-editor indent, and the terminal, where `NoAction` masks every
-//!   outer binding so the key reaches the shell.
+//!   editor / WHERE / ORDER BY / LIMIT and the grid are tab stops (the panes'
+//!   buttons opt out), so Tab walks those fields in order — INTO the grid and on
+//!   out of it, never cell by cell (only a cell being edited takes Tab: stage +
+//!   step sideways); with a dialog up it stays in the dialog (`modal.rs`). Panes
+//!   that use Tab themselves win by depth: code-editor indent, and the terminal,
+//!   where `NoAction` masks every outer binding so the key reaches the shell.
 
 use super::*;
 use gpui::{DismissEvent, KeyBinding, KeyDownEvent, NoAction, Pixels, Point};
@@ -131,8 +132,8 @@ pub fn bind_nav_keys(cx: &mut App) {
         KeyBinding::new("cmd-end", GridLast, GRID),
         KeyBinding::new("pageup", GridPageUp, GRID),
         KeyBinding::new("pagedown", GridPageDown, GRID),
-        KeyBinding::new("tab", GridNextCell, GRID),
-        KeyBinding::new("shift-tab", GridPrevCell, GRID),
+        // No `tab` here: Tab moves between fields (filter → … → grid → next), it
+        // doesn't walk the cells; the arrows do that.
         KeyBinding::new("enter", GridEdit, GRID),
         KeyBinding::new("f2", GridEdit, GRID),
         KeyBinding::new("ctrl-c", GridCopyCell, GRID),
@@ -229,7 +230,6 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
         "RESULT GRID",
         &[
             ("Move cell", "Arrows"),
-            ("Next / previous cell", "Tab / Shift+Tab"),
             ("Row start / end", "Home / End"),
             ("First / last cell", "Ctrl+Home / Ctrl+End"),
             ("Page up / down", "PgUp / PgDn"),
@@ -537,6 +537,21 @@ impl Workspace {
 
     pub(super) fn set_restore_tabs(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.restore_tabs = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Connections per database (the pool size), kept within
+    /// `1..=POOL_SIZE_MAX`; takes effect on the live connection at once.
+    pub(super) fn set_pool_size(&mut self, size: usize, cx: &mut Context<Self>) {
+        let size = size.clamp(1, zdb_config::POOL_SIZE_MAX);
+        if size == self.settings.pool_size {
+            return;
+        }
+        self.settings.pool_size = size;
+        if let Some(conn) = self.conn {
+            self.db.set_pool_size(conn, size);
+        }
         self.save_settings();
         cx.notify();
     }

@@ -15,11 +15,12 @@ crates/
   zdb-db/      data layer: async DbHandle (own Tokio runtime thread + channels),
                streaming query exec, schema introspection, inline-edit engine
                (edit.rs), query editability describe (actor.rs run_describe),
-               rustls(ring) TLS. Auto-reconnect: worker's `ensure_conn` redials
-               (same ConnId) when the client is closed; a query whose SUBMIT hit
-               a silently-dead socket retries once (safe — nothing reached the
-               server; mid-stream failures never retry). 10s connect_timeout +
-               120s keepalive in config.rs.
+               rustls(ring) TLS. A ConnId owns a connection POOL (see "DB pool"
+               below). Auto-reconnect: dead pooled connections are dropped and
+               redialed; a job whose SUBMIT hit a silently-dead socket retries
+               once on a fresh one (safe — nothing reached the server;
+               mid-stream failures never retry). 10s connect_timeout + 120s
+               keepalive in config.rs.
   zdb-config/  JSON settings (connections, theme, keymap) + OS-keychain passwords
                (secret.rs, keyring; per-OS backend).
   zdb-app/     gpui app (bin `zdb`): workspace/ (the UI — ONE `Workspace` gpui
@@ -377,14 +378,44 @@ The WSL host can run Windows exes directly:
 - The per-tab toolbar (`render_tab_body`): Run toggles to a red Stop while the tab is
   `running`; `+`/`-`/refresh are ALWAYS shown and disabled when N/A (`+` needs an
   editable result; `-` needs a selected row — its glyph is red only when enabled,
-  else neutral `c.fg`; refresh needs the tab's `base_sql`). `reload_data(tab_id)` re-runs
+  else uncolored so the disabled button dims it; refresh needs the tab's `base_sql`). `reload_data(tab_id)` re-runs
   it keeping filter + sort: a Table tab REBUILDS from its WHERE / ORDER BY boxes (as Run
   does — `base_sql` predates a header sort, which only `run_sql`s), a Query tab re-runs
   `base_sql` under its header sort. (`render_center` = tab strip + active tab body |
-  welcome pane.)
+  welcome pane.) Groups, divided by 1px rules: row actions | pager (Table tabs) |
+  Explain / Export / Copy (/ Format) as ICON buttons. Toolbar icons get NO explicit
+  `text_color` (except the semantic red/green ones): inside a gpui-component `Button`
+  the icon inherits the button's text color, which is what dims it when disabled — a
+  fixed color made a disabled button look live.
+- **Pager** (`view.rs::render_pager`, `query.rs::go_page`): `« ‹ 501–1000 of N › »`. A page
+  is the LIMIT box's rows (`tabs::page_size`; no LIMIT = no paging); `Tab.page` → `OFFSET
+  page*limit`; applying the boxes / a header sort go back to page 1, refresh stays. It holds
+  still while running and over staged edits (a page turn re-reads rows → would drop them).
+  "Last" needs the total: `count_rows` runs `SELECT count(*) … [WHERE]` ONLY then (not per
+  load — slow on big tables), caching `Tab.total_rows` (forgotten by `apply_where`), which
+  also adds "of N". `Tab.first_row` (the OFFSET as of the request) numbers the row gutter
+  (`fit_gutter` widens it for 7+ digit numbers) and the label, so page 2 counts from 501.
+  **Far pages are read from the end**: OFFSET makes Postgres walk every skipped row, so
+  with the total known, a page nearer the end than the start runs with the ORDER BY
+  reversed (`util::reverse_order`; bails on `USING`, comments, `$$`) and OFFSET = rows
+  AFTER it — the last page has none, instant with an index (10M rows: 1ms vs 700ms).
+  `TableSql.reversed` says so; `run_sql` flips the rows back (`table_page_of` →
+  `Tab.last_page`, so a reload of `last_sql` after Apply still knows). No ORDER BY = no
+  reversal: an unordered table has no "end" to read from, so Last = count + OFFSET.
+- **Tab strip scrolls** (`render_tab_strip`): the chips sit in an `overflow_x_scroll`
+  container (a vertical wheel scrolls it — gpui maps it onto an x-only scroller), with `+` /
+  scratch right after it, never scrolled away. The active chip is revealed by
+  `tabs.rs::reveal_active_chip`, NOT `ScrollHandle::scroll_to_item`: gpui applies that in
+  prepaint BEFORE refreshing the scroller's own bounds, so on the first frame with chips it
+  measured against the empty (0-wide) strip and scrolled a chip too far (the restored active
+  tab started hidden). We reveal one frame after the active tab changes (`strip_seen` /
+  `strip_revealed`), from chip + strip bounds of the same finished layout, and only on a
+  change — scrolling the strip by hand isn't undone.
 - **Table-tab filter bar** (`view.rs::render_filter_bar`) is styled after Zed's
   "Search threads…" box: one full-width strip, muted icon + SQL keyword, BORDERLESS
-  `Input` (`appearance(false)`), a clear `×` once non-empty (clears + re-runs), mono font.
+  `Input` (`appearance(false)`), a clear `×` once non-empty (clears + re-runs; not on LIMIT,
+  where empty = every row), mono font. Boxes: WHERE | ORDER BY | LIMIT (default 500, saved
+  per tab in the session file as `limit`; older files without it get the default).
   Focus shows as the half's keyword/icon brightening (no border); red = the last run
   failed on that box's text (`Tab.clause_error`, see error marks below).
 - **Live theme switch / Settings modal** (`render_settings`, gear in the sidebar
@@ -403,7 +434,9 @@ The WSL host can run Windows exes directly:
   selection, and staged edits. Key rules baked in:
   - **Table-tab sorting rebuilds, never rewrites.** A Table tab's SQL is generated by
     `tabs.rs::table_query` from its own parts: `SELECT * FROM "s"."t" [WHERE <where_input>]
-    [ORDER BY <order_input>] LIMIT 500`. A header click (`query.rs::toggle_sort`) writes
+    [ORDER BY <order_input>] [LIMIT <limit_input>] [OFFSET page*limit]` (`TableSql`, which
+    also records where each box's text starts — error marks — and the `count(*)` form for
+    the pager). A header click (`query.rs::toggle_sort`) writes
     `"col" ASC|DESC` into `order_input` and regenerates — so the ORDER BY text field (next
     to WHERE in the table toolbar, Enter re-runs) is the single source of truth, and typing
     in it clears `sort_state` (header arrows off). Do NOT re-parse the previous SQL. Query /
@@ -417,7 +450,8 @@ The WSL host can run Windows exes directly:
     `apply_pending` capture `tab_id` and do `this.tab_mut(tab_id)` inside the result closure,
     bailing if the tab was closed mid-query. DON'T assume the active tab is still the one
     that issued the query. The per-result selection clear lives here, scoped to that tab's
-    widget.
+    widget. Run handlers also capture `Tab.run_gen` (`begin_run` / `current_run`): a result
+    for a run that was stopped or superseded is dropped.
   - `ResultDelegate` carries a `tab_id`; `render_th`/`render_td` resolve `ws.tab(tab_id)`
     for editing/sort/edited-cell state (NOT global fields).
   - Tables open focus-if-open-else-new (`open_table_tab`); scratch is a SINGLETON
@@ -440,6 +474,54 @@ The WSL host can run Windows exes directly:
     input there panics (`root.rs` "window first layer should be a Root").
   - Opening a tab needs `&mut Window`; from windowless async contexts (the selftest) set
     `pending_open` and let `render()` consume it next frame.
+
+- **DB pool** (`zdb-db/src/actor.rs`). Postgres runs ONE statement at a time per
+  connection, and zdb used to have one connection: every tab, the tree, describe and the
+  pager's count queued on it (a 30s count froze every other tab), and `cancel` hit whatever
+  that connection happened to be running — often ANOTHER tab's query ("other tabs stop
+  loading after a cancel"). Now each `ConnId` has a pool like Go's `database/sql`: a job
+  borrows an idle connection, dials one while fewer than the pool size are open, else
+  waits; idle ones close after 5 min (the newest stays warm). Size = Settings →
+  "Connections per database" (`Settings.pool_size`, default 4, `set_pool_size` live).
+  (A connection PER TAB was tried first and rejected by the user — don't go back to it.)
+  - Jobs belong to a `Session { conn, id }`: the app uses the tab id (`query.rs::
+    tab_session`; tab ids start at 1), introspection `Session::SHARED` (0, what a bare
+    `ConnId` converts to). A session's jobs run ONE AT A TIME in order (a tab's query →
+    describe → …); the shared session's run side by side. `Tab.db_session` holds a
+    `TabSession` whose `Drop` sends `close_session` (any tab-removal path).
+  - **Transaction pinning.** A run that leaves a transaction open keeps its connection
+    pinned to its session until a later run ends it, or the session closes (connection
+    closed → server rolls back). Detected exactly: after a run that MIGHT begin one
+    (`may_begin`: mentions BEGIN/START) or ran pinned, `in_transaction` asks
+    `SELECT now() <> statement_timestamp()` (inside a block `now()` is the block's start;
+    error 25P02 = aborted block, still in it) — tokio-postgres drops the protocol's
+    ReadyForQuery status byte, so there's no direct way. Reported to the UI as
+    `QueryEvent::Transaction(bool)` (always sent last for queries) → `Tab.in_transaction`
+    → amber dot on the chip + "Transaction open" toolbar badge. Pinned connections sit
+    OUTSIDE the pool size (`ConnState.pinned`), so a forgotten BEGIN can't starve the rest.
+  - **No other session state survives.** `may_change_session` (SET, temp, PREPARE,
+    LISTEN, DECLARE, advisory locks — whole-word, any case; a hit in a string just costs a
+    round trip) marks the connection dirty — kept across a pinned stretch, so a temp table
+    made inside a transaction is caught when it ends — and it's `DISCARD ALL`ed before
+    going back to the pool, then `clear_type_cache()` (DISCARD deallocates the statements
+    tokio-postgres caches type lookups in).
+  - **Exact cancel**: `cancel(session)` bumps the session's `watch` to its last job
+    number; the running job sends a cancel request, queued ones fail with
+    `DbError::Cancelled`, and the connection is handed back only AFTER the cancel request
+    has landed — Postgres applies a cancel to whatever the backend runs when it arrives
+    (ignored while idle), so a late one would hit the next borrower.
+  - The worker loop alone owns every pool (no locks): jobs report back through its own
+    sender (`Command::JobDone` / `Dialed`). Dial failure fails the first waiting job, or
+    all of them when no live connection could come back. The TLS connector is built once
+    per connection and reused by every dial and cancel (verifying modes load the OS trust
+    store — slow on Windows).
+  - UI side, Stop (`query.rs::cancel`) frees the tab at once (`running = false`,
+    `run_gen` bumped so the late result is dropped). `describe` is queued AFTER the run.
+  Tests: `crates/zdb-db/tests/sessions.rs` (parallel sessions, pool cap, cancel isolation
+  + queued jobs, pinning across runs incl. aborted blocks, no SET/temp leaks incl. via a
+  transaction, close rolls back). NOTE when reading `pg_stat_activity` while testing: an
+  idle connection shows its LAST statement, which is often the describe's Parse of the
+  user SQL or the `now() <> statement_timestamp()` check.
 
 - **Saved tabs per connection** (`workspace/session.rs`, `zdb-config/src/tabs.rs`).
   Each connection's tab set — order, active index, and per tab: title + kind +
@@ -486,8 +568,8 @@ The WSL host can run Windows exes directly:
 
 - **Keyboard navigation** (`workspace/keynav.rs`; bindings in `bind_nav_keys`, called
   from `main.rs` AFTER `gpui_component::init`; every handler is on the workspace
-  root via `view.rs::nav_actions`). Grid: arrows / Tab / Home / End / Ctrl+Home/End /
-  PgUp/PgDn move the cell cursor, Enter / F2 / typing edits, Ctrl+C copies the cell.
+  root via `view.rs::nav_actions`). Grid: arrows / Home / End / Ctrl+Home/End /
+  PgUp/PgDn move the cell cursor (NOT Tab — see below), Enter / F2 / typing edits, Ctrl+C copies the cell.
   Panes: Ctrl+1 tree, Ctrl+2 editor (WHERE on Table tabs), Ctrl+3 grid; Ctrl+Tab /
   Ctrl+Shift+Tab / Ctrl+W tabs; Ctrl+S applies the staged batch. Settings has two
   live checkboxes: "Esc saves cell edit" and "Vim navigation". Mechanics that cost
@@ -548,8 +630,10 @@ The WSL host can run Windows exes directly:
     and behind open dialogs. We bind `tab`/`shift-tab` → `FocusNextField`/`PrevField` on
     `"zdb"` (`modal.rs::step_focus`), opt the panes' Buttons out (`.tab_stop(false)`) and
     make the tree + grid handles tab stops, so Tab walks filter box → tree → editor |
-    WHERE → ORDER BY → grid (landing on the grid puts the cursor on a cell). Panes that use
-    Tab win by depth: grid cells, code-editor indent, `AcceptCompletion` on `"Input"`
+    WHERE → ORDER BY → LIMIT → grid → (wraps) — INTO the grid and on OUT of it on the next
+    press, never cell by cell (the user's call; landing on the grid puts the cursor on a
+    cell). Only a cell being EDITED takes Tab (`"GridEdit"`: stage + step sideways). Panes
+    that use Tab win by depth: code-editor indent, `AcceptCompletion` on `"Input"`
     (Tab takes the highlighted completion, Zed-style). `FocusHandle::tab_stop` writes the
     SHARED focus entry and every `track_focus` clones from it, so setting it on our clone
     of a widget's private handle (TableState) takes effect.

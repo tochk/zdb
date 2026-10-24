@@ -4,7 +4,7 @@
 //! optionally `ZDB_TEST_PASSWORD`/`ZDB_TEST_PORT`). No docker here, so these run
 //! against a native server. See the dev-env memory.
 
-use zdb_db::{CellValue, ConnectionConfig, DbHandle, QueryEvent, SslMode};
+use zdb_db::{CellValue, ConnectionConfig, DbHandle, QueryEvent, Session, SslMode};
 
 fn test_config() -> Option<ConnectionConfig> {
     let host = std::env::var("ZDB_TEST_HOST").ok()?;
@@ -32,6 +32,7 @@ async fn collect(
             QueryEvent::Rows(mut r) => rows.append(&mut r),
             QueryEvent::Done { affected: a, .. } => affected = a,
             QueryEvent::Failed(e) => panic!("query failed: {e}"),
+            QueryEvent::Transaction(_) => {}
         }
     }
     (columns, rows, affected)
@@ -60,15 +61,19 @@ async fn select_values_and_nulls() {
 }
 
 #[tokio::test]
-async fn dml_roundtrip_in_one_session() {
+async fn dml_roundtrip_in_one_transaction() {
     let Some(cfg) = test_config() else {
         eprintln!("skipping: ZDB_TEST_* not set");
         return;
     };
     let db = DbHandle::spawn();
     let conn = db.connect(cfg).await.expect("connect");
+    // Pooled: an open transaction keeps the session on one connection, so
+    // the temp table is there for every run until it ends.
+    let conn = Session::new(conn, 1);
 
-    // Temp table lives for the session; one ConnId == one session.
+    let mut rx = db.query(conn, "BEGIN");
+    let (_, _, _) = collect(&mut rx).await;
     let mut rx = db.query(conn, "CREATE TEMP TABLE t (id int primary key, name text)");
     let (_, _, _) = collect(&mut rx).await;
 
@@ -86,6 +91,9 @@ async fn dml_roundtrip_in_one_session() {
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[1][1], CellValue::Text("z".into()));
     assert_eq!(rows[2][1], CellValue::Null);
+
+    let mut rx = db.query(conn, "ROLLBACK");
+    let (_, _, _) = collect(&mut rx).await;
 }
 
 #[tokio::test]

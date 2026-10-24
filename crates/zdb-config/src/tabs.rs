@@ -42,6 +42,9 @@ pub enum SavedTabKind {
         filter: String,
         #[serde(default)]
         order_by: String,
+        /// `None` in files from before the LIMIT box: the default applies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<String>,
     },
 }
 
@@ -170,6 +173,7 @@ mod tests {
                         table: "users".into(),
                         filter: "id > 5".into(),
                         order_by: "\"name\" DESC".into(),
+                        limit: Some("100".into()),
                     },
                 },
                 SavedTab {
@@ -212,6 +216,7 @@ mod tests {
                 table: "t".into(),
                 filter: String::new(),
                 order_by: String::new(),
+                limit: None,
             }
         );
     }
