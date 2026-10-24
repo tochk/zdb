@@ -50,11 +50,13 @@ fn split_trailing_limit(q: &str) -> (&str, Option<&str>) {
     (q, None)
 }
 
-/// The single SQL statement containing byte offset `cursor`, trimmed. Splits on
-/// top-level `;`, honoring single/double quotes, line (`--`) and block (`/* */`)
-/// comments, and dollar-quoted bodies (`$$ … $$`, `$tag$ … $tag$`). Falls back to
-/// the whole (trimmed) input when the picked statement is empty.
-pub(crate) fn statement_at(sql: &str, cursor: usize) -> String {
+/// Byte range of the single SQL statement containing byte offset `cursor`,
+/// trimmed. Splits on top-level `;`, honoring single/double quotes, line (`--`)
+/// and block (`/* */`) comments, and dollar-quoted bodies (`$$ … $$`,
+/// `$tag$ … $tag$`). Falls back to the whole (trimmed) input when the picked
+/// statement is empty. A range rather than the text, so an error the server
+/// reports in it can be put back on the editor text.
+pub(crate) fn statement_range(sql: &str, cursor: usize) -> std::ops::Range<usize> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -121,12 +123,49 @@ pub(crate) fn statement_at(sql: &str, cursor: usize) -> String {
         .find(|(s, e)| cur >= *s && cur <= *e)
         .copied()
         .unwrap_or((0, n));
-    let stmt = sql[s..e].trim();
+    let trimmed = |s: usize, e: usize| {
+        let part = &sql[s..e];
+        let start = s + (part.len() - part.trim_start().len());
+        start..start + part.trim().len()
+    };
+    let stmt = trimmed(s, e);
     if stmt.is_empty() {
-        sql.trim().to_string()
+        trimmed(0, n)
     } else {
-        stmt.to_string()
+        stmt
     }
+}
+
+/// The byte span of `sql` to underline for a server error at 1-based
+/// character `pos` (Postgres' error position): the token that starts there —
+/// a word, a quoted name / string, or one symbol. An error at the very end
+/// ("syntax error at end of input") marks the last token instead. Empty when
+/// `sql` is blank.
+pub(crate) fn error_span(sql: &str, pos: u32) -> std::ops::Range<usize> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    let mut at = sql
+        .char_indices()
+        .nth(pos.saturating_sub(1) as usize)
+        .map_or(sql.len(), |(i, _)| i);
+    if sql[at..].trim().is_empty() {
+        let head = sql[..at].trim_end();
+        let Some(last) = head.chars().next_back() else {
+            return 0..0;
+        };
+        at = if word(last) {
+            head.rfind(|c: char| !word(c)).map_or(0, |i| i + 1)
+        } else {
+            head.len() - last.len_utf8()
+        };
+    }
+    let rest = &sql[at..];
+    let first = rest.chars().next().unwrap_or(' ');
+    let len = match first {
+        c if word(c) => rest.find(|c: char| !word(c)).unwrap_or(rest.len()),
+        '"' | '\'' => rest[1..].find(first).map_or(rest.len(), |i| i + 2),
+        c => c.len_utf8(),
+    };
+    at..at + len
 }
 
 /// If `b` begins a dollar-quote opening tag (`$`, optional `[A-Za-z0-9_]*`, `$`),
@@ -199,10 +238,47 @@ pub(crate) fn rel_icon(kind: RelationKind) -> &'static str {
 }
 
 #[cfg(test)]
+mod error_span_tests {
+    use super::*;
+
+    #[test]
+    fn statement_range_points_into_the_text() {
+        let sql = "select 1;\n  select 2 ;\n";
+        let r = statement_range(sql, 13);
+        assert_eq!(&sql[r.clone()], "select 2");
+        assert_eq!(r.start, 12);
+        assert_eq!(statement_range("  x  ", 0), 2..3);
+    }
+
+    #[test]
+    fn marks_the_token_postgres_points_at() {
+        let sql = "SELECT nme FROM t";
+        assert_eq!(&sql[error_span(sql, 8)], "nme");
+        let sql = "SELECT * FROM \"Bad Name\"";
+        assert_eq!(&sql[error_span(sql, 15)], "\"Bad Name\"");
+        let sql = "SELECT 1 +* 2";
+        assert_eq!(&sql[error_span(sql, 11)], "*");
+        // "syntax error at end of input": the last token.
+        let sql = "SELECT * FROM";
+        assert_eq!(&sql[error_span(sql, 14)], "FROM");
+        let sql = "SELECT (1 ";
+        assert_eq!(&sql[error_span(sql, 11)], "1");
+        assert_eq!(error_span("", 1), 0..0);
+        // Positions count characters, not bytes.
+        let sql = "SELECT 'ä' + nope";
+        assert_eq!(&sql[error_span(sql, 14)], "nope");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gpui_component::table::ColumnSort;
     use zdb_db::SslMode;
+
+    fn statement_at(sql: &str, cursor: usize) -> &str {
+        &sql[statement_range(sql, cursor)]
+    }
 
     #[test]
     fn window_title_reflects_connection() {

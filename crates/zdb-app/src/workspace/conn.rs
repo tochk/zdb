@@ -61,23 +61,21 @@ impl Workspace {
         } else if let Some(cfg) = self.cfg.clone() {
             self.start_connect(cfg, cx);
         } else {
-            self.conn_manager_open = true;
+            self.modal = Some(Modal::Connections);
             cx.notify();
         }
     }
 
     pub(super) fn toggle_connections(&mut self, cx: &mut Context<Self>) {
-        self.conn_manager_open = !self.conn_manager_open;
-        if self.conn_manager_open {
+        self.toggle_modal(Modal::Connections, cx);
+        if self.is_modal(Modal::Connections) {
             // No saved connections → go straight to the add form.
             self.conn_adding = self.settings.connections.is_empty();
         }
-        cx.notify();
     }
 
     pub(super) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
-        self.settings_open = !self.settings_open;
-        cx.notify();
+        self.toggle_modal(Modal::Settings, cx);
     }
 
     /// Switch the theme live and persist it to settings.json.
@@ -123,7 +121,9 @@ impl Workspace {
         self.tree.reset(cx);
         self.close_all_tabs(cx);
         self.cfg = Some(cfg.clone());
-        self.conn_manager_open = false;
+        if self.is_modal(Modal::Connections) {
+            self.modal = None;
+        }
         self.start_connect(cfg, cx);
     }
 
@@ -249,14 +249,7 @@ impl Workspace {
             log("sqls not found; SQL completion disabled");
             return;
         };
-        let config_path = match lsp::write_config(cfg) {
-            Ok(p) => p,
-            Err(e) => {
-                log(format!("sqls config write failed: {e}"));
-                return;
-            }
-        };
-        match lsp::LspHandle::spawn(&exe, config_path, cfg.password.clone()) {
+        match lsp::LspHandle::spawn(&exe, cfg) {
             Ok(h) => {
                 *self.lsp_slot.borrow_mut() = Some(h);
                 log("sqls started");
@@ -297,7 +290,7 @@ mod tests {
         window
             .update(cx, |ws, _w, _cx| {
                 assert!(ws.conn.is_none());
-                assert!(ws.conn_manager_open);
+                assert!(ws.is_modal(Modal::Connections));
                 // No saved connections → straight to the add form.
                 assert!(ws.conn_adding);
             })

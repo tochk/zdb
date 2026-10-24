@@ -39,6 +39,7 @@ mod edit;
 mod export;
 mod grid;
 mod keynav;
+mod modal;
 mod query;
 mod session;
 mod tabs;
@@ -49,9 +50,10 @@ mod view;
 use autoscroll::AutoScroll;
 use colors::{palette, Colors};
 use conn::ConnForm;
-use grid::{Tab, TabKind};
+use grid::{Clause, Tab, TabKind};
 pub use keynav::bind_nav_keys;
 use keynav::*;
+use modal::{Modal, ModalFocus};
 use query::QueryLog;
 use tree::{NodeMeta, SchemaTree};
 use util::{entry_to_config, oneline, order_by_sql, rel_icon, window_title};
@@ -177,8 +179,9 @@ pub struct Workspace {
 
     log: QueryLog,
 
-    // Command palette.
-    palette_open: bool,
+    /// The dialog showing, if any (see `modal.rs`).
+    modal: Option<Modal>,
+    modal_focus: ModalFocus,
     palette_input: Entity<InputState>,
 
     // Embedded terminal.
@@ -188,12 +191,8 @@ pub struct Workspace {
     // Connections.
     settings: Settings,
     passwords: HashMap<String, String>,
-    conn_manager_open: bool,
     /// Whether the connection manager is showing the add form.
     conn_adding: bool,
-    settings_open: bool,
-    /// Whether the keyboard-shortcut reference is showing.
-    shortcuts_open: bool,
     form: ConnForm,
 
     /// Latest window geometry seen in `render`, and whether a debounced write of
@@ -323,16 +322,14 @@ impl Workspace {
             cell_multi,
             lsp_slot: lsp::new_slot(),
             log: QueryLog::default(),
-            palette_open: false,
+            modal: None,
+            modal_focus: ModalFocus::new(cx),
             palette_input,
             terminal: None,
             terminal_open: false,
             settings,
             passwords: HashMap::new(),
-            conn_manager_open: false,
             conn_adding: false,
-            settings_open: false,
-            shortcuts_open: false,
             form,
             pending_geom: None,
             geom_flush: false,
@@ -346,7 +343,7 @@ impl Workspace {
             }
             this.start_connect(cfg, cx);
         } else {
-            this.conn_manager_open = true;
+            this.modal = Some(Modal::Connections);
             this.conn_adding = this.settings.connections.is_empty();
         }
         this
@@ -425,19 +422,11 @@ impl Workspace {
     }
 
     fn toggle_palette(&mut self, cx: &mut Context<Self>) {
-        self.palette_open = !self.palette_open;
-        cx.notify();
-    }
-
-    fn close_palette(&mut self, cx: &mut Context<Self>) {
-        if self.palette_open {
-            self.palette_open = false;
-            cx.notify();
-        }
+        self.toggle_modal(Modal::Palette, cx);
     }
 
     fn run_command(&mut self, cmd: PaletteCmd, window: &mut Window, cx: &mut Context<Self>) {
-        self.palette_open = false;
+        self.modal = None;
         match cmd {
             PaletteCmd::Run => self.run_active_tab(cx),
             PaletteCmd::Explain => self.explain_active(false, cx),
@@ -491,7 +480,7 @@ mod test_support;
 
 #[cfg(test)]
 mod tests {
-    use super::geom_state;
+    use super::{geom_state, Modal};
     use crate::workspace::test_support::*;
     use gpui::{point, px, size, Bounds, TestAppContext, WindowBounds};
 
@@ -516,11 +505,10 @@ mod tests {
         let window = new_workspace(cx);
         window
             .update(cx, |ws, _w, cx| {
-                assert!(!ws.palette_open);
                 ws.toggle_palette(cx);
-                assert!(ws.palette_open);
-                ws.close_palette(cx);
-                assert!(!ws.palette_open);
+                assert!(ws.is_modal(Modal::Palette));
+                ws.toggle_palette(cx);
+                assert!(!ws.modal_open());
             })
             .unwrap();
     }

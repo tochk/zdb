@@ -12,7 +12,9 @@
 # Usage: scripts/build-sqls.sh [output_dir]   (default: dist/sqls)
 set -euo pipefail
 
-VERSION="v0.2.47"
+# v0.2.48+: v0.2.47 overflowed its stack (crashing the server, so completion
+# died) on any `CASE` without an `END` — i.e. on every CASE while it's typed.
+VERSION="v0.2.48"
 SRC="${SQLS_SRC:-$HOME/src/sqls}"
 OUT="${1:-$(cd "$(dirname "$0")/.." && pwd)/dist/sqls}"
 
@@ -20,6 +22,11 @@ command -v go >/dev/null || { echo "error: Go toolchain not found on PATH"; exit
 
 if [ ! -d "$SRC/.git" ]; then
     git clone --depth 1 --branch "$VERSION" https://github.com/sqls-server/sqls.git "$SRC"
+elif [ "$(git -C "$SRC" describe --tags --exact-match 2>/dev/null)" != "$VERSION" ]; then
+    # A clone of another version: move it to $VERSION. `-f` drops our edits
+    # below (they are re-applied).
+    git -C "$SRC" fetch --depth 1 origin tag "$VERSION"
+    git -C "$SRC" checkout -f -q "$VERSION"
 fi
 cd "$SRC"
 

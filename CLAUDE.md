@@ -39,6 +39,8 @@ crates/
                  autoscroll.rs  middle-click (wheel-press) autoscroll of the grid
                  keynav.rs  keyboard navigation: cell cursor, tree keys, pane
                             focus, tab keys + `bind_nav_keys` (ALL nav bindings)
+                 modal.rs   dialogs: one-at-a-time `Modal` state, focus trap,
+                            the shared occluding backdrop (`modal_layer`)
                  export.rs  CSV/JSON/INSERTs/TSV export
                  view.rs    all render_* + impl Render
                  grid.rs    Tab/TabKind + ResultDelegate
@@ -144,6 +146,13 @@ The WSL host can run Windows exes directly:
 
 - Background-command "exit 0" from `… | tee | tail` is the tail's exit — always
   grep the log for `error:` to confirm a build actually passed.
+- Driving the app on WSL X11: stop it with `pkill -x zdb` — `pkill -f target/debug/zdb`
+  matches (and kills) the shell running the command. `import -window` silently crops a
+  window that extends past the screen (bottom-panel UI "missing"): `xdotool windowmove`
+  it on-screen first. Synthetic hover (tooltips, diagnostic popovers) only registers
+  after a synthetic click in the window. Running the app writes the REAL
+  `~/.config/zdb` (env connection's tabs → `tabs/env.json`, scratch → `scratch/env.sql`,
+  settings toggled in the UI) — clean up after testing.
 - **Custom (Zed-style) title bar** lives in `workspace.rs::render_titlebar` (not
   the gpui-component `TitleBar`). Window opens borderless via
   `gpui_component::TitleBar::title_bar_options()` in `main.rs` (`appears_transparent`
@@ -282,9 +291,9 @@ The WSL host can run Windows exes directly:
   (`keynav.rs::escape_cell_edit`). `cell_input` is ONE shared entity, so a cell→cell move never changes
   the focus handle and emits NO `InputEvent::Blur` — `begin_edit`/`set_current_row`
   therefore call `commit_cell_edit` themselves before repointing `editing`. Esc rides
-  the global `escape`→`ClosePalette` action (gpui-component's `InputState::escape`
-  propagates when `clean_on_escape` is off), which clears `editing` first so the blur
-  from the unmounting input finds nothing to commit.
+  the global `escape`→`ClosePalette` action — which runs BEFORE the input's own escape
+  (see "binding with no context" under keyboard navigation) — and clears `editing`
+  first so the blur from the unmounting input finds nothing to commit.
   When browsing a table from the tree (`table_view.is_some()`) the generated
   `SELECT * FROM …` editor is hidden — the rows fill the center pane.
 - **Middle-click autoscroll** (`workspace/autoscroll.rs`): wheel-press over a grid drops
@@ -369,7 +378,15 @@ The WSL host can run Windows exes directly:
   `running`; `+`/`-`/refresh are ALWAYS shown and disabled when N/A (`+` needs an
   editable result; `-` needs a selected row — its glyph is red only when enabled,
   else neutral `c.fg`; refresh needs the tab's `base_sql`). `reload_data(tab_id)` re-runs
-  it. (`render_center` = tab strip + active tab body | welcome pane.)
+  it keeping filter + sort: a Table tab REBUILDS from its WHERE / ORDER BY boxes (as Run
+  does — `base_sql` predates a header sort, which only `run_sql`s), a Query tab re-runs
+  `base_sql` under its header sort. (`render_center` = tab strip + active tab body |
+  welcome pane.)
+- **Table-tab filter bar** (`view.rs::render_filter_bar`) is styled after Zed's
+  "Search threads…" box: one full-width strip, muted icon + SQL keyword, BORDERLESS
+  `Input` (`appearance(false)`), a clear `×` once non-empty (clears + re-runs), mono font.
+  Focus shows as the half's keyword/icon brightening (no border); red = the last run
+  failed on that box's text (`Tab.clause_error`, see error marks below).
 - **Live theme switch / Settings modal** (`render_settings`, gear in the sidebar
   header or Ctrl/Cmd+,): `gpui_component::Theme::change(mode, Some(window), cx)` swaps
   the theme at runtime; persist with `self.settings.save()`. List/row UIs (schema
@@ -520,9 +537,34 @@ The WSL host can run Windows exes directly:
     `deferred(anchored())` from the root, and anchor it to the selected row's
     bounds, captured by a `canvas` in `schema_tree_row`. `view.rs::node_menu` builds
     the items for both menus.
+  - **A binding with NO context outranks every context binding** (cost a round):
+    gpui gives a context-less binding the DEEPEST depth (`keymap.rs::binding_enabled`
+    → `contexts.len()`). So `main.rs`'s global `escape` → `ClosePalette` fires before
+    the focused Input's own `escape` — which is why Esc could never close a completion
+    menu. Handlers of global keys must hand the key on themselves when it isn't theirs
+    (`completion_menu_action` offers Esc / Tab to an open menu first).
+  - **Tab is ours, not gpui-component's.** Its `Root` binds `tab` → `window.focus_next()`
+    over EVERY tab stop in the window — it walked into toolbar buttons (invisible focus)
+    and behind open dialogs. We bind `tab`/`shift-tab` → `FocusNextField`/`PrevField` on
+    `"zdb"` (`modal.rs::step_focus`), opt the panes' Buttons out (`.tab_stop(false)`) and
+    make the tree + grid handles tab stops, so Tab walks filter box → tree → editor |
+    WHERE → ORDER BY → grid (landing on the grid puts the cursor on a cell). Panes that use
+    Tab win by depth: grid cells, code-editor indent, `AcceptCompletion` on `"Input"`
+    (Tab takes the highlighted completion, Zed-style). `FocusHandle::tab_stop` writes the
+    SHARED focus entry and every `track_focus` clones from it, so setting it on our clone
+    of a widget's private handle (TableState) takes effect.
   - **Terminal**: the pane/tab/apply chords are shell keys there, so their handlers
     `cx.propagate()` when the terminal has focus — an unhandled action lets the
-    keystroke through to the terminal's `on_key_down`.
+    keystroke through to the terminal's `on_key_down`. `tab`/`shift-tab`/`escape` are
+    bound to `NoAction` in the `"Terminal"` context (its wrapper div): `NoAction` masks
+    every lower binding, so they reach the shell (completion, vi) instead of moving focus.
+  - **Dialogs own mouse + keyboard** (`modal.rs`): one `Modal` at a time (opening one
+    replaces another); the backdrop `occlude()`s the panes (a press on it closes) and
+    starts BELOW the title bar so the window stays movable/closable; the panel tracks a
+    focus handle that `sync_modal_focus` (render) pulls focus into and hands back on close
+    (unless a palette command moved it); Tab cycles only the dialog's controls (steps
+    `focus_next` until focus is inside again); the pane / tab / query chords are swallowed
+    while one is up.
   - **Shortcut reference** (F1, keyboard button in the sidebar header, palette,
     Settings → "Show"): `render_shortcuts` draws `keynav::SHORTCUTS`, a hand-kept
     table — add a row there whenever a binding is added or changed.
@@ -552,8 +594,11 @@ The WSL host can run Windows exes directly:
     `children.len()>0`, so without one the widget won't expand them).
   - **Two click targets kept**: the widget's row handler is `on_mouse_down` (not click) —
     the relation name area has its own `on_mouse_down` that `cx.stop_propagation()`s, selects
-    manually, and `open_table_tab`s. Enter opens via zdb action `TreeOpenSelected` and
-    also hands focus to the new tab's grid (a mouse open doesn't). All tree keys, and
+    manually, and opens via `click_tree_relation`: like Zed's project panel, one click opens
+    and KEEPS the keyboard in the tree (it refocuses `tree.focus` — the stopped propagation
+    skips the widget's focus-on-click, and `activate_tab` would leave focus in WHERE, so the
+    arrows "stopped working"); a double-click / Enter (`TreeOpenSelected`) goes into the
+    tab's grid. All tree keys, and
     how the tree gets keyboard focus despite its private `FocusHandle`, are in the
     keyboard-navigation notes above.
   - **Filter box** (`filter_input` under the sidebar header): non-empty `tree_filter` keeps
@@ -587,7 +632,7 @@ The WSL host can run Windows exes directly:
 - **SQL editor extras**: `Format` button/palette → `sqlformat` crate (`util::format_sql`,
   2-space, uppercased keywords) rewrites the editor via `InputState::set_value` (needs
   `&mut Window`). Run / Ctrl+Enter runs the **statement under the cursor**, not the whole
-  editor: `util::statement_at(sql, cursor_byte_offset)` splits on top-level `;` honoring
+  editor: `util::statement_range(sql, cursor_byte_offset)` splits on top-level `;` honoring
   `'`/`"` quotes, `--`/`/* */` comments, and `$tag$` dollar-quoting (`InputState::cursor()`
   gives the byte offset). **Syntax highlight is NOT automatic**: `code_editor("sql")` alone
   does nothing — gpui-component gates every grammar except JSON behind its all-or-nothing
@@ -635,5 +680,34 @@ The WSL host can run Windows exes directly:
     needs `use gpui::AppContext`.
   - End-to-end test: `lsp::tests::completion_end_to_end`, gated on `ZDB_TEST_SQLS` (path to the
     binary) + the `ZDB_TEST_*` Postgres env; polls the oneshot with `try_recv` (no executor).
+  - **WHERE / ORDER BY complete columns too** (`SqlCompletion::clause`): alone, `id > 3 AND na`
+    names no table, so sqls is shown `SELECT * FROM s.t <KW> ` + only the comma-separated item
+    being typed (`list_item_start`: sqls loses the columns after `col DESC,`). Names stay
+    UNQUOTED when plain (`clause_head`) — sqls resolves nothing for `"s"."t"`. Table names
+    are dropped there.
+  - **Menu presentation** (`tidy_items`): sqls' markdown docs go (gpui-component shows them in
+    a side panel — for a table, a column listing taller than the window); a column's type
+    becomes its inline detail (`integer PK`). Each item's `filter_text` is set to the label
+    prefix the typed word matches: the menu highlights the first `filter_text.len()` bytes of
+    the label, else `query.len()` — and its query runs on across spaces while the menu stays
+    open (`WHERE c` vs label `c1`), which PANICKED gpui (`is_char_boundary(run.end)`).
+  - **sqls can die** — v0.2.47 overflowed its stack on any `CASE` without `END` (i.e. while
+    typing one), after which every request hung and a stale menu froze on screen. Pinned
+    v0.2.48 (upstream fix). zdb also survives it: on stdout EOF the reader fails all pending
+    requests (dropped senders = no completions) and marks the handle dead; the next request
+    `restart()`s it (not within `RESTART_BACKOFF` of its start), and editors re-`didOpen`
+    per server generation.
+- **Error marks** (`query.rs::mark_failure`): a failed run is put back where it failed using
+  Postgres' 1-based character `position` (`DbError::Postgres`). Editor runs remember the
+  statement + its byte offset (`Tab.editor_run`); the token at the position
+  (`util::error_span`) gets a diagnostic (red squiggle, hover = message + DETAIL/HINT) —
+  code-editor inputs only (`InputState::diagnostics_mut`). Table tabs map the position onto
+  their generated SQL (`tabs.rs::TableSql`) and redden WHERE or ORDER BY. Diagnostics are
+  byte offsets into the text they were made for: `grid::clear_marks` drops them on EVERY
+  editor change (stale offsets past the end would hit the same gpui text-run panic), and
+  each run clears the previous marks. Deliberately NOT checked as-you-type: that means
+  server round-trips (an error per pause in the server log, and a parse error inside the
+  user's open transaction aborts it — needs a separate connection), and local parsers
+  aren't exact Postgres.
 
 See the auto-memory under the Claude projects dir for the running phase log.

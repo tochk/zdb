@@ -2,6 +2,9 @@
 //! and the query log.
 
 use super::*;
+use gpui_component::highlighter::{Diagnostic, DiagnosticSeverity};
+use gpui_component::RopeExt as _;
+use zdb_db::DbError;
 
 const LOG_CAP: usize = 500;
 
@@ -35,7 +38,7 @@ struct QueryOutcome {
     rows: Vec<Vec<CellValue>>,
     affected: u64,
     elapsed: std::time::Duration,
-    error: Option<String>,
+    error: Option<DbError>,
 }
 
 /// Collect a query's whole event stream into one `QueryOutcome`.
@@ -49,7 +52,7 @@ async fn drain_query(mut rx: zdb_db::QueryStream) -> QueryOutcome {
                 out.affected = affected;
                 out.elapsed = elapsed;
             }
-            QueryEvent::Failed(e) => out.error = Some(e.to_string()),
+            QueryEvent::Failed(e) => out.error = Some(e),
         }
     }
     out
@@ -83,7 +86,12 @@ impl Workspace {
         if is_table {
             self.apply_where(id, cx);
         } else {
-            self.run_new_query(id, util::statement_at(&full, cursor), cx);
+            let range = util::statement_range(&full, cursor);
+            let stmt = full[range.clone()].to_string();
+            if let Some(tab) = self.tab_mut(id) {
+                tab.editor_run = Some((stmt.clone(), range.start));
+            }
+            self.run_new_query(id, stmt, cx);
         }
     }
 
@@ -174,22 +182,52 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Re-run a tab's current query/table from the DB (discards staged edits).
+    /// Re-run a tab's current query/table from the DB (discards staged edits),
+    /// keeping its filter and sort.
     pub(super) fn reload_data(&mut self, tab_id: u64, cx: &mut Context<Self>) {
-        if let Some(sql) = self.tab(tab_id).and_then(|t| t.base_sql.clone()) {
-            self.run_new_query(tab_id, sql, cx);
+        let Some(tab) = self.tab(tab_id) else {
+            return;
+        };
+        let sort = tab.sort_state;
+        if matches!(tab.kind, TabKind::Table { .. }) {
+            // A Table tab's query IS its WHERE / ORDER BY boxes, so rebuild it
+            // from them as Run does — `base_sql` predates any header sort. The
+            // header arrow stays while the box still holds what its click wrote.
+            let order = tab.order_input.read(cx).value().trim().to_string();
+            let keep = sort.filter(|_| order == sort_clause(&tab.headers, sort));
+            let sql = self.table_query(tab_id, cx);
+            self.start_query(tab_id, sql.clone(), sql, keep, cx);
+            return;
         }
+        let Some(base) = tab.base_sql.clone() else {
+            return;
+        };
+        let shown = sorted_sql(&base, &tab.headers, sort);
+        self.start_query(tab_id, base, shown, sort, cx);
     }
 
     /// Start a new query for `tab_id`: remember it as the sort base, drop stale
     /// editability, then describe (for editability) and execute it.
     pub(super) fn run_new_query(&mut self, tab_id: u64, base: String, cx: &mut Context<Self>) {
+        self.start_query(tab_id, base.clone(), base, None, cx);
+    }
+
+    /// `run_new_query`, showing the rows as `shown` (`base` under the header
+    /// `sort`) — what a refresh needs to keep the order on screen.
+    fn start_query(
+        &mut self,
+        tab_id: u64,
+        base: String,
+        shown: String,
+        sort: Option<(usize, bool)>,
+        cx: &mut Context<Self>,
+    ) {
         {
             let Some(tab) = self.tab_mut(tab_id) else {
                 return;
             };
             tab.base_sql = Some(base.clone());
-            tab.sort_state = None;
+            tab.sort_state = sort;
             tab.edit_target = None;
             tab.edit_cols.clear();
             tab.editing = None;
@@ -199,8 +237,8 @@ impl Workspace {
         }
         // The cell cursor is deliberately left alone: `run_sql` clamps it to the
         // rows that come back, so a refresh / re-sort keeps your place.
-        self.describe_async(tab_id, base.clone(), cx);
-        self.run_sql(tab_id, base, cx);
+        self.describe_async(tab_id, base, cx);
+        self.run_sql(tab_id, shown, cx);
     }
 
     pub(super) fn describe_async(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
@@ -262,6 +300,10 @@ impl Workspace {
                 return;
             };
             tab.running = false;
+            // Marks from an earlier failure go, whatever this run did.
+            tab.clause_error = None;
+            let editor = tab.editor.clone();
+            grid::clear_marks(&editor, cx);
             let QueryOutcome {
                 headers,
                 rows,
@@ -273,6 +315,7 @@ impl Workspace {
                 Some(e) => {
                     let s = format!("Error: {e}");
                     this.log.push(&logged, false);
+                    this.mark_failure(tab_id, &logged, &e, cx);
                     s
                 }
                 None => {
@@ -346,6 +389,72 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Put a failed run's error back where it happened: underline the token
+    /// Postgres points at in the editor (hovering shows the message), or flag
+    /// the Table tab box it falls in. Either clears on the next edit or run.
+    fn mark_failure(&mut self, tab_id: u64, sql: &str, err: &DbError, cx: &mut Context<Self>) {
+        let DbError::Postgres {
+            message,
+            position: Some(pos),
+            detail,
+            hint,
+            ..
+        } = err
+        else {
+            return;
+        };
+        let Some(tab) = self.tab(tab_id) else {
+            return;
+        };
+        if matches!(tab.kind, TabKind::Table { .. }) {
+            let clause = self.clause_at(tab_id, sql, *pos, cx);
+            if let Some(tab) = self.tab_mut(tab_id) {
+                tab.clause_error = clause;
+            }
+            return;
+        }
+        // Only a statement run from the editor maps back onto its text (not a
+        // re-sort's wrapper, say).
+        let Some(start) = tab
+            .editor_run
+            .as_ref()
+            .filter(|(run, _)| run == sql)
+            .map(|(_, start)| *start)
+        else {
+            return;
+        };
+        let span = util::error_span(sql, *pos);
+        if span.is_empty() {
+            return;
+        }
+        let mut text = message.clone();
+        for (label, extra) in [("DETAIL", detail), ("HINT", hint)] {
+            if let Some(extra) = extra {
+                text.push_str(&format!("\n{label}: {extra}"));
+            }
+        }
+        tab.editor.clone().update(cx, |state, cx| {
+            let rope = state.text().clone();
+            // Edited while it ran: the offsets no longer line up.
+            if rope.to_string().get(start..start + sql.len()) != Some(sql) {
+                return;
+            }
+            let range = rope.offset_to_position(start + span.start)
+                ..rope.offset_to_position(start + span.end);
+            if let Some(marks) = state.diagnostics_mut() {
+                marks.reset(&rope);
+                marks.push(Diagnostic {
+                    range,
+                    severity: DiagnosticSeverity::Error,
+                    message: text.into(),
+                    source: Some("postgres".into()),
+                    ..Default::default()
+                });
+            }
+            cx.notify();
+        });
+    }
+
     // ---- sorting ---------------------------------------------------------
 
     /// Clicking a header cycles its sort: none → ascending → descending → none,
@@ -374,19 +483,7 @@ impl Workspace {
         // ORDER BY input and rebuild, instead of rewriting the SQL it produced
         // last time.
         if is_table {
-            let clause = match next {
-                Some((c, desc)) => headers
-                    .get(c)
-                    .map(|name| {
-                        format!(
-                            "\"{}\" {}",
-                            name.replace('"', "\"\""),
-                            if desc { "DESC" } else { "ASC" }
-                        )
-                    })
-                    .unwrap_or_default(),
-                None => String::new(),
-            };
+            let clause = sort_clause(&headers, next);
             if let Some(input) = self.tab(tab_id).map(|t| t.order_input.clone()) {
                 input.update(cx, |state, cx| state.set_value(clause, window, cx));
             }
@@ -399,20 +496,37 @@ impl Workspace {
             log("sort: no base query");
             return;
         };
-        let sql = match next {
-            Some((c, desc)) => {
-                let col = headers.get(c).cloned().unwrap_or_default();
-                let dir = if desc {
-                    ColumnSort::Descending
-                } else {
-                    ColumnSort::Ascending
-                };
-                order_by_sql(&base, &col, dir)
-            }
-            None => base,
-        };
+        let sql = sorted_sql(&base, &headers, next);
         log(format!("sort: {sql}"));
         self.run_sql(tab_id, sql, cx);
+    }
+}
+
+/// What a header sort writes into a Table tab's ORDER BY box: `"col" ASC|DESC`
+/// (empty for no sort, or a column that's gone).
+fn sort_clause(headers: &[String], sort: Option<(usize, bool)>) -> String {
+    let Some((name, desc)) = sort.and_then(|(c, desc)| Some((headers.get(c)?, desc))) else {
+        return String::new();
+    };
+    format!(
+        "\"{}\" {}",
+        name.replace('"', "\"\""),
+        if desc { "DESC" } else { "ASC" }
+    )
+}
+
+/// A Query tab's `base` under a header sort (unchanged for no sort).
+fn sorted_sql(base: &str, headers: &[String], sort: Option<(usize, bool)>) -> String {
+    match sort.and_then(|(c, desc)| Some((headers.get(c)?, desc))) {
+        Some((col, desc)) => {
+            let dir = if desc {
+                ColumnSort::Descending
+            } else {
+                ColumnSort::Ascending
+            };
+            order_by_sql(base, col, dir)
+        }
+        None => base.to_string(),
     }
 }
 
@@ -498,6 +612,153 @@ mod tests {
                 ws.run_active_tab(cx);
                 let base = ws.tab(id).unwrap().base_sql.clone().unwrap();
                 assert!(!base.contains("WHERE"));
+            })
+            .unwrap();
+    }
+
+    /// Refresh re-runs a Table tab from its WHERE / ORDER BY boxes — including
+    /// a header sort, which never touched `base_sql`.
+    #[gpui::test]
+    fn refresh_keeps_table_filter_and_sort(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                let (filter, order) = {
+                    let tab = ws.tab(id).unwrap();
+                    (tab.where_input.clone(), tab.order_input.clone())
+                };
+                filter.update(cx, |i, cx| i.set_value("id > 5", window, cx));
+                ws.apply_where(id, cx);
+                ws.tab_mut(id).unwrap().headers = vec!["id".into(), "name".into()];
+                ws.toggle_sort(id, 1, window, cx);
+
+                ws.reload_data(id, cx);
+                let tab = ws.tab(id).unwrap();
+                let base = tab.base_sql.clone().unwrap();
+                assert!(
+                    base.contains("WHERE id > 5 ORDER BY \"name\" ASC"),
+                    "{base}"
+                );
+                assert_eq!(tab.sort_state, Some((1, false)));
+
+                // Typed over the header's clause: the text wins, the arrow goes.
+                order.update(cx, |i, cx| i.set_value("id DESC", window, cx));
+                ws.reload_data(id, cx);
+                let tab = ws.tab(id).unwrap();
+                assert!(tab
+                    .base_sql
+                    .clone()
+                    .unwrap()
+                    .ends_with("ORDER BY id DESC LIMIT 500"));
+                assert_eq!(tab.sort_state, None);
+            })
+            .unwrap();
+    }
+
+    /// A Query tab's header sort survives a refresh; the base stays unsorted.
+    #[gpui::test]
+    fn refresh_keeps_query_tab_sort(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.base_sql = Some("SELECT * FROM t".into());
+                    tab.headers = vec!["qty".into()];
+                }
+                ws.toggle_sort(id, 0, window, cx);
+                ws.reload_data(id, cx);
+                let tab = ws.tab(id).unwrap();
+                assert_eq!(tab.base_sql.as_deref(), Some("SELECT * FROM t"));
+                assert_eq!(tab.sort_state, Some((0, false)));
+                assert_eq!(
+                    sorted_sql("SELECT * FROM t", &tab.headers, tab.sort_state),
+                    order_by_sql("SELECT * FROM t", "qty", ColumnSort::Ascending)
+                );
+            })
+            .unwrap();
+    }
+
+    fn pg_error(position: u32) -> DbError {
+        DbError::Postgres {
+            message: "column \"nme\" does not exist".into(),
+            code: Some("42703".into()),
+            position: Some(position),
+            detail: None,
+            hint: Some("Perhaps you meant \"name\".".into()),
+        }
+    }
+
+    /// A failed editor run is marked on the statement's own text (not where
+    /// the same offset would land in the whole editor), and editing clears it.
+    #[gpui::test]
+    fn failed_run_is_marked_in_the_editor(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        let stmt = "select nme from t";
+        let editor = window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                let editor = ws.tab(id).unwrap().editor.clone();
+                editor.update(cx, |e, cx| {
+                    e.set_value(format!("select 1;\n{stmt}"), window, cx)
+                });
+                ws.tab_mut(id).unwrap().editor_run = Some((stmt.into(), 10));
+                ws.mark_failure(id, stmt, &pg_error(8), cx);
+                assert_eq!(editor.read(cx).diagnostics().map(|d| d.len()), Some(1));
+
+                // The run's text no longer where it was: nothing is marked.
+                ws.tab_mut(id).unwrap().editor_run = Some((stmt.into(), 3));
+                grid::clear_marks(&editor, cx);
+                ws.mark_failure(id, stmt, &pg_error(8), cx);
+                assert_eq!(editor.read(cx).diagnostics().map(|d| d.len()), Some(0));
+
+                ws.tab_mut(id).unwrap().editor_run = Some((stmt.into(), 10));
+                ws.mark_failure(id, stmt, &pg_error(8), cx);
+                editor.update(cx, |e, cx| e.set_value("select 2", window, cx));
+                editor
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let left = cx.read(|cx| editor.read(cx).diagnostics().map(|d| d.len()));
+        assert_eq!(left, Some(0));
+    }
+
+    /// A Table tab error is pinned on the box it falls in — including one
+    /// reported just past the box's text, at the next keyword.
+    #[gpui::test]
+    fn table_errors_point_at_their_box(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "users".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                let (filter, order) = {
+                    let tab = ws.tab(id).unwrap();
+                    (tab.where_input.clone(), tab.order_input.clone())
+                };
+                filter.update(cx, |i, cx| i.set_value("id >", window, cx));
+                order.update(cx, |i, cx| i.set_value("nme", window, cx));
+                let sql = ws.table_query(id, cx);
+                let at = |s: &str| sql.find(s).unwrap() as u32 + 1;
+                assert_eq!(ws.clause_at(id, &sql, at("id >"), cx), Some(Clause::Where));
+                assert_eq!(
+                    ws.clause_at(id, &sql, at(" ORDER"), cx),
+                    Some(Clause::Where)
+                );
+                assert_eq!(ws.clause_at(id, &sql, at("nme"), cx), Some(Clause::OrderBy));
+                assert_eq!(
+                    ws.clause_at(id, &sql, at("LIMIT"), cx),
+                    Some(Clause::OrderBy)
+                );
+                assert_eq!(ws.clause_at(id, &sql, at("users"), cx), None);
+                // SQL the boxes no longer produce isn't attributed.
+                assert_eq!(ws.clause_at(id, "SELECT 1", 1, cx), None);
+
+                ws.mark_failure(id, &sql, &pg_error(at("nme")), cx);
+                assert_eq!(ws.tab(id).unwrap().clause_error, Some(Clause::OrderBy));
             })
             .unwrap();
     }

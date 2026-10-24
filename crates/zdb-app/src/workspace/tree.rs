@@ -32,7 +32,7 @@ pub(super) struct SchemaTree {
     pub(super) pending_clear_filter: bool,
     /// Keyboard focus for the tree. The widget's own handle is private, so
     /// `ctrl-1` focuses this wrapper handle and our key handlers drive the
-    /// selection (see `keynav.rs`).
+    /// selection (see `keynav.rs`). A tab stop: Tab walks filter → tree → tab.
     pub(super) focus: FocusHandle,
     /// Where the selected row was last painted — the anchor for the keyboard-
     /// opened context menu.
@@ -71,7 +71,7 @@ impl SchemaTree {
             pending_reveal: None,
             loads: HashSet::new(),
             pending_clear_filter: false,
-            focus: cx.focus_handle(),
+            focus: cx.focus_handle().tab_stop(true),
             sel_bounds: Rc::default(),
             menu: None,
         }
@@ -615,8 +615,30 @@ impl Workspace {
         self.sync_tree(cx);
     }
 
+    /// A click on a relation's name: open it, the way Zed's project panel opens
+    /// a file — one click shows it and leaves the keyboard in the tree, so the
+    /// arrows keep walking the list; a double-click goes into the tab (as Enter
+    /// does). The click handler stops propagation, so the widget never focuses
+    /// itself here — without taking focus back, `activate_tab` would leave it in
+    /// the new tab's WHERE box and the arrows would stop reaching the tree.
+    pub(super) fn click_tree_relation(
+        &mut self,
+        schema: String,
+        table: String,
+        double: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if double {
+            self.open_selected_tree_node(window, cx);
+            return;
+        }
+        self.open_table_tab(schema, table, window, cx);
+        self.tree.focus.focus(window);
+    }
+
     /// Enter on the tree: open the selected relation in a tab and hand the
-    /// keyboard to its grid (a mouse open leaves focus where it always was).
+    /// keyboard to its grid.
     pub(super) fn open_selected_tree_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self
             .tree
