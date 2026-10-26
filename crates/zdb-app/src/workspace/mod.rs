@@ -49,14 +49,14 @@ mod view;
 
 use autoscroll::AutoScroll;
 use colors::{palette, Colors};
-use conn::{ConnForm, SetupForm};
+use conn::ConnForm;
 use grid::{Clause, Loader, PageMove, Tab, TabKind};
 pub use keynav::bind_nav_keys;
 use keynav::*;
 use modal::{Modal, ModalFocus};
 use query::QueryLog;
 use tree::{NodeMeta, SchemaTree};
-use util::{entry_to_config, oneline, order_by_sql, rel_icon, window_title};
+use util::{entry_config, entry_to_config, oneline, order_by_sql, rel_icon, window_title};
 
 actions!(
     zdb,
@@ -190,6 +190,8 @@ pub struct Workspace {
 
     /// The dialog showing, if any (see `modal.rs`).
     modal: Option<Modal>,
+    /// The cancel confirmation's "Don't ask again" box (taken on confirm only).
+    cancel_dont_ask: bool,
     modal_focus: ModalFocus,
     palette_input: Entity<InputState>,
 
@@ -203,8 +205,6 @@ pub struct Workspace {
     /// Whether the connection manager is showing the add form.
     conn_adding: bool,
     form: ConnForm,
-    /// Settings → connection setup (parameters + init SQL for the pool).
-    setup_form: SetupForm,
 
     /// Latest window geometry seen in `render`, and whether a debounced write of
     /// it is already scheduled (resizing renders every frame — one write wins).
@@ -299,7 +299,6 @@ impl Workspace {
         .detach();
 
         let form = ConnForm::new(window, cx);
-        let setup_form = SetupForm::new(&settings, window, cx);
         let tree = SchemaTree::new(window, cx);
 
         // Remember the window geometry so the next launch reopens the same size
@@ -338,6 +337,7 @@ impl Workspace {
             lsp_slot: lsp::new_slot(),
             log: QueryLog::default(),
             modal: None,
+            cancel_dont_ask: false,
             modal_focus: ModalFocus::new(cx),
             palette_input,
             terminal: None,
@@ -346,7 +346,6 @@ impl Workspace {
             passwords: HashMap::new(),
             conn_adding: false,
             form,
-            setup_form,
             pending_geom: None,
             geom_flush: false,
             autoscroll: None,

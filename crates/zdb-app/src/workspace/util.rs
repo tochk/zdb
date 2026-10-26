@@ -2,7 +2,7 @@
 
 use gpui_component::table::ColumnSort;
 use zdb_config::ConnectionEntry;
-use zdb_db::{ConnectionConfig, RelationKind, SslMode};
+use zdb_db::{ConnSetup, ConnectionConfig, RelationKind, SslMode};
 
 /// Pretty-print SQL: 2-space indent, uppercased keywords, one blank line between
 /// statements. Best-effort — `sqlformat` returns the input unchanged on SQL it
@@ -288,10 +288,20 @@ pub(crate) fn ssl_from_str(s: &str) -> SslMode {
     }
 }
 
+/// The config for a saved connection, with its pool setup. Fails on a bad
+/// parameter line (settings.json is hand-editable), naming the connection.
 pub(crate) fn entry_to_config(
     entry: &ConnectionEntry,
     password: Option<String>,
-) -> ConnectionConfig {
+) -> Result<ConnectionConfig, String> {
+    let mut cfg = entry_config(entry, password);
+    cfg.setup = ConnSetup::parse(&entry.params.join("\n"), &entry.init_sql)
+        .map_err(|e| format!("{}: parameters, {e}", entry.name))?;
+    Ok(cfg)
+}
+
+/// The config for a saved connection, without its pool setup.
+pub(crate) fn entry_config(entry: &ConnectionEntry, password: Option<String>) -> ConnectionConfig {
     let mut cfg = ConnectionConfig::new(
         entry.name.clone(),
         entry.host.clone(),

@@ -556,6 +556,13 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Settings → ask before cancelling a query from its loader.
+    pub(super) fn set_confirm_query_cancel(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.confirm_query_cancel = on;
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Status bar: show / hide the query log (bottom left).
     pub(super) fn toggle_query_log(&mut self, cx: &mut Context<Self>) {
         self.settings.show_query_log = !self.settings.show_query_log;

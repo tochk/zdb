@@ -513,7 +513,39 @@ impl Workspace {
     /// comes back for the stopped run is dropped — while the server cancels it
     /// in the background (only this tab's session: other tabs' work goes on).
     pub(super) fn cancel(&mut self, cx: &mut Context<Self>) {
-        let Some(tab) = self.active_id().and_then(|id| self.tab_mut(id)) else {
+        if let Some(id) = self.active_id() {
+            self.cancel_tab(id, cx);
+        }
+    }
+
+    /// A click on a running tab's loader: ask before stopping its query —
+    /// unless Settings (or an earlier "Don't ask again") says not to.
+    pub(super) fn ask_cancel(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if !self.tab(tab_id).is_some_and(|t| t.running) {
+            return;
+        }
+        if !self.settings.confirm_query_cancel {
+            return self.cancel_tab(tab_id, cx);
+        }
+        self.cancel_dont_ask = false;
+        self.modal = Some(Modal::ConfirmCancel(tab_id));
+        cx.notify();
+    }
+
+    /// The confirmation's "Cancel query": stop the query, close the dialog,
+    /// and stop asking if "Don't ask again" is ticked. ("Keep running" / Esc
+    /// leave the setting alone, ticked or not.)
+    pub(super) fn confirm_cancel(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.cancel_dont_ask) {
+            self.set_confirm_query_cancel(false, cx);
+        }
+        self.close_modal(cx);
+        self.cancel_tab(tab_id, cx);
+    }
+
+    /// Stop `tab_id`'s run (see `cancel`).
+    pub(super) fn cancel_tab(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab_mut(tab_id) else {
             return;
         };
         if !tab.running {
@@ -892,11 +924,51 @@ mod tests {
                 let tab = ws.tab(id).unwrap();
                 assert_eq!((tab.cursor, tab.editing), (Some((0, 0)), None));
 
+                // A click on the loader asks first; keeping it running
+                // changes nothing, confirming stops it.
+                ws.ask_cancel(id, cx);
+                assert!(ws.is_modal(Modal::ConfirmCancel(id)));
+                ws.close_modal(cx);
+                assert!(ws.tab(id).unwrap().running);
+                ws.ask_cancel(id, cx);
+                ws.confirm_cancel(id, cx);
+                assert!(!ws.modal_open());
+                assert!(ws.settings.confirm_query_cancel, "box not ticked: still asks");
                 // Stopped: no loader, and the grid answers again.
-                ws.cancel(cx);
                 assert_eq!(ws.tab(id).unwrap().loader(later), None);
                 ws.grid_motion(Motion::Down, cx);
                 assert_eq!(ws.tab(id).unwrap().cursor, Some((1, 0)));
+            })
+            .unwrap();
+    }
+
+    /// "Don't ask again" counts only with "Cancel query"; after that a click
+    /// on the loader cancels straight away.
+    #[gpui::test]
+    fn dont_ask_again_only_on_cancel(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.close_modal(cx);
+                let id = seed_query_tab(ws, window, cx);
+                ws.begin_run(id, cx).unwrap();
+
+                ws.ask_cancel(id, cx);
+                ws.cancel_dont_ask = true;
+                ws.close_modal(cx); // Keep running
+                assert!(ws.settings.confirm_query_cancel);
+                assert!(ws.tab(id).unwrap().running);
+
+                ws.ask_cancel(id, cx);
+                assert!(!ws.cancel_dont_ask, "the box starts unticked each time");
+                ws.cancel_dont_ask = true;
+                ws.confirm_cancel(id, cx);
+                assert!(!ws.settings.confirm_query_cancel);
+
+                ws.begin_run(id, cx).unwrap();
+                ws.ask_cancel(id, cx);
+                assert!(!ws.modal_open());
+                assert!(!ws.tab(id).unwrap().running);
             })
             .unwrap();
     }

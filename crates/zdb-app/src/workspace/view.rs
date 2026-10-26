@@ -546,7 +546,7 @@ impl Workspace {
                 .min_w(px(0.))
                 .overflow_hidden()
                 .child(shown)
-                .children(loader.map(|l| Self::loading_overlay(l, c, cx))),
+                .children(loader.map(|l| Self::loading_overlay(tab_id, l, c, cx))),
         );
 
         // Table tabs hide the redundant generated `SELECT *` editor and let the
@@ -575,11 +575,17 @@ impl Workspace {
             .children(Self::render_value_editor(tab, cell_multi, c, cx))
     }
 
-    /// The loader over a running tab's results: an animated spinner card on
-    /// a blank pane, or over the previous rows, dimmed. Either way it
+    /// The loader over a running tab's results: an animated spinner, on a
+    /// blank pane or over the previous rows, dimmed. Either way it
     /// `occlude()`s what's under it — no click, hover or wheel reaches the grid
-    /// until the run is over (its keys are ignored meanwhile too).
-    fn loading_overlay(loader: Loader, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+    /// until the run is over (its keys are ignored meanwhile too) — and a
+    /// click on it asks whether to cancel the query.
+    fn loading_overlay(
+        tab_id: u64,
+        loader: Loader,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let backdrop = match loader {
             Loader::Blank => c.center,
             Loader::OverData => c.center.opacity(0.6),
@@ -593,33 +599,66 @@ impl Workspace {
             .flex()
             .items_center()
             .justify_center()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.ask_cancel(tab_id, cx)))
+            .child(
+                Spinner::new()
+                    .icon(Icon::empty().path("icons/loader-circle.svg"))
+                    .color(c.fg_dim)
+                    .large(),
+            )
+    }
+
+    /// "Cancel the running query?" — asked by a click on a tab's loader.
+    fn render_confirm_cancel(&self, tab_id: u64, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = palette(cx);
+        let title = self.tab(tab_id).map(|t| t.title.clone()).unwrap_or_default();
+        let body = v_flex()
+            .p_4()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c.fg)
+                    .child("Cancel the running query?"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(format!("“{title}” is still waiting for the database.")),
+            )
             .child(
                 h_flex()
+                    .pt_1()
                     .gap_2()
-                    .pl_3()
-                    .pr_1()
-                    .py_1()
                     .items_center()
-                    .rounded_md()
-                    .bg(c.panel)
-                    .border_1()
-                    .border_color(c.border)
-                    .shadow_md()
                     .child(
-                        Spinner::new()
-                            .icon(Icon::empty().path("icons/loader-circle.svg"))
-                            .color(c.fg),
+                        div().flex_1().child(
+                            Checkbox::new("cancel-dont-ask")
+                                .label("Don't ask again")
+                                .checked(self.cancel_dont_ask)
+                                .on_click(cx.listener(|this, on: &bool, _, cx| {
+                                    this.cancel_dont_ask = *on;
+                                    cx.notify();
+                                })),
+                        ),
                     )
-                    .child(div().text_sm().text_color(c.fg_dim).child("Loading…"))
                     .child(
-                        Button::new("loader-stop")
-                            .ghost()
-                            .small()
-                            .tab_stop(false)
-                            .label("Stop")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx))),
+                        Button::new("keep-running")
+                            .label("Keep running")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx))),
+                    )
+                    .child(
+                        Button::new("confirm-cancel")
+                            .label("Cancel query")
+                            .danger()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.confirm_cancel(tab_id, cx)
+                            })),
                     ),
-            )
+            );
+        self.modal_layer(v_flex().mt(px(120.)).w(px(460.)).child(body), cx)
     }
 
     /// A Table tab's WHERE / ORDER BY / LIMIT strip, built like Zed's "Search
@@ -1086,12 +1125,14 @@ impl Workspace {
     /// latest message, so hiding it doesn't hide what just happened.
     fn render_status_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
+        // An open panel's toggle turns blue, so "on" reads at a glance.
+        let blue = cx.theme().blue;
         let toggle = |id: &'static str, icon: &'static str, tip: &'static str, on: bool| {
             Button::new(id)
                 .ghost()
                 .xsmall()
                 .tab_stop(false)
-                .icon(Icon::empty().path(icon))
+                .icon(Icon::empty().path(icon).when(on, |i| i.text_color(blue)))
                 .tooltip(tip)
                 .selected(on)
         };
@@ -1144,39 +1185,51 @@ impl Workspace {
         let show_form = self.conn_adding || self.settings.connections.is_empty();
 
         let body = if show_form {
-            let field = |label: &'static str, input: &Entity<InputState>| {
+            let label_w = px(96.);
+            let label = |text: &'static str| {
+                div()
+                    .w(label_w)
+                    .flex_none()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(text)
+            };
+            let field = |text: &'static str, input: &Entity<InputState>| {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .w(px(96.))
-                            .flex_none()
-                            .text_xs()
-                            .text_color(c.fg_dim)
-                            .child(label),
-                    )
-                    .child(div().w(px(320.)).child(Input::new(input)))
+                    .child(label(text))
+                    .child(div().w(px(380.)).child(Input::new(input)))
             };
-            let mut buttons = h_flex().gap_2().pt_1().child(
-                Button::new("add-conn")
-                    .label("Save & Connect")
-                    .primary()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_connection(cx))),
-            );
-            // Allow returning to the list if there are saved connections.
-            buttons =
-                if self.settings.connections.is_empty() {
-                    buttons.child(Button::new("close-form").label("Close").on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_connections(cx)),
-                    ))
-                } else {
-                    buttons.child(Button::new("back-list").label("Back").on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.show_conn_list(cx)),
-                    ))
-                };
+            // Multi-line fields: label at the top, a hint under the input.
+            let lines = |text: &'static str, input: &Entity<InputState>, hint: &'static str| {
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(div().pt(px(6.)).child(label(text)))
+                    .child(
+                        v_flex()
+                            .w(px(380.))
+                            .gap(px(2.))
+                            .child(Input::new(input))
+                            .child(div().text_xs().text_color(c.fg_dim).child(hint)),
+                    )
+            };
+            let editing = self.form.editing.is_some();
+            let save = Button::new("save-conn")
+                .label(if editing { "Save" } else { "Save & Connect" })
+                .primary()
+                .loading(self.form.applying)
+                .disabled(self.form.applying)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_connection(cx)));
+            let cancel = Button::new("cancel-conn")
+                .label("Cancel")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_conn_form(cx)));
             v_flex()
-                .child(section_header("ADD CONNECTION", c))
+                .child(section_header(
+                    if editing { "EDIT CONNECTION" } else { "ADD CONNECTION" },
+                    c,
+                ))
                 .child(
                     v_flex()
                         .p_2()
@@ -1188,7 +1241,33 @@ impl Workspace {
                         .child(field("Database", &self.form.db))
                         .child(field("Password", &self.form.password))
                         .child(field("SSL mode", &self.form.ssl))
-                        .child(buttons),
+                        .child(div().h(px(4.)))
+                        .child(lines(
+                            "Parameters",
+                            &self.form.params,
+                            "key=value per line. libpq keys (application_name, \
+                             connect_timeout…) set up the connection, others are server settings.",
+                        ))
+                        .child(lines(
+                            "On connect",
+                            &self.form.init_sql,
+                            "SQL run on every connection of the pool, e.g. SET statements.",
+                        ))
+                        .children(self.form.error.clone().map(|e| {
+                            div()
+                                .pl(label_w + px(8.))
+                                .text_xs()
+                                .text_color(c.danger)
+                                .child(e)
+                        }))
+                        .child(
+                            h_flex()
+                                .pt_1()
+                                .gap_2()
+                                .justify_end()
+                                .child(cancel)
+                                .child(save),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -1197,35 +1276,59 @@ impl Workspace {
                 let active =
                     self.conn.is_some() && self.cfg.as_ref().is_some_and(|cur| cur.name == e.name);
                 let subtitle = format!("{}@{}:{}/{}", e.user, e.host, e.port, e.dbname);
+                // The edit button is a SIBLING of the row's click area, not
+                // inside it: nested click handlers would both fire.
                 list = list.child(
-                    div()
-                        .id(SharedString::from(format!("conn-{i}")))
-                        .px_2()
-                        .py(px(6.))
-                        .gap_2()
-                        .flex()
+                    h_flex()
+                        .pr_1()
+                        .gap_1()
                         .items_center()
                         .rounded_md()
-                        .cursor_pointer()
                         .when(active, |d| d.bg(c.active))
                         .hover(|s| s.bg(c.hover))
                         .child(
                             div()
-                                .size(px(7.))
-                                .rounded_full()
-                                .when(active, |d| d.bg(rgba(0x22c55eff)))
-                                .when(!active, |d| d.border_1().border_color(c.fg_dim)),
+                                .id(SharedString::from(format!("conn-{i}")))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .px_2()
+                                .py(px(6.))
+                                .gap_2()
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .size(px(7.))
+                                        .rounded_full()
+                                        .when(active, |d| d.bg(rgba(0x22c55eff)))
+                                        .when(!active, |d| d.border_1().border_color(c.fg_dim)),
+                                )
+                                .child(tree_icon("icons/database.svg", c.fg_dim))
+                                .child(
+                                    v_flex()
+                                        .min_w(px(0.))
+                                        .gap(px(1.))
+                                        .child(
+                                            div().text_sm().text_color(c.fg).child(e.name.clone()),
+                                        )
+                                        .child(div().text_xs().text_color(c.fg_dim).child(subtitle)),
+                                )
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.connect_saved(i, cx)
+                                })),
                         )
-                        .child(tree_icon("icons/database.svg", c.fg_dim))
                         .child(
-                            v_flex()
-                                .gap(px(1.))
-                                .child(div().text_sm().text_color(c.fg).child(e.name.clone()))
-                                .child(div().text_xs().text_color(c.fg_dim).child(subtitle)),
-                        )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.connect_saved(i, cx)
-                        })),
+                            Button::new(SharedString::from(format!("edit-conn-{i}")))
+                                .ghost()
+                                .small()
+                                .icon(Icon::empty().path("icons/pencil.svg"))
+                                .tooltip("Edit connection")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.show_edit_form(i, window, cx)
+                                })),
+                        ),
                 );
             }
             v_flex()
@@ -1241,13 +1344,16 @@ impl Workspace {
                     h_flex()
                         .p_2()
                         .gap_2()
+                        .justify_end()
                         .border_t_1()
                         .border_color(c.border)
-                        .child(Button::new("add-new").label("Add").primary().on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.show_add_form(cx)),
-                        ))
                         .child(Button::new("close-conn").label("Close").on_click(
                             cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_connections(cx)),
+                        ))
+                        .child(Button::new("add-new").label("Add").primary().on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.show_add_form(window, cx)
+                            }),
                         )),
                 )
                 .into_any_element()
@@ -1329,11 +1435,18 @@ impl Workspace {
                         .into_any_element(),
                 ))
                 .child(setting_row(
+                    "Ask before cancelling a query (click on its loader)",
+                    Checkbox::new("confirm-cancel")
+                        .checked(self.settings.confirm_query_cancel)
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.set_confirm_query_cancel(*on, cx)
+                        }))
+                        .into_any_element(),
+                ))
+                .child(setting_row(
                     "Connections per database",
                     self.render_pool_size(c, cx).into_any_element(),
                 ))
-                .child(section_header("CONNECTION SETUP", c))
-                .child(self.render_conn_setup(c, cx))
                 .child(setting_row(
                     "Keyboard shortcuts",
                     Button::new("show-shortcuts")
@@ -1359,46 +1472,6 @@ impl Workspace {
                 ));
 
         self.modal_layer(v_flex().mt(px(26.)).w(px(520.)).child(body), cx)
-    }
-
-    /// Settings → the parameters and SQL every pooled connection is opened
-    /// with. Apply tries them on a connection first (see `apply_conn_setup`).
-    fn render_conn_setup(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
-        let form = &self.setup_form;
-        let label = |text: &'static str| div().text_sm().text_color(c.fg).child(text);
-        let hint = |text: &'static str| div().text_xs().text_color(c.fg_dim).child(text);
-        let apply = Button::new("apply-setup")
-            .small()
-            .primary()
-            .label("Apply")
-            .loading(form.applying)
-            .disabled(form.applying || !self.setup_edited(cx))
-            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.apply_conn_setup(cx)));
-        v_flex()
-            .px_3()
-            .py_2()
-            .gap_1()
-            .border_b_1()
-            .border_color(c.border)
-            .child(label("Connection parameters"))
-            .child(Input::new(&form.params))
-            .child(hint(
-                "One key=value per line. libpq keys (application_name, connect_timeout, \
-                 options, …) configure the connection; any other key is a server setting \
-                 sent at startup, e.g. statement_timeout=30s.",
-            ))
-            .child(div().pt_2().child(label("Run on each connection")))
-            .child(Input::new(&form.init_sql))
-            .child(hint(
-                "SQL run on every connection the pool opens — and again after it is \
-                 reset — e.g. SET search_path TO app, public;",
-            ))
-            .children(
-                form.error
-                    .clone()
-                    .map(|e| div().text_xs().text_color(c.danger).child(e)),
-            )
-            .child(h_flex().pt_1().justify_end().child(apply))
     }
 
     /// `− N +` for the pool size. Tabs inside a transaction hold one more
@@ -1947,11 +2020,20 @@ impl Render for Workspace {
                 .with_priority(1),
             );
         }
+        // The query it asks about finished meanwhile: nothing left to cancel.
+        if let Some(Modal::ConfirmCancel(id)) = self.modal {
+            if !self.tab(id).is_some_and(|t| t.running) {
+                self.modal = None;
+            }
+        }
         let dialog = match self.modal {
             Some(Modal::Connections) => Some(self.render_conn_manager(cx).into_any_element()),
             Some(Modal::Settings) => Some(self.render_settings(window, cx).into_any_element()),
             Some(Modal::Shortcuts) => Some(self.render_shortcuts(window, cx).into_any_element()),
             Some(Modal::Palette) => Some(self.render_palette(cx).into_any_element()),
+            Some(Modal::ConfirmCancel(id)) => {
+                Some(self.render_confirm_cancel(id, cx).into_any_element())
+            }
             None => None,
         };
         root.children(dialog)
