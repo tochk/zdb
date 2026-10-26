@@ -28,8 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use zdb_config::{ConnectionEntry, Settings};
 use zdb_db::{
-    CellValue, ConnId, ConnectionConfig, DbHandle, EditTarget, ExportFormat, QueryEvent,
-    RelationDetail, RelationKind, RowEdit, SchemaObjects,
+    CellValue, ConnId, ConnSetup, ConnectionConfig, DbHandle, EditTarget, ExportFormat,
+    QueryEvent, RelationDetail, RelationKind, RowEdit, SchemaObjects,
 };
 
 mod autoscroll;
@@ -49,8 +49,8 @@ mod view;
 
 use autoscroll::AutoScroll;
 use colors::{palette, Colors};
-use conn::ConnForm;
-use grid::{Clause, PageMove, Tab, TabKind};
+use conn::{ConnForm, SetupForm};
+use grid::{Clause, Loader, PageMove, Tab, TabKind};
 pub use keynav::bind_nav_keys;
 use keynav::*;
 use modal::{Modal, ModalFocus};
@@ -99,6 +99,8 @@ enum PaletteCmd {
     ExportInserts,
     CopyTsv,
     Format,
+    QueryLog,
+    Messages,
 }
 
 const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
@@ -116,6 +118,8 @@ const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
     ("Open settings", PaletteCmd::Settings),
     ("Keyboard shortcuts", PaletteCmd::Shortcuts),
     ("Toggle terminal", PaletteCmd::Terminal),
+    ("Toggle query log", PaletteCmd::QueryLog),
+    ("Toggle messages", PaletteCmd::Messages),
     ("Focus schema tree", PaletteCmd::FocusTree),
     ("Focus editor / filter", PaletteCmd::FocusEditor),
     ("Focus result grid", PaletteCmd::FocusGrid),
@@ -199,6 +203,8 @@ pub struct Workspace {
     /// Whether the connection manager is showing the add form.
     conn_adding: bool,
     form: ConnForm,
+    /// Settings → connection setup (parameters + init SQL for the pool).
+    setup_form: SetupForm,
 
     /// Latest window geometry seen in `render`, and whether a debounced write of
     /// it is already scheduled (resizing renders every frame — one write wins).
@@ -293,6 +299,7 @@ impl Workspace {
         .detach();
 
         let form = ConnForm::new(window, cx);
+        let setup_form = SetupForm::new(&settings, window, cx);
         let tree = SchemaTree::new(window, cx);
 
         // Remember the window geometry so the next launch reopens the same size
@@ -339,6 +346,7 @@ impl Workspace {
             passwords: HashMap::new(),
             conn_adding: false,
             form,
+            setup_form,
             pending_geom: None,
             geom_flush: false,
             autoscroll: None,
@@ -457,6 +465,8 @@ impl Workspace {
             PaletteCmd::PrevTab => self.cycle_tab(false, window, cx),
             PaletteCmd::CloseTab => self.close_active_tab(window, cx),
             PaletteCmd::ApplyEdits => self.apply_active(cx),
+            PaletteCmd::QueryLog => self.toggle_query_log(cx),
+            PaletteCmd::Messages => self.toggle_messages(cx),
         }
     }
 

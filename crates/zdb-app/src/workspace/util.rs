@@ -10,6 +10,8 @@ use zdb_db::{ConnectionConfig, RelationKind, SslMode};
 pub(crate) fn format_sql(sql: &str) -> String {
     let opts = sqlformat::FormatOptions {
         uppercase: Some(true),
+        // Array syntax (`a[1]`, `ARRAY[…]`) and Postgres operators.
+        dialect: sqlformat::Dialect::PostgreSql,
         ..Default::default()
     };
     sqlformat::format(sql, &sqlformat::QueryParams::None, &opts)

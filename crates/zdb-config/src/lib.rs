@@ -36,6 +36,14 @@ pub struct Settings {
     /// queries (its connection pool). A tab inside a transaction holds one
     /// more until it ends.
     pub pool_size: usize,
+    /// Extra connection parameters every pooled connection is opened with,
+    /// one `key=value` per entry (see `zdb_db::ConnSetup::parse`).
+    pub connection_params: Vec<String>,
+    /// SQL (typically `SET`s) run on every pooled connection.
+    pub connection_init_sql: String,
+    /// Bottom-panel visibility, toggled from the status bar.
+    pub show_query_log: bool,
+    pub show_messages: bool,
 }
 
 /// `Settings::pool_size` range the UI allows.
@@ -52,6 +60,10 @@ impl Default for Settings {
             vim_navigation: false,
             restore_tabs: true,
             pool_size: 4,
+            connection_params: Vec::new(),
+            connection_init_sql: String::new(),
+            show_query_log: true,
+            show_messages: true,
         }
     }
 }
@@ -242,6 +254,10 @@ mod tests {
             vim_navigation: true,
             restore_tabs: false,
             pool_size: 7,
+            connection_params: vec!["application_name=x".into()],
+            connection_init_sql: "SET search_path TO app".into(),
+            show_query_log: false,
+            show_messages: true,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -254,6 +270,9 @@ mod tests {
         assert!(!back.restore_tabs);
         assert_eq!(back.pool_size, 7);
         assert_eq!(back.connections[0].id, "abc");
+        assert_eq!(back.connection_params, ["application_name=x"]);
+        assert_eq!(back.connection_init_sql, "SET search_path TO app");
+        assert!(!back.show_query_log && back.show_messages);
     }
 
     #[test]
@@ -284,6 +303,9 @@ mod tests {
         // Tab restore is on unless the file says otherwise.
         assert!(s.restore_tabs);
         assert_eq!(s.pool_size, 4);
+        // No connection setup; both bottom panels showing.
+        assert!(s.connection_params.is_empty() && s.connection_init_sql.is_empty());
+        assert!(s.show_query_log && s.show_messages);
     }
 
     #[test]

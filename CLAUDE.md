@@ -147,6 +147,17 @@ The WSL host can run Windows exes directly:
 
 - Background-command "exit 0" from `… | tee | tail` is the tail's exit — always
   grep the log for `error:` to confirm a build actually passed.
+- **libc is held at 0.2.189 in Cargo.lock** (`cargo update -p libc --precise 0.2.189`):
+  0.2.190+ dropped `libc::ENOATTR`, which `xattr` 0.2.3 (gpui 0.2.2 → gpui_http_client →
+  zed-async-tar) needs on Linux. A blanket `cargo update` re-breaks the build — re-pin after it.
+  Goes away once gpui leaves 0.2.2.
+- **UI stack deliberately held** at gpui 0.2.2 / gpui-component 0.5.1 / gpui-terminal 0.1.0
+  (user's call; every other dep is on its latest). gpui-component 0.8 moved to `gpui-pre`
+  0.3.x, and no terminal crate targets that — upgrading means vendoring + porting
+  gpui-terminal (Zed's own terminal is in-tree `terminal` + `terminal_view` crates on
+  alacritty_terminal, not reusable). A trial build against 0.8.1 hit ~40 API errors (Input
+  split into `gpui_base`, `CompletionProvider` signature, `Table::stripe`, `ScrollbarShow`,
+  `Application::new`, `Enter { shift }`). Don't bump these without asking.
 - Driving the app on WSL X11: stop it with `pkill -x zdb` — `pkill -f target/debug/zdb`
   matches (and kills) the shell running the command. `import -window` silently crops a
   window that extends past the screen (bottom-panel UI "missing"): `xdotool windowmove`
@@ -387,6 +398,21 @@ The WSL host can run Windows exes directly:
   `text_color` (except the semantic red/green ones): inside a gpui-component `Button`
   the icon inherits the button's text color, which is what dims it when disabled — a
   fixed color made a disabled button look live.
+- **Loader** (`grid.rs::Tab::loader`, `view.rs::loading_overlay`): a run that's still going
+  after `LOADER_DELAY` (150ms — fast ones never flash it; `begin_run` schedules the repaint)
+  gets an animated `gpui_component::spinner::Spinner` (`icons/loader-circle.svg`) card with a
+  Stop button. No rows yet → on an OPAQUE pane (`Loader::Blank`); rows/plan from before → over
+  them, dimmed (`OverData`). The overlay is an absolute `occlude()`d child of a `relative`
+  wrapper around grid|plan (the Table stays mounted underneath — focus/element state intact),
+  so no click/hover/wheel reaches the grid; keys are blocked by `tab.running` guards in
+  `grid_motion` and `begin_edit_with`, and +/- are disabled while running.
+- **Status bar + collapsible bottom panels** (`view.rs::render_status_bar`, Zed-style): ghost
+  icon toggles (`.selected` while open) for QUERY LOG / MESSAGES, persisted as
+  `Settings.show_query_log` / `show_messages` (also in the palette). With Messages hidden the
+  bar shows the latest status line. The PENDING review pane ignores the Messages toggle (it
+  holds Apply/Cancel). Hidden bottom = the `zdb-root` panel stays in the group with
+  `.visible(false)` (its height survives the toggle) and the top panel's 1200px cap is lifted.
+  The bar is pinned to `viewport_size().width` like the title bar.
 - **Pager** (`view.rs::render_pager`, `query.rs::go_page`): `« ‹ 501–1000 of N › »`. A page
   is the LIMIT box's rows (`tabs::page_size`; no LIMIT = no paging); `Tab.page` → `OFFSET
   page*limit`; applying the boxes / a header sort go back to page 1, refresh stays. It holds
@@ -515,6 +541,18 @@ The WSL host can run Windows exes directly:
     all of them when no live connection could come back. The TLS connector is built once
     per connection and reused by every dial and cancel (verifying modes load the OS trust
     store — slow on Windows).
+  - **Connection setup** (Settings → CONNECTION SETUP; `Settings.connection_params` lines +
+    `connection_init_sql`; `zdb_db::ConnSetup`, carried on `ConnectionConfig.setup`). Params:
+    libpq client keys (`application_name`, `connect_timeout`, `options`, keepalives…) set the
+    tokio-postgres `Config`; ANY other key is a server GUC sent at startup as `-c key=value` in
+    `options` (space/backslash backslash-escaped). Per-connection keys (host/port/user/dbname/
+    sslmode…) are rejected. `ConnSetup::parse` validates with line numbers — the UI's Apply and
+    `start_connect` (settings.json is hand-editable) both go through it. Init SQL runs in `dial`
+    AND again after `DISCARD ALL` (which resets SETs; startup `-c` params survive it, being the
+    session defaults) — failing there retires the connection. Live change: `DbHandle::set_setup`
+    dials a TRIAL connection first (error → nothing changes, shown in the dialog), then bumps
+    `ConnState.gen`: idle connections close now, busy ones as they come back (`Pooled.gen`
+    mismatch), pinned ones once their transaction ends. Settings are saved only once applied.
   - UI side, Stop (`query.rs::cancel`) frees the tab at once (`running = false`,
     `run_gen` bumped so the late result is dropped). `describe` is queued AFTER the run.
   Tests: `crates/zdb-db/tests/sessions.rs` (parallel sessions, pool cap, cancel isolation

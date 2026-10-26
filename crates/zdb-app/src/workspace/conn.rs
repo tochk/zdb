@@ -42,6 +42,67 @@ impl ConnForm {
     }
 }
 
+/// Settings → connection setup: the parameters and init-SQL editors, and how
+/// the last Apply went.
+pub(super) struct SetupForm {
+    pub(super) params: Entity<InputState>,
+    pub(super) init_sql: Entity<InputState>,
+    /// Why the last Apply was refused (bad line, or the trial connection
+    /// failed).
+    pub(super) error: Option<String>,
+    /// Waiting for the trial connection of an Apply.
+    pub(super) applying: bool,
+}
+
+impl SetupForm {
+    pub(super) fn new(settings: &Settings, window: &mut Window, cx: &mut Context<Workspace>) -> Self {
+        let editor = |window: &mut Window, cx: &mut Context<Workspace>, ph: &str, val: String| {
+            let ph = ph.to_string();
+            cx.new(|cx| {
+                // Auto-grow rather than a plain text area: that one takes Tab
+                // for indenting, which would trap the dialog's Tab cycle.
+                InputState::new(window, cx)
+                    .auto_grow(3, 8)
+                    .placeholder(ph)
+                    .default_value(val)
+            })
+        };
+        Self {
+            params: editor(
+                window,
+                cx,
+                "application_name=zdb\nstatement_timeout=30s",
+                settings.connection_params.join("\n"),
+            ),
+            init_sql: editor(
+                window,
+                cx,
+                "SET search_path TO app, public;",
+                settings.connection_init_sql.clone(),
+            ),
+            error: None,
+            applying: false,
+        }
+    }
+}
+
+/// The parameter lines worth keeping from the editor text.
+fn param_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The app-wide connection setup in `settings`.
+fn conn_setup(settings: &Settings) -> Result<ConnSetup, String> {
+    ConnSetup::parse(
+        &settings.connection_params.join("\n"),
+        &settings.connection_init_sql,
+    )
+}
+
 /// The id for a connection being saved as `name`: the existing entry's when
 /// one has that name, else a fresh one.
 fn conn_id_for(connections: &[ConnectionEntry], name: &str) -> String {
@@ -200,7 +261,16 @@ impl Workspace {
         self.switch_connection(entry_to_config(&entry, pw), Some(entry.id.clone()), cx);
     }
 
-    pub(super) fn start_connect(&mut self, cfg: ConnectionConfig, cx: &mut Context<Self>) {
+    pub(super) fn start_connect(&mut self, mut cfg: ConnectionConfig, cx: &mut Context<Self>) {
+        // Hand-editable settings: a bad parameter is reported, not ignored.
+        match conn_setup(&self.settings) {
+            Ok(setup) => cfg.setup = setup,
+            Err(e) => {
+                self.status = format!("Connection failed: Settings → connection parameters, {e}");
+                cx.notify();
+                return;
+            }
+        }
         self.status = format!("Connecting to {}…", cfg.name);
         let db = self.db.clone();
         let key = self.conn_key.clone();
@@ -240,6 +310,61 @@ impl Workspace {
         });
     }
 
+    /// Whether the setup editors hold something other than what is saved.
+    pub(super) fn setup_edited(&self, cx: &App) -> bool {
+        let params = param_lines(&self.setup_form.params.read(cx).value());
+        let init_sql = self.setup_form.init_sql.read(cx).value().trim().to_string();
+        params != self.settings.connection_params || init_sql != self.settings.connection_init_sql
+    }
+
+    /// Settings → connection setup → Apply. Connected, the live pool tries a
+    /// connection with the new setup first and takes it over only if that
+    /// works; the setup is saved once it is in use (or, not connected, once
+    /// it parses).
+    pub(super) fn apply_conn_setup(&mut self, cx: &mut Context<Self>) {
+        let params_text = self.setup_form.params.read(cx).value().to_string();
+        let init_sql = self.setup_form.init_sql.read(cx).value().trim().to_string();
+        let setup = match ConnSetup::parse(&params_text, &init_sql) {
+            Ok(setup) => setup,
+            Err(e) => {
+                self.setup_form.error = Some(format!("Connection parameters, {e}"));
+                cx.notify();
+                return;
+            }
+        };
+        self.setup_form.error = None;
+        let params = param_lines(&params_text);
+        let Some(conn) = self.conn else {
+            self.store_conn_setup(params, init_sql);
+            self.status = "Connection setup saved; used from the next connect".into();
+            cx.notify();
+            return;
+        };
+        self.setup_form.applying = true;
+        let db = self.db.clone();
+        self.spawn_db(
+            cx,
+            async move { db.set_setup(conn, setup).await },
+            move |this, res, _cx| {
+                this.setup_form.applying = false;
+                match res {
+                    Ok(()) => {
+                        this.store_conn_setup(params, init_sql);
+                        this.status = "Connection setup applied to every connection".into();
+                    }
+                    Err(e) => this.setup_form.error = Some(e.to_string()),
+                }
+            },
+        );
+        cx.notify();
+    }
+
+    fn store_conn_setup(&mut self, params: Vec<String>, init_sql: String) {
+        self.settings.connection_params = params;
+        self.settings.connection_init_sql = init_sql;
+        self.save_settings();
+    }
+
     /// (Re)start the bundled `sqls` server for the just-connected database, so
     /// SQL editors get schema-aware completion. Best-effort: if `sqls` isn't
     /// bundled/installed we log and carry on with no completion.
@@ -265,6 +390,64 @@ mod tests {
     use super::*;
     use crate::workspace::test_support::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn param_lines_drop_blanks() {
+        assert_eq!(
+            param_lines("  a=1 \n\n b = 2\n"),
+            vec!["a=1".to_string(), "b = 2".to_string()]
+        );
+    }
+
+    /// A broken parameter in settings.json stops the connect with a message
+    /// instead of being dropped silently.
+    #[gpui::test]
+    fn bad_saved_setup_fails_the_connect(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, _w, cx| {
+                ws.settings.connection_params = vec!["connect_timeout=soon".into()];
+                ws.start_connect(ConnectionConfig::new("n", "127.0.0.1", "d", "u"), cx);
+                assert!(
+                    ws.status.contains("connection parameters, line 1"),
+                    "status: {}",
+                    ws.status
+                );
+            })
+            .unwrap();
+    }
+
+    /// Not connected, Apply only checks the text and saves it; a bad line is
+    /// reported in the dialog and nothing is saved.
+    #[gpui::test]
+    fn apply_setup_checks_then_saves(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let set = |ws: &mut Workspace, params: &str, window: &mut Window, cx: &mut Context<Workspace>| {
+                    ws.setup_form
+                        .params
+                        .update(cx, |i, cx| i.set_value(params.to_string(), window, cx));
+                };
+                assert!(!ws.setup_edited(cx));
+                set(ws, "keepalives=maybe", window, cx);
+                ws.setup_form
+                    .init_sql
+                    .update(cx, |i, cx| i.set_value(" SET lock_timeout = '5s' ", window, cx));
+                assert!(ws.setup_edited(cx));
+                ws.apply_conn_setup(cx);
+                assert!(ws.setup_form.error.as_deref().unwrap().contains("line 1"));
+                assert!(ws.settings.connection_params.is_empty());
+
+                set(ws, "application_name=x\n\nwork_mem=64MB", window, cx);
+                ws.apply_conn_setup(cx);
+                assert_eq!(ws.setup_form.error, None);
+                assert_eq!(ws.settings.connection_params, ["application_name=x", "work_mem=64MB"]);
+                assert_eq!(ws.settings.connection_init_sql, "SET lock_timeout = '5s'");
+                assert!(!ws.setup_edited(cx));
+            })
+            .unwrap();
+    }
 
     #[test]
     fn resaving_a_connection_keeps_its_id() {

@@ -79,12 +79,24 @@ impl Workspace {
     }
 
     /// Start a run of `tab_id`: whatever it still has in flight is stale from
-    /// here on. Returns the run's number for `current_run`.
-    fn begin_run(&mut self, tab_id: u64) -> Option<u64> {
+    /// here on. Returns the run's number for `current_run`. Its loader shows
+    /// if it is still going after `LOADER_DELAY` (a render then draws it).
+    fn begin_run(&mut self, tab_id: u64, cx: &mut Context<Self>) -> Option<u64> {
         let tab = self.tab_mut(tab_id)?;
         tab.run_gen += 1;
         tab.running = true;
-        Some(tab.run_gen)
+        tab.running_since = Some(std::time::Instant::now());
+        let gen = tab.run_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(grid::LOADER_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.current_run(tab_id, gen).is_some_and(|t| t.running) {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        Some(gen)
     }
 
     /// `tab_id`, if run `gen` is still its latest (not stopped or superseded).
@@ -175,7 +187,7 @@ impl Workspace {
             cx.notify();
             return;
         };
-        let Some(gen) = self.begin_run(tab_id) else {
+        let Some(gen) = self.begin_run(tab_id, cx) else {
             return;
         };
         self.status = "Explaining…".into();
@@ -280,7 +292,7 @@ impl Workspace {
         let Some(session) = self.tab_session(tab_id) else {
             return;
         };
-        let Some(gen) = self.begin_run(tab_id) else {
+        let Some(gen) = self.begin_run(tab_id, cx) else {
             return;
         };
         self.status = "Counting rows…".into();
@@ -400,7 +412,7 @@ impl Workspace {
         let Some(session) = self.tab_session(tab_id) else {
             return;
         };
-        let Some(gen) = self.begin_run(tab_id) else {
+        let Some(gen) = self.begin_run(tab_id, cx) else {
             return;
         };
         // Where these rows start in the table (the OFFSET), as of the request,
@@ -843,7 +855,7 @@ mod tests {
                 ws.close_modal(cx);
                 ws.open_query_tab(window, cx);
                 let id = ws.active_id().unwrap();
-                let gen = ws.begin_run(id).unwrap();
+                let gen = ws.begin_run(id, cx).unwrap();
                 assert!(ws.tab(id).unwrap().running);
                 ws.cancel(cx);
                 assert!(!ws.tab(id).unwrap().running);
@@ -852,6 +864,39 @@ mod tests {
                 let now = ws.tab(id).unwrap().run_gen;
                 ws.cancel(cx);
                 assert_eq!(ws.tab(id).unwrap().run_gen, now);
+            })
+            .unwrap();
+    }
+
+    /// The loader waits out `LOADER_DELAY`, then covers a blank pane — or
+    /// the rows from before, which take no input until the run is over.
+    #[gpui::test]
+    fn loader_shows_once_a_run_takes_a_while(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.close_modal(cx);
+                let id = seed_query_tab(ws, window, cx);
+                ws.begin_run(id, cx).unwrap();
+                let start = ws.tab(id).unwrap().running_since.unwrap();
+                let later = start + grid::LOADER_DELAY;
+                assert_eq!(ws.tab(id).unwrap().loader(start), None);
+                assert_eq!(ws.tab(id).unwrap().loader(later), Some(Loader::Blank));
+
+                seed_rows(ws, id, vec!["id", "name"], 3, cx);
+                editable_tab(ws, id, vec!["id", "name"]);
+                ws.set_cursor(id, 0, 0, cx);
+                assert_eq!(ws.tab(id).unwrap().loader(later), Some(Loader::OverData));
+                ws.grid_motion(Motion::Down, cx);
+                ws.begin_edit(id, 0, 1, window, cx);
+                let tab = ws.tab(id).unwrap();
+                assert_eq!((tab.cursor, tab.editing), (Some((0, 0)), None));
+
+                // Stopped: no loader, and the grid answers again.
+                ws.cancel(cx);
+                assert_eq!(ws.tab(id).unwrap().loader(later), None);
+                ws.grid_motion(Motion::Down, cx);
+                assert_eq!(ws.tab(id).unwrap().cursor, Some((1, 0)));
             })
             .unwrap();
     }

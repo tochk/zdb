@@ -24,10 +24,10 @@ tree-sitter-sequel.workspace = true
 # (`gpui_component::Rope`) so we don't declare its beta `ropey` ourselves.
 lsp-types = "=0.97.0"
 serde_json.workspace = true
-futures-channel = "0.3"
+futures-channel = "0.3.34"
 
 [build-dependencies]
-embed-resource = "3"
+embed-resource = "3.0.12"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
