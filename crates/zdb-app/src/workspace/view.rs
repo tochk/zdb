@@ -511,8 +511,8 @@ impl Workspace {
             results = results.child(Self::render_filter_bar(tab, window, c, cx));
         }
         // The results area shows the grid, or — after EXPLAIN — the plan text in
-        // that same place (query data vs. plan, same spot). A run that takes a
-        // while puts its loader over it.
+        // that same place (query data vs. plan, same spot). A running query
+        // puts its loader over it.
         let shown = if let Some(plan) = &tab.plan {
             Self::plan_view(tab_id, plan, c, cx).into_any_element()
         } else {
@@ -538,7 +538,7 @@ impl Workspace {
                     .child(Table::new(&tab.table).stripe(true).bordered(true))
                     .into_any_element()
         };
-        let loader = tab.loader(std::time::Instant::now());
+        let loader = tab.loader();
         results = results.child(
             div()
                 .relative()

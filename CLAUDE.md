@@ -409,18 +409,19 @@ The WSL host can run Windows exes directly:
   `text_color` (except the semantic red/green ones): inside a gpui-component `Button`
   the icon inherits the button's text color, which is what dims it when disabled — a
   fixed color made a disabled button look live.
-- **Loader** (`grid.rs::Tab::loader`, `view.rs::loading_overlay`): a run that's still going
-  after `LOADER_DELAY` (150ms — fast ones never flash it; `begin_run` schedules the repaint)
-  gets a bare animated `gpui_component::spinner::Spinner` (`icons/loader-circle.svg`) — no
-  card, no text (the user's call). No rows yet → on an OPAQUE pane (`Loader::Blank`);
-  rows/plan from before → over them, dimmed (`OverData`). A click on it asks "Cancel the
-  running query?" (`Modal::ConfirmCancel(tab_id)` → `confirm_cancel` → `cancel_tab`); `render`
-  drops that dialog once the run is over. Its "Don't ask again" box (`cancel_dont_ask`, reset
-  each time it opens) counts ONLY with "Cancel query" — it clears
-  `Settings.confirm_query_cancel` (also a Settings checkbox); after that a click cancels at once. The overlay is an absolute `occlude()`d child of a `relative`
-  wrapper around grid|plan (the Table stays mounted underneath — focus/element state intact),
-  so no click/hover/wheel reaches the grid; keys are blocked by `tab.running` guards in
-  `grid_motion` and `begin_edit_with`, and +/- are disabled while running.
+- **Loader** (`grid.rs::Tab::loader`, `view.rs::loading_overlay`): every run shows it from
+  the moment it starts — NO delay before it (the user's call; a 150ms one was removed). A bare
+  animated `gpui_component::spinner::Spinner` (`icons/loader-circle.svg`), no card, no text.
+  No rows yet → on an OPAQUE pane (`Loader::Blank`); rows/plan from before → over them,
+  dimmed (`OverData`). A click on it asks "Cancel the running query?"
+  (`Modal::ConfirmCancel(tab_id)` → `confirm_cancel` → `cancel_tab`); `render` drops that
+  dialog once the run is over. Its "Don't ask again" box (`cancel_dont_ask`, reset each time
+  it opens) counts ONLY with "Cancel query" — it clears `Settings.confirm_query_cancel` (also
+  a Settings checkbox); after that a click cancels at once. The overlay is an absolute
+  `occlude()`d child of a `relative` wrapper around grid|plan (the Table stays mounted
+  underneath — focus/element state intact), so no click/hover/wheel reaches the grid; keys
+  are blocked by `tab.running` guards in `grid_motion` and `begin_edit_with`, and +/- are
+  disabled while running.
 - **Status bar + collapsible bottom panels** (`view.rs::render_status_bar`, Zed-style): ghost
   icon toggles (`.selected` + a `theme.blue` icon while open) for QUERY LOG / MESSAGES, persisted as
   `Settings.show_query_log` / `show_messages` (also in the palette). With Messages hidden the

@@ -15,7 +15,6 @@ use gpui_component::{
 };
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
 use zdb_db::{CellValue, DbHandle, EditTarget, RowEdit, Session};
 
 use super::colors::{palette, Colors};
@@ -602,8 +601,6 @@ pub(crate) struct Tab {
     pub(crate) edited_cells: HashSet<(usize, usize)>,
 
     pub(crate) running: bool,
-    /// When the current run started (see `Tab::loader`).
-    pub(crate) running_since: Option<Instant>,
     /// Bumped by every run (and by Stop): a result that comes back for an
     /// older one is stale and dropped.
     pub(crate) run_gen: u64,
@@ -627,10 +624,6 @@ pub(crate) struct Tab {
     /// Table tabs: the box the last failed run's error points into.
     pub(crate) clause_error: Option<Clause>,
 }
-
-/// How long a run goes on before its loader shows, so a fast one never
-/// flashes it.
-pub(crate) const LOADER_DELAY: Duration = Duration::from_millis(150);
 
 /// The loader over a tab's results while it runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -727,11 +720,9 @@ pub(crate) fn make_sql_editor(
 }
 
 impl Tab {
-    /// The loader to draw at `now`, once the run has gone on for
-    /// `LOADER_DELAY`.
-    pub(crate) fn loader(&self, now: Instant) -> Option<Loader> {
-        let since = self.running_since.filter(|_| self.running)?;
-        if now.saturating_duration_since(since) < LOADER_DELAY {
+    /// The loader to draw: from the moment a run starts until it is over.
+    pub(crate) fn loader(&self) -> Option<Loader> {
+        if !self.running {
             return None;
         }
         Some(if self.headers.is_empty() && self.plan.is_none() {
@@ -787,7 +778,6 @@ impl Tab {
             pending: Vec::new(),
             edited_cells: HashSet::new(),
             running: false,
-            running_since: None,
             run_gen: 0,
             db_session: None,
             in_transaction: false,
