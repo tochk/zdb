@@ -122,6 +122,22 @@ const ICONS: &[(&str, &[u8])] = &[
         "icons/braces.svg",
         include_bytes!("../assets/icons/braces.svg"),
     ),
+    (
+        "icons/loader-circle.svg",
+        include_bytes!("../assets/icons/loader-circle.svg"),
+    ),
+    (
+        "icons/history.svg",
+        include_bytes!("../assets/icons/history.svg"),
+    ),
+    (
+        "icons/message-square.svg",
+        include_bytes!("../assets/icons/message-square.svg"),
+    ),
+    (
+        "icons/pencil.svg",
+        include_bytes!("../assets/icons/pencil.svg"),
+    ),
 ];
 
 pub struct Assets;

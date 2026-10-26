@@ -5,7 +5,9 @@
 //! Skipped unless the `ZDB_TEST_*` Postgres env is set (see connect.rs).
 
 use std::time::{Duration, Instant};
-use zdb_db::{CellValue, ConnectionConfig, DbError, DbHandle, QueryEvent, Session, SslMode};
+use zdb_db::{
+    CellValue, ConnSetup, ConnectionConfig, DbError, DbHandle, QueryEvent, Session, SslMode,
+};
 
 fn test_config() -> Option<ConnectionConfig> {
     let host = std::env::var("ZDB_TEST_HOST").ok()?;
@@ -292,4 +294,63 @@ async fn closing_a_session_rolls_back_and_stops_it() {
         t.elapsed()
     );
     run(&db, shared, "DROP TABLE zdb_pool_close").await.unwrap();
+}
+
+/// Every pooled connection gets the setup's parameters and init SQL — also
+/// after a reset (DISCARD ALL undoes SETs) — and a new setup replaces the old
+/// one only once a connection opened with it works.
+#[tokio::test]
+async fn setup_applies_to_every_connection() {
+    let Some(mut cfg) = test_config() else { return };
+    cfg.setup = ConnSetup::parse(
+        "application_name=zdb-setup\nwork_mem=12MB",
+        "SET lock_timeout = '7s';",
+    )
+    .unwrap();
+    let db = DbHandle::spawn();
+    let conn = db.connect(cfg.clone()).await.expect("connect");
+    let (a, b) = (Session::new(conn, 1), Session::new(conn, 2));
+    const SHOW: &str = "SELECT current_setting('application_name') || ' ' || \
+        current_setting('work_mem') || ' ' || current_setting('lock_timeout') || ' ' || \
+        pg_backend_pid() FROM pg_sleep(0.3)";
+    let settings = |r: Option<String>| {
+        let r = r.unwrap();
+        let (settings, pid) = r.rsplit_once(' ').unwrap();
+        (settings.to_string(), pid.to_string())
+    };
+
+    // Two sessions at once: two connections, both set up.
+    let (ra, rb) = tokio::join!(run(&db, a, SHOW), run(&db, b, SHOW));
+    let ((sa, pa), (sb, pb)) = (settings(ra.unwrap()), settings(rb.unwrap()));
+    assert_ne!(pa, pb, "expected two connections");
+    assert_eq!(sa, "zdb-setup 12MB 7s");
+    assert_eq!(sb, sa);
+
+    // A SET makes the connection be reset; the setup comes back with it.
+    run(&db, a, "SET lock_timeout = '1s'").await.unwrap();
+    let (ra, rb) = tokio::join!(run(&db, a, SHOW), run(&db, b, SHOW));
+    assert_eq!(settings(ra.unwrap()).0, "zdb-setup 12MB 7s");
+    assert_eq!(settings(rb.unwrap()).0, "zdb-setup 12MB 7s");
+
+    // A broken setup is refused and changes nothing…
+    let bad = ConnSetup::parse("", "SET zdb_no_such_setting = 1").unwrap();
+    let err = db.set_setup(conn, bad).await.unwrap_err();
+    assert!(err.to_string().contains("connection setup SQL"), "{err}");
+    let bad = ConnSetup::parse("zdb_no_such_param=1", "").unwrap();
+    assert!(db.set_setup(conn, bad).await.is_err());
+    assert_eq!(settings(run(&db, a, SHOW).await.unwrap()).0, "zdb-setup 12MB 7s");
+
+    // …a working one replaces it on every connection.
+    let good = ConnSetup::parse("", "SET lock_timeout = '3s'").unwrap();
+    db.set_setup(conn, good).await.unwrap();
+    // (work_mem back at the server's default, whatever that is here.)
+    let (ra, rb) = tokio::join!(run(&db, a, SHOW), run(&db, b, SHOW));
+    for (s, _) in [settings(ra.unwrap()), settings(rb.unwrap())] {
+        assert!(s.starts_with("zdb ") && s.ends_with(" 3s") && !s.contains("12MB"), "{s}");
+    }
+
+    // Connecting with init SQL that fails fails the connect.
+    cfg.setup = ConnSetup::parse("", "SELECT 1/0").unwrap();
+    let err = db.connect(cfg).await.unwrap_err();
+    assert!(err.to_string().contains("division by zero"), "{err}");
 }

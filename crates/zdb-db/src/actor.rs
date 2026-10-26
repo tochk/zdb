@@ -23,6 +23,9 @@
 //!   can't starve everything else. Other session state doesn't survive: a
 //!   connection whose runs looked like they changed some (`SET`, temp tables,
 //!   `PREPARE` …) is `DISCARD ALL`ed before it goes back to the pool.
+//!   Every connection is opened the same way — the [`ConnSetup`]'s parameters
+//!   and init SQL — and the init SQL runs again after a reset; changing the
+//!   setup ([`DbHandle::set_setup`]) retires the connections opened before.
 //! - **Cancel.** [`DbHandle::cancel`] stops the session's running job and
 //!   drops its queued ones — and the connection only goes back to the pool
 //!   once the cancel request has landed. Postgres applies a cancel to whatever
@@ -34,7 +37,8 @@ use crate::introspect::{
 };
 use crate::tls::make_connector;
 use crate::{
-    edit, query, ConnectionConfig, ConnId, DbError, DescribedResult, EditTarget, QueryEvent, RowEdit,
+    edit, query, ConnSetup, ConnectionConfig, ConnId, DbError, DescribedResult, EditTarget,
+    QueryEvent, RowEdit,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -173,23 +177,44 @@ enum Command {
         conn: ConnId,
         size: usize,
     },
+    SetSetup {
+        conn: ConnId,
+        setup: ConnSetup,
+        reply: oneshot::Sender<Result<(), DbError>>,
+    },
     Disconnect {
         conn: ConnId,
     },
-    /// A pooled connection finished dialing (internal).
+    /// A pooled connection finished dialing (internal), for setup `gen`.
     Dialed {
         conn: ConnId,
+        gen: u64,
         result: Result<Client, DbError>,
+    },
+    /// The trial connection of a `SetSetup` finished dialing (internal).
+    SetupDialed {
+        conn: ConnId,
+        cfg: Arc<ConnectionConfig>,
+        result: Result<Client, DbError>,
+        reply: oneshot::Sender<Result<(), DbError>>,
     },
     /// A job finished and hands its connection back (internal). `client` is
     /// `None` when it died; `retry` is a job to queue again at the front.
     JobDone {
         conn: ConnId,
         session: u64,
-        client: Option<Client>,
+        client: Option<Pooled>,
         done: Ran,
         retry: Option<Queued>,
     },
+}
+
+/// A pooled Postgres connection and the setup it was opened with.
+struct Pooled {
+    client: Client,
+    /// `ConnState::gen` when it was dialed. One from an older setup is closed
+    /// instead of going back to the pool.
+    gen: u64,
 }
 
 /// How a job left its connection.
@@ -215,7 +240,7 @@ struct SessionState {
     cancelled: watch::Sender<u64>,
     /// Its connection while a transaction is open on it, and whether that
     /// needs a reset once the transaction is over.
-    pinned: Option<(Client, bool)>,
+    pinned: Option<(Pooled, bool)>,
     /// Closed by the caller; forgotten once its last job is back.
     closed: bool,
 }
@@ -235,6 +260,9 @@ impl SessionState {
 /// One open connection: its config and pool.
 struct ConnState {
     cfg: Arc<ConnectionConfig>,
+    /// Bumped whenever `cfg`'s setup changes; connections carry the value
+    /// they were opened with.
+    gen: u64,
     /// Built once and reused — by every dial and, above all, every cancel
     /// request, which must not wait on a fresh TLS setup (loading the OS trust
     /// store for the verifying modes is slow on some systems).
@@ -247,7 +275,7 @@ struct ConnState {
     /// Of `open`, the ones pinned to a session (outside the pool size).
     pinned: usize,
     /// Idle connections, each with when it was last given back.
-    idle: Vec<(Client, Instant)>,
+    idle: Vec<(Pooled, Instant)>,
     /// Jobs not started yet, in arrival order.
     queue: VecDeque<Queued>,
     sessions: HashMap<u64, SessionState>,
@@ -257,12 +285,13 @@ impl ConnState {
     fn new(cfg: ConnectionConfig, connector: MakeRustlsConnect, first: Client) -> Self {
         Self {
             cfg: Arc::new(cfg),
+            gen: 0,
             connector,
             size: DEFAULT_POOL_SIZE,
             open: 1,
             dialing: 0,
             pinned: 0,
-            idle: vec![(first, Instant::now())],
+            idle: vec![(Pooled { client: first, gen: 0 }, Instant::now())],
             queue: VecDeque::new(),
             sessions: HashMap::new(),
         }
@@ -293,10 +322,10 @@ impl ConnState {
     }
 
     /// An idle connection that is still alive.
-    fn take_idle(&mut self) -> Option<Client> {
-        while let Some((client, _)) = self.idle.pop() {
-            if !client.is_closed() {
-                return Some(client);
+    fn take_idle(&mut self) -> Option<Pooled> {
+        while let Some((pooled, _)) = self.idle.pop() {
+            if !pooled.client.is_closed() {
+                return Some(pooled);
             }
             self.open -= 1;
         }
@@ -336,9 +365,10 @@ impl ConnState {
             self.open += 1;
             self.dialing += 1;
             let (cfg, connector, tx) = (self.cfg.clone(), self.connector.clone(), tx.clone());
+            let gen = self.gen;
             tokio::spawn(async move {
                 let result = dial(&cfg, &connector).await;
-                let _ = tx.send(Command::Dialed { conn, result });
+                let _ = tx.send(Command::Dialed { conn, gen, result });
             });
         }
     }
@@ -347,7 +377,7 @@ impl ConnState {
         &mut self,
         conn: ConnId,
         q: Queued,
-        client: Client,
+        client: Pooled,
         before: Ran,
         tx: &mpsc::UnboundedSender<Command>,
     ) {
@@ -360,6 +390,7 @@ impl ConnState {
             client,
             before,
             cancelled,
+            self.cfg.clone(),
             self.connector.clone(),
             tx.clone(),
         ));
@@ -400,24 +431,27 @@ impl ConnState {
     }
 
     /// A job's connection came back.
-    fn job_done(&mut self, session: u64, client: Option<Client>, ran: Ran, retry: Option<Queued>) {
+    fn job_done(&mut self, session: u64, client: Option<Pooled>, ran: Ran, retry: Option<Queued>) {
         if ran.was_pinned {
             // Counted again below if it stays pinned.
             self.pinned -= 1;
         }
         let closed = self.sessions.get(&session).is_none_or(|s| s.closed);
         let over = self.open - self.pinned > self.size;
-        match client.filter(|c| !c.is_closed()) {
+        match client.filter(|c| !c.client.is_closed()) {
             None => self.open -= 1,
+            // An open transaction keeps its connection even under an older
+            // setup; it is retired once the transaction is over.
             Some(c) if ran.in_transaction && !closed => {
                 if let Some(s) = self.sessions.get_mut(&session) {
                     s.pinned = Some((c, ran.dirty));
                     self.pinned += 1;
                 }
             }
-            // A closed session's transaction, or over the (lowered) pool
-            // size: close it (the server rolls the transaction back).
-            Some(_) if ran.in_transaction || over => self.open -= 1,
+            // A closed session's transaction, over the (lowered) pool size, or
+            // opened under an older setup: close it (the server rolls a
+            // transaction back).
+            Some(c) if ran.in_transaction || over || c.gen != self.gen => self.open -= 1,
             Some(c) => self.idle.push((c, Instant::now())),
         }
         if let Some(s) = self.sessions.get_mut(&session) {
@@ -454,9 +488,28 @@ impl ConnState {
     fn reap(&mut self, now: Instant) {
         let newest = self.idle.iter().map(|(_, at)| *at).max();
         let before = self.idle.len();
-        self.idle
-            .retain(|(c, at)| !c.is_closed() && (Some(*at) == newest || now - *at < IDLE_TIMEOUT));
+        self.idle.retain(|(c, at)| {
+            !c.client.is_closed() && (Some(*at) == newest || now - *at < IDLE_TIMEOUT)
+        });
         self.open -= before - self.idle.len();
+    }
+
+    /// Switch to `cfg`'s setup. `trial` is a connection already opened with
+    /// it: the idle connections make way for it, and busy ones are closed as
+    /// they come back (pinned ones once their transaction is over).
+    fn set_setup(&mut self, cfg: Arc<ConnectionConfig>, trial: Client) {
+        self.cfg = cfg;
+        self.gen += 1;
+        self.open -= self.idle.len();
+        self.idle.clear();
+        if self.open - self.pinned < self.size {
+            self.open += 1;
+            let pooled = Pooled {
+                client: trial,
+                gen: self.gen,
+            };
+            self.idle.push((pooled, Instant::now()));
+        }
     }
 
     fn set_size(&mut self, size: usize) {
@@ -514,6 +567,19 @@ impl DbHandle {
     /// goes idle.
     pub fn set_pool_size(&self, conn: ConnId, size: usize) {
         let _ = self.tx.send(Command::SetPoolSize { conn, size });
+    }
+
+    /// Open `conn`'s connections with `setup` from now on. A trial connection
+    /// is opened with it first: if that fails (a bad parameter, init SQL that
+    /// errors) the error comes back and nothing changes. Otherwise the pool's
+    /// existing connections are replaced as they go idle — except one inside
+    /// a transaction, which is kept until that ends.
+    pub async fn set_setup(&self, conn: ConnId, setup: ConnSetup) -> Result<(), DbError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Command::SetSetup { conn, setup, reply })
+            .map_err(|_| DbError::WorkerGone)?;
+        rx.await.map_err(|_| DbError::WorkerGone)?
     }
 
     fn submit(&self, session: Session, job: Job) {
@@ -766,12 +832,14 @@ fn closed() -> DbError {
 /// runs, a cancel of its session sends a cancel request, and the connection
 /// is only handed back once that has landed. `before` is the connection's
 /// state as the job got it.
+#[allow(clippy::too_many_arguments)]
 async fn run_pooled(
     conn: ConnId,
     q: Queued,
-    client: Client,
+    pooled: Pooled,
     before: Ran,
     mut cancelled: watch::Receiver<u64>,
+    cfg: Arc<ConnectionConfig>,
     connector: MakeRustlsConnect,
     tx: mpsc::UnboundedSender<Command>,
 ) {
@@ -781,11 +849,12 @@ async fn run_pooled(
         job,
         retried,
     } = q;
+    let Pooled { client, gen } = pooled;
     let done = |client: Option<Client>, done: Ran, retry: Option<Queued>| {
         let _ = tx.send(Command::JobDone {
             conn,
             session,
-            client,
+            client: client.map(|client| Pooled { client, gen }),
             done,
             retry,
         });
@@ -856,6 +925,11 @@ async fn run_pooled(
         // server-side statements tokio-postgres may have cached type lookups in.
         let _ = client.batch_execute("DISCARD ALL").await;
         client.clear_type_cache();
+        // …and undoes the setup's SETs: put them back, or retire the
+        // connection when that fails.
+        if init_session(&client, &cfg).await.is_err() {
+            return done(None, gone, None);
+        }
     }
     let ran = Ran {
         was_pinned: before.was_pinned,
@@ -931,16 +1005,61 @@ async fn worker(tx: mpsc::UnboundedSender<Command>, mut rx: mpsc::UnboundedRecei
                 state.set_size(size);
                 conn
             }),
+            Command::SetSetup { conn, setup, reply } => {
+                match conns.get(&conn) {
+                    Some(state) => {
+                        let mut cfg = (*state.cfg).clone();
+                        cfg.setup = setup;
+                        let (cfg, connector, tx) =
+                            (Arc::new(cfg), state.connector.clone(), tx.clone());
+                        tokio::spawn(async move {
+                            let result = dial(&cfg, &connector).await;
+                            let _ = tx.send(Command::SetupDialed {
+                                conn,
+                                cfg,
+                                result,
+                                reply,
+                            });
+                        });
+                    }
+                    None => {
+                        let _ = reply.send(Err(DbError::NoConnection(conn)));
+                    }
+                }
+                None
+            }
+            Command::SetupDialed {
+                conn,
+                cfg,
+                result,
+                reply,
+            } => {
+                let state = conns.get_mut(&conn);
+                let _ = reply.send(match (state, result) {
+                    (Some(state), Ok(trial)) => {
+                        state.set_setup(cfg, trial);
+                        Ok(())
+                    }
+                    (None, _) => Err(DbError::NoConnection(conn)),
+                    (_, Err(e)) => Err(e),
+                });
+                None
+            }
             Command::Disconnect { conn } => {
                 // Dropping the sessions' cancel senders stops their running
                 // jobs; their connections close as they come back.
                 conns.remove(&conn);
                 None
             }
-            Command::Dialed { conn, result } => conns.get_mut(&conn).map(|state| {
+            Command::Dialed { conn, gen, result } => conns.get_mut(&conn).map(|state| {
                 state.dialing -= 1;
                 match result {
-                    Ok(client) => state.idle.push((client, Instant::now())),
+                    Ok(client) if gen == state.gen => {
+                        state.idle.push((Pooled { client, gen }, Instant::now()))
+                    }
+                    // Opened with a setup that has been replaced meanwhile:
+                    // `pump` dials again with the current one.
+                    Ok(_) => state.open -= 1,
                     Err(e) => {
                         state.open -= 1;
                         state.dial_failed(e);
@@ -1093,10 +1212,12 @@ async fn apply_batch(client: &Client, batch: &str) -> Result<(), DbError> {
     }
 }
 
-/// Open one Postgres connection and spawn its protocol driver.
+/// Open one Postgres connection, spawn its protocol driver, and run the
+/// setup's init SQL on it.
 async fn dial(cfg: &ConnectionConfig, connector: &MakeRustlsConnect) -> Result<Client, DbError> {
     let (client, connection) = cfg
         .to_pg_config()
+        .map_err(DbError::Connect)?
         .connect(connector.clone())
         .await
         .map_err(|e| DbError::Connect(e.to_string()))?;
@@ -1105,5 +1226,18 @@ async fn dial(cfg: &ConnectionConfig, connector: &MakeRustlsConnect) -> Result<C
     tokio::spawn(async move {
         let _ = connection.await;
     });
+    init_session(&client, cfg).await?;
     Ok(client)
+}
+
+/// Run the setup's init SQL (if any) on a fresh or just-reset connection.
+async fn init_session(client: &Client, cfg: &ConnectionConfig) -> Result<(), DbError> {
+    let sql = &cfg.setup.init_sql;
+    if sql.is_empty() {
+        return Ok(());
+    }
+    client
+        .batch_execute(sql)
+        .await
+        .map_err(|e| DbError::Connect(format!("connection setup SQL: {}", DbError::from_pg(&e))))
 }

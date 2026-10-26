@@ -16,14 +16,8 @@ serde.workspace = true
 serde_json.workspace = true
 directories.workspace = true
 anyhow.workspace = true
-uuid = { version = "1", features = ["v4"] }
-
-# OS keychain for connection passwords — native backend per platform.
-[target.'cfg(windows)'.dependencies]
-keyring = { version = "3", default-features = false, features = ["windows-native"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", default-features = false, features = ["apple-native"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", default-features = false, features = ["sync-secret-service"] }
+uuid = { version = "1.29", features = ["v4"] }
+# OS keychain for connection passwords. keyring 4's `v1` feature (its default)
+# picks the native store per platform: Windows Credential Manager, macOS
+# Keychain, the Secret Service (over zbus) on Linux.
+keyring = "4.2"

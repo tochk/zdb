@@ -36,6 +36,11 @@ pub struct Settings {
     /// queries (its connection pool). A tab inside a transaction holds one
     /// more until it ends.
     pub pool_size: usize,
+    /// A click on a running query's loader asks before cancelling it.
+    pub confirm_query_cancel: bool,
+    /// Bottom-panel visibility, toggled from the status bar.
+    pub show_query_log: bool,
+    pub show_messages: bool,
 }
 
 /// `Settings::pool_size` range the UI allows.
@@ -52,6 +57,9 @@ impl Default for Settings {
             vim_navigation: false,
             restore_tabs: true,
             pool_size: 4,
+            confirm_query_cancel: true,
+            show_query_log: true,
+            show_messages: true,
         }
     }
 }
@@ -83,6 +91,13 @@ pub struct ConnectionEntry {
     /// One of: disable, prefer, require, verify-ca, verify-full.
     #[serde(default = "default_ssl")]
     pub ssl_mode: String,
+    /// Extra parameters every connection of its pool is opened with, one
+    /// `key=value` per entry (see `zdb_db::ConnSetup::parse`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub params: Vec<String>,
+    /// SQL (typically `SET`s) run on every connection of its pool.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub init_sql: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +240,8 @@ mod tests {
                 dbname: "app".into(),
                 user: "me".into(),
                 ssl_mode: "require".into(),
+                params: vec!["application_name=x".into()],
+                init_sql: "SET search_path TO app".into(),
             }],
             theme: Theme::Light,
             keymap: vec![KeyBindingEntry {
@@ -242,6 +259,9 @@ mod tests {
             vim_navigation: true,
             restore_tabs: false,
             pool_size: 7,
+            confirm_query_cancel: false,
+            show_query_log: false,
+            show_messages: true,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -254,6 +274,10 @@ mod tests {
         assert!(!back.restore_tabs);
         assert_eq!(back.pool_size, 7);
         assert_eq!(back.connections[0].id, "abc");
+        assert_eq!(back.connections[0].params, ["application_name=x"]);
+        assert_eq!(back.connections[0].init_sql, "SET search_path TO app");
+        assert!(!back.show_query_log && back.show_messages);
+        assert!(!back.confirm_query_cancel);
     }
 
     #[test]
@@ -284,6 +308,9 @@ mod tests {
         // Tab restore is on unless the file says otherwise.
         assert!(s.restore_tabs);
         assert_eq!(s.pool_size, 4);
+        // Both bottom panels showing; cancelling from the loader asks first.
+        assert!(s.show_query_log && s.show_messages);
+        assert!(s.confirm_query_cancel);
     }
 
     #[test]
@@ -295,6 +322,8 @@ mod tests {
         let s: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(s.connections[0].port, 5432);
         assert_eq!(s.connections[0].ssl_mode, "prefer");
+        // No connection setup unless the file has one.
+        assert!(s.connections[0].params.is_empty() && s.connections[0].init_sql.is_empty());
         assert_eq!(s.theme, Theme::Light); // default is white scheme
     }
 

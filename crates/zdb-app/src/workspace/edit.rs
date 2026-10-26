@@ -86,6 +86,10 @@ impl Workspace {
         if self.tab(tab_id).and_then(|t| t.editing) == Some((row, col)) {
             return;
         }
+        // The grid takes no input while a run is reloading it.
+        if self.tab(tab_id).is_some_and(|t| t.running) {
+            return;
+        }
         self.commit_cell_edit(cx);
         if self
             .tab(tab_id)

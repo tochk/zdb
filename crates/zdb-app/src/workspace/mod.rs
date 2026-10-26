@@ -28,8 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use zdb_config::{ConnectionEntry, Settings};
 use zdb_db::{
-    CellValue, ConnId, ConnectionConfig, DbHandle, EditTarget, ExportFormat, QueryEvent,
-    RelationDetail, RelationKind, RowEdit, SchemaObjects,
+    CellValue, ConnId, ConnSetup, ConnectionConfig, DbHandle, EditTarget, ExportFormat,
+    QueryEvent, RelationDetail, RelationKind, RowEdit, SchemaObjects,
 };
 
 mod autoscroll;
@@ -50,13 +50,13 @@ mod view;
 use autoscroll::AutoScroll;
 use colors::{palette, Colors};
 use conn::ConnForm;
-use grid::{Clause, PageMove, Tab, TabKind};
+use grid::{Clause, Loader, PageMove, Tab, TabKind};
 pub use keynav::bind_nav_keys;
 use keynav::*;
 use modal::{Modal, ModalFocus};
 use query::QueryLog;
 use tree::{NodeMeta, SchemaTree};
-use util::{entry_to_config, oneline, order_by_sql, rel_icon, window_title};
+use util::{entry_config, entry_to_config, oneline, order_by_sql, rel_icon, window_title};
 
 actions!(
     zdb,
@@ -99,6 +99,8 @@ enum PaletteCmd {
     ExportInserts,
     CopyTsv,
     Format,
+    QueryLog,
+    Messages,
 }
 
 const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
@@ -116,6 +118,8 @@ const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
     ("Open settings", PaletteCmd::Settings),
     ("Keyboard shortcuts", PaletteCmd::Shortcuts),
     ("Toggle terminal", PaletteCmd::Terminal),
+    ("Toggle query log", PaletteCmd::QueryLog),
+    ("Toggle messages", PaletteCmd::Messages),
     ("Focus schema tree", PaletteCmd::FocusTree),
     ("Focus editor / filter", PaletteCmd::FocusEditor),
     ("Focus result grid", PaletteCmd::FocusGrid),
@@ -186,6 +190,8 @@ pub struct Workspace {
 
     /// The dialog showing, if any (see `modal.rs`).
     modal: Option<Modal>,
+    /// The cancel confirmation's "Don't ask again" box (taken on confirm only).
+    cancel_dont_ask: bool,
     modal_focus: ModalFocus,
     palette_input: Entity<InputState>,
 
@@ -331,6 +337,7 @@ impl Workspace {
             lsp_slot: lsp::new_slot(),
             log: QueryLog::default(),
             modal: None,
+            cancel_dont_ask: false,
             modal_focus: ModalFocus::new(cx),
             palette_input,
             terminal: None,
@@ -457,6 +464,8 @@ impl Workspace {
             PaletteCmd::PrevTab => self.cycle_tab(false, window, cx),
             PaletteCmd::CloseTab => self.close_active_tab(window, cx),
             PaletteCmd::ApplyEdits => self.apply_active(cx),
+            PaletteCmd::QueryLog => self.toggle_query_log(cx),
+            PaletteCmd::Messages => self.toggle_messages(cx),
         }
     }
 

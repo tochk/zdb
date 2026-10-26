@@ -556,8 +556,29 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Settings → ask before cancelling a query from its loader.
+    pub(super) fn set_confirm_query_cancel(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.confirm_query_cancel = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Status bar: show / hide the query log (bottom left).
+    pub(super) fn toggle_query_log(&mut self, cx: &mut Context<Self>) {
+        self.settings.show_query_log = !self.settings.show_query_log;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Status bar: show / hide the messages (bottom right).
+    pub(super) fn toggle_messages(&mut self, cx: &mut Context<Self>) {
+        self.settings.show_messages = !self.settings.show_messages;
+        self.save_settings();
+        cx.notify();
+    }
+
     /// Tests run against the dev machine's real settings file — never write it.
-    fn save_settings(&mut self) {
+    pub(super) fn save_settings(&mut self) {
         #[cfg(not(test))]
         if let Err(e) = self.settings.save() {
             self.status = format!("Setting changed (disk write failed: {e})");
@@ -582,7 +603,9 @@ impl Workspace {
         let Some(tab) = self.active_tab() else {
             return;
         };
-        if tab.editing.is_some() {
+        // Mid-edit the arrows belong to the input; mid-run the grid is inert
+        // (its rows are about to be replaced).
+        if tab.editing.is_some() || tab.running {
             return;
         }
         self.move_cursor(m, cx);

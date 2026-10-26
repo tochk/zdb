@@ -11,11 +11,16 @@ use gpui::{
 use gpui_component::checkbox::Checkbox;
 use gpui_component::list::ListItem;
 use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use gpui_component::spinner::Spinner;
 use gpui_component::tree::{tree, TreeEntry};
-use gpui_component::ActiveTheme;
+use gpui_component::{ActiveTheme, Selectable as _};
 
 /// Amber of the "transaction open" markers (tab chip dot, toolbar badge).
 const TX_AMBER: u32 = 0xf59e0bff;
+/// Height of the status bar along the window's bottom edge.
+const STATUS_BAR_H: gpui::Pixels = px(26.);
+/// Width of the query log while Messages shares the bottom panel with it.
+const LOG_W: gpui::Pixels = px(520.);
 
 impl Workspace {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -359,7 +364,7 @@ impl Workspace {
         };
         // Red only when actionable. Disabled, it takes the button's own (dimmed)
         // text color — a fixed one would make it look live.
-        let del_enabled = editable && tab.current_row.is_some();
+        let del_enabled = editable && tab.current_row.is_some() && !tab.running;
         let del_icon = Icon::empty()
             .path("icons/minus.svg")
             .when(del_enabled, |i| i.text_color(rgba(0xef4444ff)));
@@ -377,7 +382,7 @@ impl Workspace {
                     .tab_stop(false)
                     .icon(IconName::Plus)
                     .tooltip("Add row")
-                    .disabled(!editable)
+                    .disabled(!editable || tab.running)
                     .on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| this.add_row(tab_id, cx)),
                     ),
@@ -506,11 +511,11 @@ impl Workspace {
             results = results.child(Self::render_filter_bar(tab, window, c, cx));
         }
         // The results area shows the grid, or — after EXPLAIN — the plan text in
-        // that same place (query data vs. plan, same spot).
-        results = if let Some(plan) = &tab.plan {
-            results.child(Self::plan_view(tab_id, plan, c, cx))
+        // that same place (query data vs. plan, same spot). A run that takes a
+        // while puts its loader over it.
+        let shown = if let Some(plan) = &tab.plan {
+            Self::plan_view(tab_id, plan, c, cx).into_any_element()
         } else {
-            results.child(
                 div()
                     .size_full()
                     .min_w(px(0.))
@@ -530,9 +535,19 @@ impl Workspace {
                             cx.stop_propagation();
                         }),
                     )
-                    .child(Table::new(&tab.table).stripe(true).bordered(true)),
-            )
+                    .child(Table::new(&tab.table).stripe(true).bordered(true))
+                    .into_any_element()
         };
+        let loader = tab.loader(std::time::Instant::now());
+        results = results.child(
+            div()
+                .relative()
+                .size_full()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .child(shown)
+                .children(loader.map(|l| Self::loading_overlay(tab_id, l, c, cx))),
+        );
 
         // Table tabs hide the redundant generated `SELECT *` editor and let the
         // rows fill the pane; Query / Scratch keep the editor above the results.
@@ -558,6 +573,92 @@ impl Workspace {
             .child(toolbar)
             .child(body)
             .children(Self::render_value_editor(tab, cell_multi, c, cx))
+    }
+
+    /// The loader over a running tab's results: an animated spinner, on a
+    /// blank pane or over the previous rows, dimmed. Either way it
+    /// `occlude()`s what's under it — no click, hover or wheel reaches the grid
+    /// until the run is over (its keys are ignored meanwhile too) — and a
+    /// click on it asks whether to cancel the query.
+    fn loading_overlay(
+        tab_id: u64,
+        loader: Loader,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let backdrop = match loader {
+            Loader::Blank => c.center,
+            Loader::OverData => c.center.opacity(0.6),
+        };
+        div()
+            .id("loading-overlay")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(backdrop)
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.ask_cancel(tab_id, cx)))
+            .child(
+                Spinner::new()
+                    .icon(Icon::empty().path("icons/loader-circle.svg"))
+                    .color(c.fg_dim)
+                    .large(),
+            )
+    }
+
+    /// "Cancel the running query?" — asked by a click on a tab's loader.
+    fn render_confirm_cancel(&self, tab_id: u64, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = palette(cx);
+        let title = self.tab(tab_id).map(|t| t.title.clone()).unwrap_or_default();
+        let body = v_flex()
+            .p_4()
+            .gap_3()
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(c.fg)
+                    .child("Cancel the running query?"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(format!("“{title}” is still waiting for the database.")),
+            )
+            .child(
+                h_flex()
+                    .pt_1()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div().flex_1().child(
+                            Checkbox::new("cancel-dont-ask")
+                                .label("Don't ask again")
+                                .checked(self.cancel_dont_ask)
+                                .on_click(cx.listener(|this, on: &bool, _, cx| {
+                                    this.cancel_dont_ask = *on;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .child(
+                        Button::new("keep-running")
+                            .label("Keep running")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx))),
+                    )
+                    .child(
+                        Button::new("confirm-cancel")
+                            .label("Cancel query")
+                            .danger()
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.confirm_cancel(tab_id, cx)
+                            })),
+                    ),
+            );
+        self.modal_layer(v_flex().mt(px(120.)).w(px(460.)).child(body), cx)
     }
 
     /// A Table tab's WHERE / ORDER BY / LIMIT strip, built like Zed's "Search
@@ -885,8 +986,25 @@ impl Workspace {
             )
     }
 
+    /// The active tab and its staged-edit count, when it has edits waiting
+    /// for review.
+    fn pending_review(&self) -> Option<(u64, usize)> {
+        self.active_tab()
+            .filter(|t| !t.pending.is_empty())
+            .map(|t| (t.id, t.pending.len()))
+    }
+
+    /// Whether the bottom panel shows at all: the query log or Messages is
+    /// toggled on in the status bar, or staged edits wait for review (that
+    /// pane holds their Apply / Cancel, so it never hides).
+    fn bottom_visible(&self) -> bool {
+        self.settings.show_query_log || self.settings.show_messages || self.pending_review().is_some()
+    }
+
     fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
+        let pending_tab = self.pending_review();
+        let show_right = pending_tab.is_some() || self.settings.show_messages;
 
         let mut log_list = v_flex().p_1().gap(px(1.));
         for e in self.log.entries.iter().rev() {
@@ -901,13 +1019,18 @@ impl Workspace {
                     .child(format!("{glyph}  {}", oneline(&e.sql))),
             );
         }
+        // Next to the right pane it keeps a fixed width; alone it takes the
+        // whole panel.
         let log_panel = v_flex()
-            .w(px(520.))
-            .flex_none()
             .h_full()
             .overflow_hidden()
-            .border_r_1()
-            .border_color(c.border)
+            .map(|d| {
+                if show_right {
+                    d.w(LOG_W).flex_none().border_r_1().border_color(c.border)
+                } else {
+                    d.flex_1().min_w(px(0.))
+                }
+            })
             .child(section_header("QUERY LOG", c))
             .child(
                 div()
@@ -920,10 +1043,6 @@ impl Workspace {
 
         // When the active tab has staged edits, the bottom-right pane shows the
         // combined SQL for review; otherwise it shows status messages.
-        let pending_tab = self
-            .active_tab()
-            .filter(|t| !t.pending.is_empty())
-            .map(|t| (t.id, t.pending.len()));
         let right = if let Some((tab_id, n)) = pending_tab {
             let sql = self.pending_sql(tab_id).unwrap_or_default();
             v_flex()
@@ -997,8 +1116,68 @@ impl Workspace {
             .bg(c.messages)
             .border_t_1()
             .border_color(c.border)
-            .child(log_panel)
-            .child(right)
+            .when(self.settings.show_query_log, |d| d.child(log_panel))
+            .when(show_right, |d| d.child(right))
+    }
+
+    /// Zed-style status bar along the window's bottom edge: toggles for the
+    /// bottom panels (lit while open) and — while Messages is hidden — the
+    /// latest message, so hiding it doesn't hide what just happened.
+    fn render_status_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let c = palette(cx);
+        // An open panel's toggle turns blue, so "on" reads at a glance.
+        let blue = cx.theme().blue;
+        let toggle = |id: &'static str, icon: &'static str, tip: &'static str, on: bool| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .tab_stop(false)
+                .icon(Icon::empty().path(icon).when(on, |i| i.text_color(blue)))
+                .tooltip(tip)
+                .selected(on)
+        };
+        // Pinned to the window width like the title bar (see there): a wide
+        // grid's min-content width must not push anything off-screen.
+        h_flex()
+            .w(window.viewport_size().width)
+            .h(STATUS_BAR_H)
+            .flex_shrink_0()
+            .px_1()
+            .gap_1()
+            .items_center()
+            .bg(c.header)
+            .border_t_1()
+            .border_color(c.border)
+            .child(
+                toggle(
+                    "toggle-log",
+                    "icons/history.svg",
+                    "Query log",
+                    self.settings.show_query_log,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_query_log(cx))),
+            )
+            .child(
+                toggle(
+                    "toggle-messages",
+                    "icons/message-square.svg",
+                    "Messages",
+                    self.settings.show_messages,
+                )
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_messages(cx))),
+            )
+            .when(!self.settings.show_messages, |bar| {
+                bar.child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .pl_2()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .truncate()
+                        .child(oneline(&self.status)),
+                )
+            })
     }
 
     fn render_conn_manager(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1006,39 +1185,51 @@ impl Workspace {
         let show_form = self.conn_adding || self.settings.connections.is_empty();
 
         let body = if show_form {
-            let field = |label: &'static str, input: &Entity<InputState>| {
+            let label_w = px(96.);
+            let label = |text: &'static str| {
+                div()
+                    .w(label_w)
+                    .flex_none()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(text)
+            };
+            let field = |text: &'static str, input: &Entity<InputState>| {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .w(px(96.))
-                            .flex_none()
-                            .text_xs()
-                            .text_color(c.fg_dim)
-                            .child(label),
-                    )
-                    .child(div().w(px(320.)).child(Input::new(input)))
+                    .child(label(text))
+                    .child(div().w(px(380.)).child(Input::new(input)))
             };
-            let mut buttons = h_flex().gap_2().pt_1().child(
-                Button::new("add-conn")
-                    .label("Save & Connect")
-                    .primary()
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_connection(cx))),
-            );
-            // Allow returning to the list if there are saved connections.
-            buttons =
-                if self.settings.connections.is_empty() {
-                    buttons.child(Button::new("close-form").label("Close").on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_connections(cx)),
-                    ))
-                } else {
-                    buttons.child(Button::new("back-list").label("Back").on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.show_conn_list(cx)),
-                    ))
-                };
+            // Multi-line fields: label at the top, a hint under the input.
+            let lines = |text: &'static str, input: &Entity<InputState>, hint: &'static str| {
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(div().pt(px(6.)).child(label(text)))
+                    .child(
+                        v_flex()
+                            .w(px(380.))
+                            .gap(px(2.))
+                            .child(Input::new(input))
+                            .child(div().text_xs().text_color(c.fg_dim).child(hint)),
+                    )
+            };
+            let editing = self.form.editing.is_some();
+            let save = Button::new("save-conn")
+                .label(if editing { "Save" } else { "Save & Connect" })
+                .primary()
+                .loading(self.form.applying)
+                .disabled(self.form.applying)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.save_connection(cx)));
+            let cancel = Button::new("cancel-conn")
+                .label("Cancel")
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_conn_form(cx)));
             v_flex()
-                .child(section_header("ADD CONNECTION", c))
+                .child(section_header(
+                    if editing { "EDIT CONNECTION" } else { "ADD CONNECTION" },
+                    c,
+                ))
                 .child(
                     v_flex()
                         .p_2()
@@ -1050,7 +1241,33 @@ impl Workspace {
                         .child(field("Database", &self.form.db))
                         .child(field("Password", &self.form.password))
                         .child(field("SSL mode", &self.form.ssl))
-                        .child(buttons),
+                        .child(div().h(px(4.)))
+                        .child(lines(
+                            "Parameters",
+                            &self.form.params,
+                            "key=value per line. libpq keys (application_name, \
+                             connect_timeout…) set up the connection, others are server settings.",
+                        ))
+                        .child(lines(
+                            "On connect",
+                            &self.form.init_sql,
+                            "SQL run on every connection of the pool, e.g. SET statements.",
+                        ))
+                        .children(self.form.error.clone().map(|e| {
+                            div()
+                                .pl(label_w + px(8.))
+                                .text_xs()
+                                .text_color(c.danger)
+                                .child(e)
+                        }))
+                        .child(
+                            h_flex()
+                                .pt_1()
+                                .gap_2()
+                                .justify_end()
+                                .child(cancel)
+                                .child(save),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -1059,35 +1276,59 @@ impl Workspace {
                 let active =
                     self.conn.is_some() && self.cfg.as_ref().is_some_and(|cur| cur.name == e.name);
                 let subtitle = format!("{}@{}:{}/{}", e.user, e.host, e.port, e.dbname);
+                // The edit button is a SIBLING of the row's click area, not
+                // inside it: nested click handlers would both fire.
                 list = list.child(
-                    div()
-                        .id(SharedString::from(format!("conn-{i}")))
-                        .px_2()
-                        .py(px(6.))
-                        .gap_2()
-                        .flex()
+                    h_flex()
+                        .pr_1()
+                        .gap_1()
                         .items_center()
                         .rounded_md()
-                        .cursor_pointer()
                         .when(active, |d| d.bg(c.active))
                         .hover(|s| s.bg(c.hover))
                         .child(
                             div()
-                                .size(px(7.))
-                                .rounded_full()
-                                .when(active, |d| d.bg(rgba(0x22c55eff)))
-                                .when(!active, |d| d.border_1().border_color(c.fg_dim)),
+                                .id(SharedString::from(format!("conn-{i}")))
+                                .flex_1()
+                                .min_w(px(0.))
+                                .px_2()
+                                .py(px(6.))
+                                .gap_2()
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .size(px(7.))
+                                        .rounded_full()
+                                        .when(active, |d| d.bg(rgba(0x22c55eff)))
+                                        .when(!active, |d| d.border_1().border_color(c.fg_dim)),
+                                )
+                                .child(tree_icon("icons/database.svg", c.fg_dim))
+                                .child(
+                                    v_flex()
+                                        .min_w(px(0.))
+                                        .gap(px(1.))
+                                        .child(
+                                            div().text_sm().text_color(c.fg).child(e.name.clone()),
+                                        )
+                                        .child(div().text_xs().text_color(c.fg_dim).child(subtitle)),
+                                )
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.connect_saved(i, cx)
+                                })),
                         )
-                        .child(tree_icon("icons/database.svg", c.fg_dim))
                         .child(
-                            v_flex()
-                                .gap(px(1.))
-                                .child(div().text_sm().text_color(c.fg).child(e.name.clone()))
-                                .child(div().text_xs().text_color(c.fg_dim).child(subtitle)),
-                        )
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.connect_saved(i, cx)
-                        })),
+                            Button::new(SharedString::from(format!("edit-conn-{i}")))
+                                .ghost()
+                                .small()
+                                .icon(Icon::empty().path("icons/pencil.svg"))
+                                .tooltip("Edit connection")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                    this.show_edit_form(i, window, cx)
+                                })),
+                        ),
                 );
             }
             v_flex()
@@ -1103,13 +1344,16 @@ impl Workspace {
                     h_flex()
                         .p_2()
                         .gap_2()
+                        .justify_end()
                         .border_t_1()
                         .border_color(c.border)
-                        .child(Button::new("add-new").label("Add").primary().on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.show_add_form(cx)),
-                        ))
                         .child(Button::new("close-conn").label("Close").on_click(
                             cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_connections(cx)),
+                        ))
+                        .child(Button::new("add-new").label("Add").primary().on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.show_add_form(window, cx)
+                            }),
                         )),
                 )
                 .into_any_element()
@@ -1118,7 +1362,7 @@ impl Workspace {
         self.modal_layer(v_flex().mt(px(26.)).w(px(520.)).child(body), cx)
     }
 
-    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_settings(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
         let theme = self.settings.theme;
 
@@ -1150,8 +1394,12 @@ impl Workspace {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "(unavailable)".into());
 
+        // Taller than a small window: it scrolls instead of running off it.
         let body =
             v_flex()
+                .id("settings-body")
+                .max_h(window.viewport_size().height - modal::TITLEBAR_H - px(52.))
+                .overflow_y_scroll()
                 .child(section_header("SETTINGS", c))
                 .child(setting_row(
                     "Theme",
@@ -1184,6 +1432,15 @@ impl Workspace {
                         .on_click(
                             cx.listener(|this, on: &bool, _, cx| this.set_restore_tabs(*on, cx)),
                         )
+                        .into_any_element(),
+                ))
+                .child(setting_row(
+                    "Ask before cancelling a query (click on its loader)",
+                    Checkbox::new("confirm-cancel")
+                        .checked(self.settings.confirm_query_cancel)
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.set_confirm_query_cancel(*on, cx)
+                        }))
                         .into_any_element(),
                 ))
                 .child(setting_row(
@@ -1624,18 +1881,23 @@ impl Render for Workspace {
         // Both panels need an explicit size: gpui-component's resizable seeds any
         // panel without one to PANEL_MIN_SIZE, which squeezed the bottom panel
         // (query-review / log) off-screen. Sizes are ratio-scaled to the window.
+        // Hidden from the status bar, the bottom panel stays in the group as an
+        // invisible panel (so its height is remembered for the next show) and
+        // the top one, uncapped, fills the space.
+        let bottom = self.bottom_visible();
         let main = v_resizable("zdb-root")
             .child(
                 resizable_panel()
                     .size(px(560.))
-                    .size_range(px(200.)..px(1200.))
+                    .size_range(px(200.)..if bottom { px(1200.) } else { gpui::Pixels::MAX })
                     .child(top),
             )
             .child(
                 resizable_panel()
                     .size(px(200.))
                     .size_range(px(80.)..px(460.))
-                    .child(self.render_bottom(cx)),
+                    .visible(bottom)
+                    .when(bottom, |p| p.child(self.render_bottom(cx))),
             );
 
         // `min_w(0)` + `overflow_hidden` stop a wide descendant (the results table's
@@ -1656,7 +1918,8 @@ impl Render for Workspace {
                     .min_w(px(0.))
                     .overflow_hidden()
                     .child(main),
-            );
+            )
+            .child(self.render_status_bar(window, cx));
 
         let root = div()
             .relative()
@@ -1757,11 +2020,20 @@ impl Render for Workspace {
                 .with_priority(1),
             );
         }
+        // The query it asks about finished meanwhile: nothing left to cancel.
+        if let Some(Modal::ConfirmCancel(id)) = self.modal {
+            if !self.tab(id).is_some_and(|t| t.running) {
+                self.modal = None;
+            }
+        }
         let dialog = match self.modal {
             Some(Modal::Connections) => Some(self.render_conn_manager(cx).into_any_element()),
-            Some(Modal::Settings) => Some(self.render_settings(cx).into_any_element()),
+            Some(Modal::Settings) => Some(self.render_settings(window, cx).into_any_element()),
             Some(Modal::Shortcuts) => Some(self.render_shortcuts(window, cx).into_any_element()),
             Some(Modal::Palette) => Some(self.render_palette(cx).into_any_element()),
+            Some(Modal::ConfirmCancel(id)) => {
+                Some(self.render_confirm_cancel(id, cx).into_any_element())
+            }
             None => None,
         };
         root.children(dialog)

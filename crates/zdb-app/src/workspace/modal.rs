@@ -23,6 +23,8 @@ pub(super) enum Modal {
     Settings,
     Shortcuts,
     Palette,
+    /// "Cancel the running query?" — a click on a tab's loader asks it.
+    ConfirmCancel(u64),
 }
 
 /// Dialog focus bookkeeping (see the module docs).
