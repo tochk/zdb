@@ -199,7 +199,10 @@ mod tests {
         let empty = SavedTabs::new(None, Vec::new());
         save_tabs_to(&path, &empty).unwrap();
         assert_eq!(load_tabs_from(&path).unwrap(), Some(empty));
-        assert_eq!(std::fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

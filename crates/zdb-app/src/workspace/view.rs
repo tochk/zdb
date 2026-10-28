@@ -5,18 +5,20 @@
 
 use super::*;
 use gpui::{
-    anchored, canvas, deferred, relative, AnyElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, WeakEntity,
+    anchored, canvas, deferred, relative, AnyElement, DragMoveEvent, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, WeakEntity,
 };
 use gpui_component::checkbox::Checkbox;
 use gpui_component::list::ListItem;
-use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
 use gpui_component::tree::{tree, TreeEntry};
 use gpui_component::{ActiveTheme, Selectable as _};
 
 /// Amber of the "transaction open" markers (tab chip dot, toolbar badge).
 const TX_AMBER: u32 = 0xf59e0bff;
+/// Blue of the "N changes staged" toolbar badge (the edited cells' hue).
+const PENDING_BLUE: u32 = 0x3b82f6ff;
 /// Height of the status bar along the window's bottom edge.
 const STATUS_BAR_H: gpui::Pixels = px(26.);
 /// Width of the query log while Messages shares the bottom panel with it.
@@ -152,11 +154,15 @@ impl Workspace {
         let c = palette(cx);
         let strip = self.render_tab_strip(c, cx);
         let body = match self.active {
-            Some(idx) if idx < self.tabs.len() => {
-                let vim = self.settings.vim_navigation;
-                Self::render_tab_body(&self.tabs[idx], &self.cell_multi, vim, window, c, cx)
-                    .into_any_element()
-            }
+            Some(idx) if idx < self.tabs.len() => Self::render_tab_body(
+                &self.tabs[idx],
+                &self.cell_multi,
+                &self.settings,
+                window,
+                c,
+                cx,
+            )
+            .into_any_element(),
             _ => welcome_pane(c).into_any_element(),
         };
         v_flex()
@@ -311,12 +317,14 @@ impl Workspace {
     fn render_tab_body(
         tab: &Tab,
         cell_multi: &Entity<InputState>,
-        vim: bool,
+        settings: &Settings,
         window: &Window,
         c: Colors,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let tab_id = tab.id;
+        let vim = settings.vim_navigation;
+        let export_fmt = settings.export_format;
         let editable = tab.edit_target.is_some();
         // The grid's keys live on a context that exists only while no cell is
         // being edited — see `keynav.rs` for why it can't be the widget's own.
@@ -365,6 +373,8 @@ impl Workspace {
         // Red only when actionable. Disabled, it takes the button's own (dimmed)
         // text color — a fixed one would make it look live.
         let del_enabled = editable && tab.current_row.is_some() && !tab.running;
+        let can_apply = !tab.pending.is_empty() && !tab.running;
+        let divider = || div().flex_none().w(px(1.)).h(px(16.)).bg(c.border);
         let del_icon = Icon::empty()
             .path("icons/minus.svg")
             .when(del_enabled, |i| i.text_color(rgba(0xef4444ff)));
@@ -377,6 +387,32 @@ impl Workspace {
             .border_b_1()
             .border_color(c.border)
             .child(run_btn)
+            // Staged changes: review + apply them (one transaction), or drop them.
+            .child(
+                Button::new("apply-changes")
+                    .tab_stop(false)
+                    .icon(
+                        Icon::empty()
+                            .path("icons/check.svg")
+                            .when(can_apply, |i| i.text_color(rgba(0x22c55eff))),
+                    )
+                    .tooltip("Apply changes (Ctrl/Cmd+S)")
+                    .disabled(!can_apply)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.request_apply(tab_id, cx)
+                    })),
+            )
+            .child(
+                Button::new("revert-changes")
+                    .tab_stop(false)
+                    .icon(Icon::empty().path("icons/undo-2.svg"))
+                    .tooltip("Revert changes")
+                    .disabled(!can_apply)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.cancel_pending(tab_id, cx)
+                    })),
+            )
+            .child(divider())
             .child(
                 Button::new("add-row")
                     .tab_stop(false)
@@ -409,9 +445,9 @@ impl Workspace {
                         }),
                     ),
             );
-        // Groups: row actions | pager (Table tabs) | what to do with the result.
-        // The icons carry no color of their own, so a disabled one dims.
-        let divider = || div().flex_none().w(px(1.)).h(px(16.)).bg(c.border);
+        // Groups: run + changes | row actions | pager (Table tabs) | what to do
+        // with the result. The icons carry no color of their own, so a
+        // disabled one dims.
         let action = |id: &'static str, icon: &'static str, tip: &'static str, enabled: bool| {
             Button::new(id)
                 .tab_stop(false)
@@ -424,32 +460,35 @@ impl Workspace {
                 .child(divider())
                 .child(Self::render_pager(tab, c, cx));
         }
+        // Lit while its plan is up; a click then closes the plan.
+        let explained = |analyze: bool| tab.plan.is_some() && tab.plan_analyze == analyze;
         toolbar = toolbar
             .child(divider())
-            // EXPLAIN the current statement (plan shown in the grid).
+            // EXPLAIN the current statement (plan shown in place of the grid).
             .child(
                 action(
                     "explain",
                     "icons/list-tree.svg",
-                    "Explain (query plan)",
+                    "Explain — query plan (click again to close)",
                     has_sql,
                 )
+                .selected(explained(false))
                 .on_click(
                     cx.listener(|this, _: &ClickEvent, _, cx| this.explain_active(false, cx)),
                 ),
             )
-            // Export / copy the current result.
             .child(
                 action(
-                    "export-csv",
-                    "icons/download.svg",
-                    "Export result to CSV (more formats in the palette)",
-                    has_result,
+                    "explain-analyze",
+                    "icons/gauge.svg",
+                    "Explain Analyze — runs the query, plan with real timings",
+                    has_sql,
                 )
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.export_active(ExportFormat::Csv, cx)
-                })),
+                .selected(explained(true))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.explain_active(true, cx))),
             )
+            // Export / copy the current result.
+            .child(Self::export_buttons(has_result, export_fmt, cx))
             .child(
                 action(
                     "copy-tsv",
@@ -464,6 +503,27 @@ impl Workspace {
                 action("format-sql", "icons/braces.svg", "Format SQL", has_sql).on_click(
                     cx.listener(|this, _: &ClickEvent, window, cx| this.format_active(window, cx)),
                 ),
+            );
+        }
+        if !tab.pending.is_empty() {
+            let n = tab.pending.len();
+            toolbar = toolbar.child(divider()).child(
+                div()
+                    .id("pending-badge")
+                    .px_2()
+                    .py(px(2.))
+                    .rounded_md()
+                    .bg(rgba(PENDING_BLUE & 0xffffff00 | 0x26))
+                    .text_xs()
+                    .text_color(rgba(PENDING_BLUE))
+                    .cursor_pointer()
+                    .child(format!(
+                        "{n} change{} staged",
+                        if n == 1 { "" } else { "s" }
+                    ))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.request_apply(tab_id, cx)
+                    })),
             );
         }
         if tab.in_transaction {
@@ -506,7 +566,7 @@ impl Workspace {
         // + `size_full` with no min-width of its own) grows to that width, the
         // table believes it fits, its internal horizontal scroll never engages, and
         // the off-window columns are simply clipped by the root `overflow_hidden`.
-        let mut results = v_flex().size_full().min_w(px(0.)).overflow_hidden();
+        let mut results = fill(v_flex()).overflow_hidden();
         if matches!(tab.kind, TabKind::Table { .. }) {
             results = results.child(Self::render_filter_bar(tab, window, c, cx));
         }
@@ -514,36 +574,33 @@ impl Workspace {
         // that same place (query data vs. plan, same spot). A running query
         // puts its loader over it.
         let shown = if let Some(plan) = &tab.plan {
-            Self::plan_view(tab_id, plan, c, cx).into_any_element()
+            Self::plan_view(tab_id, plan, tab.plan_analyze, c, cx).into_any_element()
         } else {
-                div()
-                    .size_full()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .key_context(grid_context)
-                    // Type-to-edit: keys no binding claimed.
-                    .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
-                        this.grid_key_down(tab_id, ev, window, cx)
-                    }))
-                    // Wheel press = autoscroll (see `autoscroll.rs`). Stopping
-                    // propagation keeps the workspace root's "any click exits"
-                    // handler from undoing the press that just started it.
-                    .on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                            this.toggle_autoscroll(tab_id, ev.position, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(Table::new(&tab.table).stripe(true).bordered(true))
-                    .into_any_element()
+            fill(div())
+                .debug_selector(|| "result-grid".into())
+                .overflow_hidden()
+                .key_context(grid_context)
+                // Type-to-edit: keys no binding claimed.
+                .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                    this.grid_key_down(tab_id, ev, window, cx)
+                }))
+                // Wheel press = autoscroll (see `autoscroll.rs`). Stopping
+                // propagation keeps the workspace root's "any click exits"
+                // handler from undoing the press that just started it.
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.toggle_autoscroll(tab_id, ev.position, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(Table::new(&tab.table).stripe(true).bordered(true))
+                .into_any_element()
         };
         let loader = tab.loader();
         results = results.child(
-            div()
+            fill(v_flex())
                 .relative()
-                .size_full()
-                .min_w(px(0.))
                 .overflow_hidden()
                 .child(shown)
                 .children(loader.map(|l| Self::loading_overlay(tab_id, l, c, cx))),
@@ -554,18 +611,11 @@ impl Workspace {
         let body = if matches!(tab.kind, TabKind::Table { .. }) {
             results.into_any_element()
         } else {
-            v_resizable(SharedString::from(format!("center-{tab_id}")))
-                .child(
-                    resizable_panel()
-                        .size(px(170.))
-                        .size_range(px(60.)..px(600.))
-                        .child(div().size_full().child(Input::new(&tab.editor).h_full())),
-                )
-                .child(resizable_panel().child(results))
-                .into_any_element()
+            Self::editor_split(tab, results, c, cx).into_any_element()
         };
 
         v_flex()
+            .debug_selector(|| "tab-body".into())
             .size_full()
             .min_w(px(0.))
             .overflow_hidden()
@@ -573,6 +623,133 @@ impl Workspace {
             .child(toolbar)
             .child(body)
             .children(Self::render_value_editor(tab, cell_multi, c, cx))
+    }
+
+    /// A Query / Scratch tab under its toolbar: the SQL editor over the
+    /// results, sharing the height by `Tab.editor_split` (half each to begin
+    /// with), and a handle between them to drag (double-click: back to half).
+    ///
+    /// Built from flex weights, NOT gpui-component's `v_resizable` + `h_full`
+    /// inputs: those size by percentage heights, which taffy can leave
+    /// unresolved at fractional device sizes (a 1.25 scale makes 170px 212.5
+    /// device px) — the editor then collapsed to one line, or the results to
+    /// 100px, with the rest of the pane empty. Nothing here is a percentage:
+    /// the panes take `split : 1 - split` of the space left by the handle, and
+    /// the editor grows into its pane. `layout_tests` sweeps window sizes to
+    /// keep it that way.
+    fn editor_split(
+        tab: &Tab,
+        results: gpui::Div,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let tab_id = tab.id;
+        let split = tab.editor_split;
+        let editor = Input::new(&tab.editor)
+            .flex_grow()
+            .flex_basis(px(0.))
+            .min_h(px(0.));
+        #[cfg(test)]
+        let editor = editor.prefix(layout_probe::probe("editor-input"));
+        let handle = div()
+            .id("editor-split-handle")
+            .flex_none()
+            .h(tabs::SPLIT_HANDLE_H)
+            .flex()
+            .items_center()
+            .cursor_row_resize()
+            .hover(|s| s.bg(c.hover))
+            .child(div().flex_1().h(px(1.)).bg(c.border))
+            .on_drag(EditorSplitDrag(tab_id), |drag, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| drag.clone())
+            })
+            .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                if e.click_count() == 2 {
+                    if let Some(tab) = this.tab_mut(tab_id) {
+                        tab.editor_split = grid::EDITOR_SPLIT;
+                    }
+                    cx.notify();
+                }
+            }));
+        fill(v_flex())
+            .debug_selector(|| "editor-split".into())
+            .overflow_hidden()
+            // Fires for the whole window while the handle is dragged; `bounds`
+            // is this split's own box.
+            .on_drag_move(
+                cx.listener(move |this, e: &DragMoveEvent<EditorSplitDrag>, _, cx| {
+                    if e.drag(cx).0 == tab_id {
+                        let y = e.event.position.y - e.bounds.top();
+                        this.set_editor_split(tab_id, y, e.bounds.size.height, cx);
+                    }
+                }),
+            )
+            .child(
+                weighted(v_flex(), split)
+                    .debug_selector(|| "editor-pane".into())
+                    .overflow_hidden()
+                    .child(editor),
+            )
+            .child(handle)
+            .child(
+                weighted(v_flex(), 1. - split)
+                    .debug_selector(|| "results-pane".into())
+                    .overflow_hidden()
+                    .child(results),
+            )
+    }
+
+    /// Export: the button saves the result in the default format (Settings),
+    /// the chevron next to it opens every format (and the clipboard copy).
+    fn export_buttons(
+        has_result: bool,
+        default: zdb_config::ExportFormat,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let weak = cx.weak_entity();
+        h_flex()
+            .child(
+                Button::new("export")
+                    .tab_stop(false)
+                    .icon(Icon::empty().path("icons/download.svg"))
+                    .tooltip(format!(
+                        "Export result as {} (default format: Settings)",
+                        export::export_label(default)
+                    ))
+                    .disabled(!has_result)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.export_default(cx))),
+            )
+            .child(
+                Button::new("export-menu")
+                    .tab_stop(false)
+                    .compact()
+                    .icon(Icon::empty().path("icons/chevron-down.svg").xsmall())
+                    .disabled(!has_result)
+                    .dropdown_menu(move |mut menu, _, _| {
+                        for fmt in export::EXPORT_FORMATS {
+                            let w = weak.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(format!(
+                                    "Export as {}",
+                                    export::export_label(fmt)
+                                ))
+                                .checked(fmt == default)
+                                .on_click(move |_, _, cx| {
+                                    w.update(cx, |this, cx| {
+                                        this.export_active(export::export_format(fmt), cx)
+                                    })
+                                    .ok();
+                                }),
+                            );
+                        }
+                        let w = weak.clone();
+                        menu.separator()
+                            .item(PopupMenuItem::new("Copy as TSV").on_click(move |_, _, cx| {
+                                w.update(cx, |this, cx| this.copy_active_tsv(cx)).ok();
+                            }))
+                    }),
+            )
     }
 
     /// The loader over a running tab's results: an animated spinner, on a
@@ -611,54 +788,144 @@ impl Workspace {
     /// "Cancel the running query?" — asked by a click on a tab's loader.
     fn render_confirm_cancel(&self, tab_id: u64, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
-        let title = self.tab(tab_id).map(|t| t.title.clone()).unwrap_or_default();
-        let body = v_flex()
-            .p_4()
-            .gap_3()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(c.fg)
-                    .child("Cancel the running query?"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(c.fg_dim)
-                    .child(format!("“{title}” is still waiting for the database.")),
-            )
-            .child(
-                h_flex()
-                    .pt_1()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div().flex_1().child(
-                            Checkbox::new("cancel-dont-ask")
-                                .label("Don't ask again")
-                                .checked(self.cancel_dont_ask)
-                                .on_click(cx.listener(|this, on: &bool, _, cx| {
-                                    this.cancel_dont_ask = *on;
-                                    cx.notify();
+        let title = self
+            .tab(tab_id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        let body =
+            v_flex()
+                .p_4()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(c.fg)
+                        .child("Cancel the running query?"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .child(format!("“{title}” is still waiting for the database.")),
+                )
+                .child(
+                    h_flex()
+                        .pt_1()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div().flex_1().child(
+                                Checkbox::new("cancel-dont-ask")
+                                    .label("Don't ask again")
+                                    .checked(self.cancel_dont_ask)
+                                    .on_click(cx.listener(|this, on: &bool, _, cx| {
+                                        this.cancel_dont_ask = *on;
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                        .child(Button::new("keep-running").label("Keep running").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx)),
+                        ))
+                        .child(
+                            Button::new("confirm-cancel")
+                                .label("Cancel query")
+                                .danger()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.confirm_cancel(tab_id, cx)
                                 })),
                         ),
-                    )
-                    .child(
-                        Button::new("keep-running")
-                            .label("Keep running")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx))),
-                    )
-                    .child(
-                        Button::new("confirm-cancel")
-                            .label("Cancel query")
-                            .danger()
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.confirm_cancel(tab_id, cx)
-                            })),
-                    ),
-            );
+                );
         self.modal_layer(v_flex().mt(px(120.)).w(px(460.)).child(body), cx)
+    }
+
+    /// "Apply N changes?" — a tab's staged changes as the statements they run
+    /// (one transaction; its BEGIN / COMMIT aren't shown), for review first.
+    fn render_confirm_apply(
+        &self,
+        tab_id: u64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let c = palette(cx);
+        let mono = cx.theme().mono_font_family.clone();
+        let stmts = self.pending_statements(tab_id);
+        let n = stmts.len();
+        let target = self
+            .tab(tab_id)
+            .and_then(|t| t.edit_target.as_ref())
+            .map(|t| format!("{}.{}", t.schema, t.table))
+            .unwrap_or_default();
+        let mut list = v_flex().p_3().gap_1();
+        for stmt in stmts {
+            list = list.child(div().text_color(c.fg).child(format!("{stmt};")));
+        }
+        let body =
+            v_flex()
+                .p_4()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(c.fg)
+                        .child(format!(
+                            "Apply {n} change{} to {target}?",
+                            if n == 1 { "" } else { "s" }
+                        )),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .child("They run in one transaction: all of them, or none if one fails."),
+                )
+                .child(
+                    div()
+                        .id("apply-statements")
+                        .max_h(window.viewport_size().height * 0.5)
+                        .overflow_y_scroll()
+                        .overflow_x_scroll()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(c.border)
+                        .bg(c.header)
+                        .text_xs()
+                        .font_family(mono)
+                        .whitespace_nowrap()
+                        .child(list),
+                )
+                .child(
+                    h_flex()
+                        .pt_1()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div().flex_1().child(
+                                Checkbox::new("apply-dont-ask")
+                                    .label("Don't ask again")
+                                    .checked(self.apply_dont_ask)
+                                    .on_click(cx.listener(|this, on: &bool, _, cx| {
+                                        this.apply_dont_ask = *on;
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                        .child(Button::new("apply-cancel").label("Cancel").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx)),
+                        ))
+                        .child(
+                            Button::new("apply-confirm")
+                                .label("Apply")
+                                .primary()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.confirm_apply(tab_id, cx)
+                                })),
+                        ),
+                );
+        let width = px(760.).min(window.viewport_size().width - px(80.));
+        self.modal_layer(v_flex().mt(px(90.)).w(width).child(body), cx)
     }
 
     /// A Table tab's WHERE / ORDER BY / LIMIT strip, built like Zed's "Search
@@ -933,7 +1200,13 @@ impl Workspace {
     /// The EXPLAIN plan view: a header with a close button and a scrollable
     /// monospace body (one row per plan line, horizontally scrollable so long
     /// lines aren't clipped).
-    fn plan_view(tab_id: u64, plan: &str, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+    fn plan_view(
+        tab_id: u64,
+        plan: &str,
+        analyze: bool,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let mono = cx.theme().mono_font_family.clone();
         let mut lines = v_flex().p_2().gap(px(1.));
         for line in plan.lines() {
@@ -944,8 +1217,7 @@ impl Workspace {
                     .child(line.to_string()),
             );
         }
-        v_flex()
-            .size_full()
+        fill(v_flex())
             .bg(c.center)
             .child(
                 h_flex()
@@ -961,7 +1233,11 @@ impl Workspace {
                             .text_xs()
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(c.fg_dim)
-                            .child("QUERY PLAN"),
+                            .child(if analyze {
+                                "QUERY PLAN — EXPLAIN ANALYZE"
+                            } else {
+                                "QUERY PLAN"
+                            }),
                     )
                     .child(
                         Button::new("close-plan")
@@ -986,25 +1262,15 @@ impl Workspace {
             )
     }
 
-    /// The active tab and its staged-edit count, when it has edits waiting
-    /// for review.
-    fn pending_review(&self) -> Option<(u64, usize)> {
-        self.active_tab()
-            .filter(|t| !t.pending.is_empty())
-            .map(|t| (t.id, t.pending.len()))
-    }
-
     /// Whether the bottom panel shows at all: the query log or Messages is
-    /// toggled on in the status bar, or staged edits wait for review (that
-    /// pane holds their Apply / Cancel, so it never hides).
+    /// toggled on in the status bar.
     fn bottom_visible(&self) -> bool {
-        self.settings.show_query_log || self.settings.show_messages || self.pending_review().is_some()
+        self.settings.show_query_log || self.settings.show_messages
     }
 
     fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
-        let pending_tab = self.pending_review();
-        let show_right = pending_tab.is_some() || self.settings.show_messages;
+        let show_right = self.settings.show_messages;
 
         let mut log_list = v_flex().p_1().gap(px(1.));
         for e in self.log.entries.iter().rev() {
@@ -1041,74 +1307,23 @@ impl Workspace {
                     .child(log_list),
             );
 
-        // When the active tab has staged edits, the bottom-right pane shows the
-        // combined SQL for review; otherwise it shows status messages.
-        let right = if let Some((tab_id, n)) = pending_tab {
-            let sql = self.pending_sql(tab_id).unwrap_or_default();
-            v_flex()
-                .flex_grow()
-                .h_full()
-                .overflow_hidden()
-                .child(section_header(
-                    format!("PENDING — {n} CHANGE(S), REVIEW THEN APPLY"),
-                    c,
-                ))
-                .child(
-                    div()
-                        .id("pending-scroll")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .overflow_y_scroll()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(c.fg)
-                        .child(sql),
-                )
-                .child(
-                    h_flex()
-                        .px_2()
-                        .pb_2()
-                        .gap_2()
-                        .child(
-                            Button::new("apply")
-                                .tab_stop(false)
-                                .label("Apply")
-                                .primary()
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.apply_pending(tab_id, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("cancel-edit")
-                                .tab_stop(false)
-                                .label("Cancel")
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.cancel_pending(tab_id, cx)
-                                })),
-                        ),
-                )
-                .into_any_element()
-        } else {
-            v_flex()
-                .flex_grow()
-                .h_full()
-                .overflow_hidden()
-                .child(section_header("MESSAGES", c))
-                .child(
-                    div()
-                        .id("messages-scroll")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .overflow_y_scroll()
-                        .px_3()
-                        .py_2()
-                        .text_sm()
-                        .text_color(c.fg)
-                        .child(self.status.clone()),
-                )
-                .into_any_element()
-        };
+        let right = v_flex()
+            .flex_grow()
+            .h_full()
+            .overflow_hidden()
+            .child(section_header("MESSAGES", c))
+            .child(
+                div()
+                    .id("messages-scroll")
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(c.fg)
+                    .child(self.status.clone()),
+            );
 
         h_flex()
             .size_full()
@@ -1227,7 +1442,11 @@ impl Workspace {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_conn_form(cx)));
             v_flex()
                 .child(section_header(
-                    if editing { "EDIT CONNECTION" } else { "ADD CONNECTION" },
+                    if editing {
+                        "EDIT CONNECTION"
+                    } else {
+                        "ADD CONNECTION"
+                    },
                     c,
                 ))
                 .child(
@@ -1313,7 +1532,9 @@ impl Workspace {
                                         .child(
                                             div().text_sm().text_color(c.fg).child(e.name.clone()),
                                         )
-                                        .child(div().text_xs().text_color(c.fg_dim).child(subtitle)),
+                                        .child(
+                                            div().text_xs().text_color(c.fg_dim).child(subtitle),
+                                        ),
                                 )
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.connect_saved(i, cx)
@@ -1395,81 +1616,104 @@ impl Workspace {
             .unwrap_or_else(|| "(unavailable)".into());
 
         // Taller than a small window: it scrolls instead of running off it.
-        let body =
-            v_flex()
-                .id("settings-body")
-                .max_h(window.viewport_size().height - modal::TITLEBAR_H - px(52.))
-                .overflow_y_scroll()
-                .child(section_header("SETTINGS", c))
-                .child(setting_row(
-                    "Theme",
-                    h_flex()
-                        .gap_1()
-                        .child(theme_btn("Light", zdb_config::Theme::Light))
-                        .child(theme_btn("Dark", zdb_config::Theme::Dark))
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Esc saves cell edit",
-                    Checkbox::new("esc-saves")
-                        .checked(self.settings.esc_saves_edit)
-                        .on_click(cx.listener(|this, on: &bool, _, cx| this.set_esc_saves(*on, cx)))
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Vim navigation (hjkl, gg / G, 0 / $, i, y)",
-                    Checkbox::new("vim-nav")
-                        .checked(self.settings.vim_navigation)
-                        .on_click(
-                            cx.listener(|this, on: &bool, _, cx| this.set_vim_navigation(*on, cx)),
-                        )
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Restore tabs per connection",
-                    Checkbox::new("restore-tabs")
-                        .checked(self.settings.restore_tabs)
-                        .on_click(
-                            cx.listener(|this, on: &bool, _, cx| this.set_restore_tabs(*on, cx)),
-                        )
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Ask before cancelling a query (click on its loader)",
-                    Checkbox::new("confirm-cancel")
-                        .checked(self.settings.confirm_query_cancel)
-                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+        let body = v_flex()
+            .id("settings-body")
+            .max_h(window.viewport_size().height - modal::TITLEBAR_H - px(52.))
+            .overflow_y_scroll()
+            .child(section_header("SETTINGS", c))
+            .child(setting_row(
+                "Theme",
+                h_flex()
+                    .gap_1()
+                    .child(theme_btn("Light", zdb_config::Theme::Light))
+                    .child(theme_btn("Dark", zdb_config::Theme::Dark))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Esc saves cell edit",
+                Checkbox::new("esc-saves")
+                    .checked(self.settings.esc_saves_edit)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| this.set_esc_saves(*on, cx)))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Vim navigation (hjkl, gg / G, 0 / $, i, y)",
+                Checkbox::new("vim-nav")
+                    .checked(self.settings.vim_navigation)
+                    .on_click(
+                        cx.listener(|this, on: &bool, _, cx| this.set_vim_navigation(*on, cx)),
+                    )
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Restore tabs per connection",
+                Checkbox::new("restore-tabs")
+                    .checked(self.settings.restore_tabs)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| this.set_restore_tabs(*on, cx)))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Ask before cancelling a query (click on its loader)",
+                Checkbox::new("confirm-cancel")
+                    .checked(self.settings.confirm_query_cancel)
+                    .on_click(
+                        cx.listener(|this, on: &bool, _, cx| {
                             this.set_confirm_query_cancel(*on, cx)
-                        }))
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Connections per database",
-                    self.render_pool_size(c, cx).into_any_element(),
-                ))
-                .child(setting_row(
-                    "Keyboard shortcuts",
-                    Button::new("show-shortcuts")
-                        .label("Show (F1)")
-                        .on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_shortcuts(cx)),
-                        )
-                        .into_any_element(),
-                ))
-                .child(section_header("CONFIG FILE", c))
-                .child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(c.fg_dim)
-                        .child(path),
-                )
-                .child(h_flex().p_2().gap_2().justify_end().child(
+                        }),
+                    )
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Show statements before applying changes",
+                Checkbox::new("confirm-apply")
+                    .checked(self.settings.confirm_apply)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| this.set_confirm_apply(*on, cx)))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Export button saves as",
+                h_flex()
+                    .gap_1()
+                    .children(export::EXPORT_FORMATS.map(|fmt| {
+                        Button::new(SharedString::from(format!("export-fmt-{fmt:?}")))
+                            .label(match fmt {
+                                zdb_config::ExportFormat::Inserts => "SQL",
+                                _ => export::export_label(fmt),
+                            })
+                            .when(self.settings.export_format == fmt, |b| b.primary())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.set_export_format(fmt, cx)
+                            }))
+                    }))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Connections per database",
+                self.render_pool_size(c, cx).into_any_element(),
+            ))
+            .child(setting_row(
+                "Keyboard shortcuts",
+                Button::new("show-shortcuts")
+                    .label("Show (F1)")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_shortcuts(cx)))
+                    .into_any_element(),
+            ))
+            .child(section_header("CONFIG FILE", c))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(path),
+            )
+            .child(
+                h_flex().p_2().gap_2().justify_end().child(
                     Button::new("close-settings").label("Close").on_click(
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_settings(cx)),
                     ),
-                ));
+                ),
+            );
 
         self.modal_layer(v_flex().mt(px(26.)).w(px(520.)).child(body), cx)
     }
@@ -1483,12 +1727,19 @@ impl Workspace {
                 .small()
                 .icon(Icon::empty().path(icon))
                 .disabled(!on)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pool_size(to, cx)))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pool_size(to, cx)),
+                )
         };
         h_flex()
             .gap_1()
             .items_center()
-            .child(step("pool-less", "icons/minus.svg", n.saturating_sub(1), n > 1))
+            .child(step(
+                "pool-less",
+                "icons/minus.svg",
+                n.saturating_sub(1),
+                n > 1,
+            ))
             .child(
                 div()
                     .w(px(28.))
@@ -1780,17 +2031,19 @@ impl Workspace {
         #[cfg(target_os = "windows")]
         let btn = btn.window_control_area(area);
         #[cfg(not(target_os = "windows"))]
-        let btn = btn.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| match id {
-            "win-min" => window.minimize_window(),
-            "win-max" => window.zoom_window(),
-            _ => {
-                // `remove_window` bypasses the OS close path, so the hook in
-                // `Workspace::new` never runs — save geometry and tabs here.
-                super::save_window_geometry(window);
-                this.flush_session(cx);
-                window.remove_window()
-            }
-        }));
+        let btn = btn.on_click(
+            cx.listener(move |this, _: &ClickEvent, window, cx| match id {
+                "win-min" => window.minimize_window(),
+                "win-max" => window.zoom_window(),
+                _ => {
+                    // `remove_window` bypasses the OS close path, so the hook in
+                    // `Workspace::new` never runs — save geometry and tabs here.
+                    super::save_window_geometry(window);
+                    this.flush_session(cx);
+                    window.remove_window()
+                }
+            }),
+        );
 
         btn
     }
@@ -2026,6 +2279,12 @@ impl Render for Workspace {
                 self.modal = None;
             }
         }
+        // Its changes are gone (tab closed, reverted, reloaded): nothing to apply.
+        if let Some(Modal::ConfirmApply(id)) = self.modal {
+            if self.tab(id).is_none_or(|t| t.pending.is_empty()) {
+                self.modal = None;
+            }
+        }
         let dialog = match self.modal {
             Some(Modal::Connections) => Some(self.render_conn_manager(cx).into_any_element()),
             Some(Modal::Settings) => Some(self.render_settings(window, cx).into_any_element()),
@@ -2033,6 +2292,9 @@ impl Render for Workspace {
             Some(Modal::Palette) => Some(self.render_palette(cx).into_any_element()),
             Some(Modal::ConfirmCancel(id)) => {
                 Some(self.render_confirm_cancel(id, cx).into_any_element())
+            }
+            Some(Modal::ConfirmApply(id)) => {
+                Some(self.render_confirm_apply(id, window, cx).into_any_element())
             }
             None => None,
         };
@@ -2154,6 +2416,32 @@ impl Workspace {
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/// Fill what the parent flex container has left along its main axis — by
+/// flex, not `size_full`'s percentage (see `editor_split` for why). `min_*(0)`
+/// lets it shrink below its content: a wide grid must scroll, not stretch
+/// every ancestor (the "can't scroll right" clamp chain).
+fn fill<E: Styled>(e: E) -> E {
+    weighted(e, 1.)
+}
+
+/// `fill`, taking `weight` of the free space next to its weighted siblings.
+fn weighted<E: Styled>(mut e: E, weight: f32) -> E {
+    let style = e.style();
+    style.flex_grow = Some(weight);
+    style.flex_shrink = Some(1.);
+    e.flex_basis(px(0.)).min_h(px(0.)).min_w(px(0.))
+}
+
+/// Drag payload of a Query tab's editor / results divider (its tab id).
+#[derive(Clone)]
+struct EditorSplitDrag(u64);
+
+impl Render for EditorSplitDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
 
 fn section_header(label: impl Into<SharedString>, c: Colors) -> impl IntoElement {
     h_flex()
@@ -2416,5 +2704,142 @@ pub(super) fn node_menu(
         }
         NodeMeta::Leaf { name, .. } => menu.item(copy_name(name.clone())),
         _ => menu,
+    }
+}
+
+/// Test-only `debug_selector` for elements that can't carry one (gpui-component's
+/// `Input`): a size-full canvas child that records its parent's bounds.
+#[cfg(test)]
+pub(super) mod layout_probe {
+    use gpui::{canvas, Bounds, IntoElement, Pixels, Styled};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    thread_local! {
+        static SEEN: RefCell<HashMap<&'static str, Bounds<Pixels>>> = RefCell::default();
+    }
+
+    pub(in crate::workspace) fn probe(key: &'static str) -> impl IntoElement {
+        canvas(
+            move |bounds, _, _| SEEN.with(|s| s.borrow_mut().insert(key, bounds)),
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
+    pub(in crate::workspace) fn bounds(key: &'static str) -> Option<Bounds<Pixels>> {
+        SEEN.with(|s| s.borrow().get(key).copied())
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::workspace::test_support::*;
+    use gpui::{size, Bounds, Pixels, TestAppContext, VisualTestContext};
+
+    /// The editor's probe sits inside its 1px border, top and bottom.
+    const INPUT_BORDER: Pixels = px(2.);
+
+    /// Close enough: layout rounds to device pixels.
+    fn near(a: Pixels, b: Pixels) -> bool {
+        (a - b).abs() <= px(1.)
+    }
+
+    fn laid_out(cx: &mut VisualTestContext, key: &'static str) -> Bounds<Pixels> {
+        cx.debug_bounds(key)
+            .unwrap_or_else(|| panic!("`{key}` wasn't drawn"))
+    }
+
+    /// A Query tab is the editor over the results, half each, filling the whole
+    /// pane under the toolbar — at every window size. The editor used to sit in
+    /// a gpui-component resizable panel and fill it by percentage height, which
+    /// taffy leaves unresolved at some fractional sizes: at 1.25 scale (and here
+    /// at many heights) the editor collapsed to its one line of text, the rest
+    /// of its panel empty. So: sweep heights with fractional device sizes, with
+    /// and without the bottom panel, and check every box.
+    #[gpui::test]
+    fn query_tab_editor_and_results_fill_the_pane(cx: &mut TestAppContext) {
+        let handle = new_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle.into(), cx);
+        cx.simulate_resize(size(px(1536.), px(816.)));
+        handle
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                seed_rows(ws, id, vec!["a", "b"], 50, cx);
+            })
+            .unwrap();
+        for bottom in [true, false] {
+            handle
+                .update(cx, |ws, _, cx| {
+                    ws.settings.show_query_log = bottom;
+                    ws.settings.show_messages = bottom;
+                    cx.notify();
+                })
+                .unwrap();
+            for i in 0..150 {
+                let height = px(560. + i as f32 * 1.37);
+                cx.simulate_resize(size(px(1536.), height));
+                cx.run_until_parked();
+                let at = format!("window height {height:?}, bottom panel {bottom}");
+
+                let body = laid_out(cx, "tab-body");
+                let split = laid_out(cx, "editor-split");
+                let editor = laid_out(cx, "editor-pane");
+                let results = laid_out(cx, "results-pane");
+                let grid = laid_out(cx, "result-grid");
+                let input = layout_probe::bounds("editor-input").expect("editor drawn");
+
+                // The split takes everything under the toolbar…
+                assert!(
+                    near(split.bottom(), body.bottom()),
+                    "split short of the tab: {at}"
+                );
+                assert!(
+                    near(results.bottom(), split.bottom()),
+                    "results short: {at}"
+                );
+                // …half each…
+                let room = split.size.height - tabs::SPLIT_HANDLE_H;
+                assert!(near(editor.size.height, room / 2.), "editor not half: {at}");
+                assert!(
+                    near(results.size.height, room / 2.),
+                    "results not half: {at}"
+                );
+                // …and what's in each pane fills it.
+                assert!(
+                    near(input.size.height + INPUT_BORDER, editor.size.height),
+                    "editor input collapsed: {at}"
+                );
+                assert!(
+                    near(grid.size.height, results.size.height),
+                    "grid short of its pane: {at}"
+                );
+            }
+        }
+    }
+
+    /// Dragging the divider moves the split; the panes follow.
+    #[gpui::test]
+    fn dragged_split_resizes_both_panes(cx: &mut TestAppContext) {
+        let handle = new_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle.into(), cx);
+        cx.simulate_resize(size(px(1400.), px(850.)));
+        let id = handle.update(cx, seed_query_tab).unwrap();
+        cx.run_until_parked();
+        let split = laid_out(cx, "editor-split");
+        handle
+            .update(cx, |ws, _, cx| {
+                ws.set_editor_split(id, split.size.height / 4., split.size.height, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let editor = laid_out(cx, "editor-pane");
+        let results = laid_out(cx, "results-pane");
+        let input = layout_probe::bounds("editor-input").unwrap();
+        assert!(editor.size.height < results.size.height / 2.);
+        assert!(near(input.size.height + INPUT_BORDER, editor.size.height));
+        assert!(near(results.bottom(), split.bottom()));
     }
 }

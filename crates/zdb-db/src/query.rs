@@ -95,10 +95,7 @@ pub(crate) async fn run(
     RunOutcome::Done
 }
 
-fn emit_columns<'a>(
-    names: impl Iterator<Item = &'a str>,
-    tx: &UnboundedSender<QueryEvent>,
-) {
+fn emit_columns<'a>(names: impl Iterator<Item = &'a str>, tx: &UnboundedSender<QueryEvent>) {
     let metas: Vec<ColumnMeta> = names.map(ColumnMeta::named).collect();
     let _ = tx.send(QueryEvent::Columns(Arc::new(metas)));
 }

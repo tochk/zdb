@@ -371,11 +371,53 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Combined SQL for a tab's staged edits (shown in the review pane).
-    pub(super) fn pending_sql(&self, tab_id: u64) -> Option<String> {
-        let tab = self.tab(tab_id)?;
-        let target = tab.edit_target.as_ref()?;
-        zdb_db::build_batch(target, &tab.pending).ok().flatten()
+    /// The statements a tab's staged changes run, as shown for review before
+    /// Apply. Just the changes: they still run inside one transaction
+    /// (`zdb_db::build_batch`), but its `BEGIN` / `COMMIT` aren't shown.
+    pub(super) fn pending_statements(&self, tab_id: u64) -> Vec<String> {
+        self.tab(tab_id)
+            .and_then(|tab| {
+                let target = tab.edit_target.as_ref()?;
+                zdb_db::edit_statements(target, &tab.pending).ok()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The Apply button / Ctrl+S: stage the cell being edited (so it's part of
+    /// the batch), then show the statements for review — or apply them at
+    /// once when that's turned off in Settings.
+    pub(super) fn request_apply(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if self.active_id() == Some(tab_id) {
+            self.commit_cell_edit(cx);
+        }
+        let Some(tab) = self.tab(tab_id) else {
+            return;
+        };
+        if tab.running {
+            return;
+        }
+        if tab.pending.is_empty() {
+            self.status = "No changes to apply".into();
+            cx.notify();
+            return;
+        }
+        if !self.settings.confirm_apply {
+            return self.apply_pending(tab_id, cx);
+        }
+        self.apply_dont_ask = false;
+        self.modal = Some(Modal::ConfirmApply(tab_id));
+        cx.notify();
+    }
+
+    /// The review dialog's Apply: run the changes, and stop asking if "Don't
+    /// ask again" is ticked. (Cancel / Esc leave the setting alone, ticked or
+    /// not — and the changes staged.)
+    pub(super) fn confirm_apply(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if std::mem::take(&mut self.apply_dont_ask) {
+            self.set_confirm_apply(false, cx);
+        }
+        self.close_modal(cx);
+        self.apply_pending(tab_id, cx);
     }
 
     pub(super) fn cancel_pending(&mut self, tab_id: u64, cx: &mut Context<Self>) {
@@ -395,13 +437,14 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Execute a tab's staged edits in a single transaction, then reload it.
+    /// Execute a tab's staged edits in a single transaction, then reload it:
+    /// the same query again, so its filter, sort and page stay.
     pub(super) fn apply_pending(&mut self, tab_id: u64, cx: &mut Context<Self>) {
         let (target, edits, reload) = {
             let Some(tab) = self.tab_mut(tab_id) else {
                 return;
             };
-            if tab.pending.is_empty() {
+            if tab.pending.is_empty() || tab.running {
                 return;
             }
             let Some(target) = tab.edit_target.clone() else {
@@ -434,6 +477,10 @@ impl Workspace {
                     this.log.push(&sql, true);
                     if let Some(tab) = this.tab_mut(tab_id) {
                         tab.edited_cells.clear();
+                        // Rows came or went: the pager's count is stale.
+                        if edits.iter().any(|e| !matches!(e, RowEdit::Update { .. })) {
+                            tab.total_rows = None;
+                        }
                     }
                     if let Some(s) = reload {
                         this.run_sql(tab_id, s, cx);
@@ -671,11 +718,113 @@ mod tests {
                 ws.commit_cell_edit(cx);
 
                 assert_eq!(ws.tab(id).unwrap().pending.len(), 2);
-                let batch = ws.pending_sql(id).expect("combined sql");
-                assert!(batch.starts_with("BEGIN;"));
-                assert!(batch.trim_end().ends_with("COMMIT;"));
-                assert!(batch.contains(r#"SET "name" = 'x' WHERE "id" = '1'"#));
-                assert!(batch.contains(r#"SET "name" = 'y' WHERE "id" = '2'"#));
+                // Shown for review as just the changes — the BEGIN / COMMIT
+                // they run inside stays out of sight.
+                assert_eq!(
+                    ws.pending_statements(id),
+                    [
+                        r#"UPDATE "public"."widget" SET "name" = 'x' WHERE "id" = '1'"#,
+                        r#"UPDATE "public"."widget" SET "name" = 'y' WHERE "id" = '2'"#,
+                    ]
+                );
+            })
+            .unwrap();
+    }
+
+    /// Stage one UPDATE on a fresh editable Query tab; returns its id.
+    fn staged_change(ws: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) -> u64 {
+        let id = seed_query_tab(ws, window, cx);
+        editable_tab(ws, id, vec!["id", "name"]);
+        ws.tab_mut(id).unwrap().rows = vec![vec![
+            CellValue::Text("1".into()),
+            CellValue::Text("a".into()),
+        ]];
+        ws.begin_edit(id, 0, 1, window, cx);
+        ws.cell_input
+            .update(cx, |i, cx| i.set_value("b", window, cx));
+        ws.commit_cell_edit(cx);
+        id
+    }
+
+    /// Apply (button / Ctrl+S) shows the statements first; Cancel keeps the
+    /// changes staged and the setting alone, even with "Don't ask again" ticked.
+    #[gpui::test]
+    fn apply_asks_first_and_cancel_keeps_the_changes(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = staged_change(ws, window, cx);
+                ws.request_apply(id, cx);
+                assert_eq!(ws.modal, Some(Modal::ConfirmApply(id)));
+                assert!(!ws.apply_dont_ask, "the box starts unticked");
+
+                ws.apply_dont_ask = true;
+                ws.close_modal(cx);
+                assert_eq!(ws.tab(id).unwrap().pending.len(), 1);
+                assert!(ws.settings.confirm_apply);
+
+                // Asking again starts with the box unticked again.
+                ws.request_apply(id, cx);
+                assert!(!ws.apply_dont_ask);
+            })
+            .unwrap();
+    }
+
+    /// The cell still being typed into is part of what Apply shows.
+    #[gpui::test]
+    fn apply_stages_the_cell_being_edited(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                editable_tab(ws, id, vec!["id", "name"]);
+                ws.tab_mut(id).unwrap().rows = vec![vec![
+                    CellValue::Text("1".into()),
+                    CellValue::Text("a".into()),
+                ]];
+                ws.begin_edit(id, 0, 1, window, cx);
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("b", window, cx));
+
+                ws.apply_active(cx);
+                assert_eq!(ws.tab(id).unwrap().editing, None);
+                assert_eq!(ws.pending_statements(id).len(), 1);
+                assert_eq!(ws.modal, Some(Modal::ConfirmApply(id)));
+            })
+            .unwrap();
+    }
+
+    /// "Don't ask again" counts only with Apply: it turns the review off, and
+    /// from then on Apply runs at once (here: no connection, so the changes
+    /// are put back for a retry, and no dialog opens).
+    #[gpui::test]
+    fn dont_ask_again_applies_directly_next_time(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = staged_change(ws, window, cx);
+                ws.request_apply(id, cx);
+                ws.apply_dont_ask = true;
+                ws.confirm_apply(id, cx);
+                assert_eq!(ws.modal, None);
+                assert!(!ws.settings.confirm_apply);
+                assert_eq!(ws.tab(id).unwrap().pending.len(), 1, "kept for a retry");
+
+                ws.request_apply(id, cx);
+                assert_eq!(ws.modal, None, "no review once turned off");
+            })
+            .unwrap();
+    }
+
+    /// Nothing staged: Apply has nothing to show.
+    #[gpui::test]
+    fn apply_with_nothing_staged_opens_nothing(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                ws.request_apply(id, cx);
+                assert_ne!(ws.modal, Some(Modal::ConfirmApply(id)));
             })
             .unwrap();
     }

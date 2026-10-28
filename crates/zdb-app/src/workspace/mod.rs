@@ -12,8 +12,8 @@ use gpui::ClipboardItem;
 use gpui::{
     actions, div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context,
     Entity, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds,
-    WindowControlArea,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Window,
+    WindowBounds, WindowControlArea,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -28,8 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use zdb_config::{ConnectionEntry, Settings};
 use zdb_db::{
-    CellValue, ConnId, ConnSetup, ConnectionConfig, DbHandle, EditTarget, ExportFormat,
-    QueryEvent, RelationDetail, RelationKind, RowEdit, SchemaObjects,
+    CellValue, ConnId, ConnSetup, ConnectionConfig, DbHandle, EditTarget, ExportFormat, QueryEvent,
+    RelationDetail, RelationKind, RowEdit, SchemaObjects,
 };
 
 mod autoscroll;
@@ -126,7 +126,7 @@ const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
     ("Next tab", PaletteCmd::NextTab),
     ("Previous tab", PaletteCmd::PrevTab),
     ("Close tab", PaletteCmd::CloseTab),
-    ("Apply staged edits", PaletteCmd::ApplyEdits),
+    ("Apply staged changes", PaletteCmd::ApplyEdits),
 ];
 
 /// Lightweight milestone logging to stderr, enabled by setting `ZDB_LOG`.
@@ -192,6 +192,8 @@ pub struct Workspace {
     modal: Option<Modal>,
     /// The cancel confirmation's "Don't ask again" box (taken on confirm only).
     cancel_dont_ask: bool,
+    /// The apply-changes dialog's "Don't ask again" box.
+    apply_dont_ask: bool,
     modal_focus: ModalFocus,
     palette_input: Entity<InputState>,
 
@@ -338,6 +340,7 @@ impl Workspace {
             log: QueryLog::default(),
             modal: None,
             cancel_dont_ask: false,
+            apply_dont_ask: false,
             modal_focus: ModalFocus::new(cx),
             palette_input,
             terminal: None,

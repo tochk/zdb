@@ -12,7 +12,9 @@ use std::sync::Arc;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ring, CryptoProvider};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 pub fn make_connector(cfg: &ConnectionConfig) -> Result<MakeRustlsConnect, DbError> {
@@ -33,9 +35,7 @@ pub fn make_connector(cfg: &ConnectionConfig) -> Result<MakeRustlsConnect, DbErr
                 .map_err(|e| DbError::Tls(format!("reading {}: {e}", path.display())))?;
             for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
                 let cert = cert.map_err(|e| DbError::Tls(e.to_string()))?;
-                roots
-                    .add(cert)
-                    .map_err(|e| DbError::Tls(e.to_string()))?;
+                roots.add(cert).map_err(|e| DbError::Tls(e.to_string()))?;
             }
         }
         builder.with_root_certificates(roots).with_no_client_auth()

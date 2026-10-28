@@ -2,6 +2,7 @@
 //! query builders (`table_query` / `apply_where`).
 
 use super::*;
+use gpui::Pixels;
 
 impl Workspace {
     // ---- tab management --------------------------------------------------
@@ -127,8 +128,42 @@ impl Workspace {
         let tab = Tab::table(id, schema, table, self.lsp_slot.clone(), window, cx);
         self.tabs.push(tab);
         self.activate_tab(self.tabs.len() - 1, window, cx);
-        let sql = self.table_query(id, cx);
-        self.run_new_query(id, sql, cx);
+        self.apply_where(id, cx);
+    }
+
+    /// Do `then` once `tab_id`'s primary key — a Table tab's default order —
+    /// is known: at once, or after looking it up (the first query of the tab).
+    /// A Stop meanwhile drops `then`; a failed lookup counts as no key.
+    pub(super) fn with_table_pk(
+        &mut self,
+        tab_id: u64,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, &mut Context<Self>) + 'static,
+    ) {
+        let (Some(conn), Some(tab)) = (self.conn, self.tab(tab_id)) else {
+            return then(self, cx);
+        };
+        let TabKind::Table { schema, table } = &tab.kind else {
+            return then(self, cx);
+        };
+        if tab.table_pk.is_some() {
+            return then(self, cx);
+        }
+        let (schema, table) = (schema.clone(), table.clone());
+        let Some(gen) = self.begin_run(tab_id) else {
+            return;
+        };
+        let db = self.db.clone();
+        let fut = async move { db.primary_key(conn, schema, table).await };
+        self.spawn_db(cx, fut, move |this, pk, cx| {
+            let Some(tab) = this.current_run(tab_id, gen) else {
+                return;
+            };
+            tab.running = false;
+            tab.table_pk = Some(pk.unwrap_or_default());
+            then(this, cx);
+        });
+        cx.notify();
     }
 
     /// Focus the singleton scratch tab, opening it if absent.
@@ -203,6 +238,25 @@ impl Workspace {
         cx.notify();
     }
 
+    /// The editor / results divider of a Query or Scratch tab was dragged to
+    /// `y` within a split `height` tall (see `editor_split_at`).
+    pub(super) fn set_editor_split(
+        &mut self,
+        tab_id: u64,
+        y: Pixels,
+        height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        let split = editor_split_at(y, height);
+        if (tab.editor_split - split).abs() > f32::EPSILON {
+            tab.editor_split = split;
+            cx.notify();
+        }
+    }
+
     /// `SELECT * FROM <table> [WHERE …] [ORDER BY …] LIMIT n` for a table tab.
     /// The whole statement is rebuilt from the tab's own parts (filter + sort),
     /// so sorting never has to rewrite previously generated SQL.
@@ -220,11 +274,20 @@ impl Workspace {
         let w = tab.where_input.read(cx).value();
         let o = tab.order_input.read(cx).value();
         let l = tab.limit_input.read(cx).value();
+        let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
+        let relation = format!("{}.{}", quote(schema), quote(table));
+        let pk_order = tab
+            .table_pk
+            .iter()
+            .flatten()
+            .map(|c| quote(c))
+            .collect::<Vec<_>>()
+            .join(", ");
         Some(TableSql::new(
-            schema,
-            table,
+            &relation,
             w.trim(),
             o.trim(),
+            &pk_order,
             l.trim(),
             tab.page,
             tab.total_rows,
@@ -285,9 +348,29 @@ impl Workspace {
             tab.page = 0;
             tab.total_rows = None;
         }
-        let sql = self.table_query(tab_id, cx);
-        self.run_new_query(tab_id, sql, cx);
+        self.with_table_pk(tab_id, cx, move |this, cx| {
+            let sql = this.table_query(tab_id, cx);
+            this.run_new_query(tab_id, sql, cx);
+        });
     }
+}
+
+/// Height of the drag handle between a Query tab's editor and its results.
+pub(super) const SPLIT_HANDLE_H: Pixels = px(5.);
+/// Neither side of that split is dragged smaller than this.
+const SPLIT_MIN_PANE: Pixels = px(60.);
+
+/// The editor's share of a split `height` tall when the divider is dragged to
+/// `y` (from the split's top): the handle centred on the cursor, both panes
+/// kept at least `SPLIT_MIN_PANE` — or an even split when there isn't room
+/// for that.
+pub(super) fn editor_split_at(y: Pixels, height: Pixels) -> f32 {
+    let room = height - SPLIT_HANDLE_H;
+    if room < SPLIT_MIN_PANE * 2. {
+        return grid::EDITOR_SPLIT;
+    }
+    let editor = (y - SPLIT_HANDLE_H / 2.).clamp(SPLIT_MIN_PANE, room - SPLIT_MIN_PANE);
+    editor / room
 }
 
 /// The LIMIT box as a page size: a positive whole number, else no paging.
@@ -312,8 +395,12 @@ pub(super) struct TableSql {
 }
 
 impl TableSql {
-    /// An empty box adds nothing (no LIMIT = every row); `page` > 0 adds the
-    /// OFFSET of that many pages of `limit` rows.
+    /// An empty box adds nothing (no LIMIT = every row) — except ORDER BY,
+    /// which then falls back to `pk_order` (the primary key; empty for none),
+    /// so rows keep their place across reloads: without an order Postgres
+    /// returns them as stored, and an UPDATE moves a row (it used to jump to
+    /// another page after Apply). `page` > 0 adds the OFFSET of that many
+    /// pages of `limit` rows.
     ///
     /// With the row count (`total`) known, a page nearer the end than the
     /// start is read from the end instead — ORDER BY reversed, OFFSET counting
@@ -322,19 +409,20 @@ impl TableSql {
     /// costs nothing extra (instant with an index on the order) instead of
     /// another pass over the whole table.
     fn new(
-        schema: &str,
-        table: &str,
+        relation: &str,
         filter: &str,
         order: &str,
+        pk_order: &str,
         limit: &str,
         page: usize,
         total: Option<usize>,
     ) -> Self {
-        let mut sql = format!(
-            "SELECT * FROM \"{}\".\"{}\"",
-            schema.replace('"', "\"\""),
-            table.replace('"', "\"\"")
-        );
+        // An error in the fallback order isn't the (empty) box's.
+        let (order, own_order) = match order {
+            "" => (pk_order, false),
+            typed => (typed, true),
+        };
+        let mut sql = format!("SELECT * FROM {relation}");
         // Appends ` <keyword> <text>`, giving where `text` starts.
         fn clause(sql: &mut String, keyword: &str, text: &str) -> Option<usize> {
             (!text.is_empty()).then(|| {
@@ -357,7 +445,7 @@ impl TableSql {
                 .map(|rev| (rev, len, after))
         });
         let reversed = from_end.is_some();
-        let (order_at, limit_at) = match from_end {
+        let (order_at, limit_at): (Option<usize>, Option<usize>) = match from_end {
             Some((rev, len, after)) => {
                 let order_at = clause(&mut sql, " ORDER BY ", &rev);
                 let limit_at = clause(&mut sql, " LIMIT ", &len.to_string());
@@ -379,7 +467,7 @@ impl TableSql {
             sql,
             count_sql,
             where_at,
-            order_at,
+            order_at: order_at.filter(|_| own_order),
             limit_at,
             first_row,
             reversed,
@@ -392,6 +480,67 @@ mod tests {
     use super::*;
     use crate::workspace::test_support::*;
     use gpui::TestAppContext;
+
+    #[test]
+    fn editor_split_follows_the_divider() {
+        // 600 to share + the 5px handle; the handle is centred on the cursor.
+        let h = px(605.);
+        assert_eq!(editor_split_at(px(302.5), h), 0.5);
+        assert_eq!(editor_split_at(px(152.5), h), 0.25);
+        // Neither pane goes below 60px…
+        assert_eq!(editor_split_at(px(0.), h), 0.1);
+        assert_eq!(editor_split_at(px(9999.), h), 0.9);
+        // …and with no room for both, it's an even split.
+        assert_eq!(editor_split_at(px(30.), px(100.)), grid::EDITOR_SPLIT);
+    }
+
+    /// With the ORDER BY box empty, rows come in primary-key order (so an
+    /// UPDATE doesn't move them between pages); a typed order wins, and errors
+    /// in the fallback aren't pinned on the empty box. Far pages read from the
+    /// end reverse it like any other order.
+    #[gpui::test]
+    fn empty_order_falls_back_to_the_primary_key(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.open_table_tab("public".into(), "pairs".into(), window, cx);
+                let id = ws.active_id().unwrap();
+                let base = "SELECT * FROM \"public\".\"pairs\"";
+                // Not looked up yet (no connection): no order at all.
+                assert_eq!(ws.table_query(id, cx), format!("{base} LIMIT 500"));
+
+                ws.tab_mut(id).unwrap().table_pk = Some(vec!["c".into(), "a\"b".into()]);
+                let sql = ws.table_query(id, cx);
+                assert_eq!(sql, format!(r#"{base} ORDER BY "c", "a""b" LIMIT 500"#));
+                let pos = sql.find("ORDER BY").unwrap() as u32 + 12;
+                assert_eq!(ws.clause_at(id, &sql, pos, cx), None);
+
+                let order = ws.tab(id).unwrap().order_input.clone();
+                order.update(cx, |i, cx| i.set_value("name DESC", window, cx));
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    format!("{base} ORDER BY name DESC LIMIT 500")
+                );
+                order.update(cx, |i, cx| i.set_value("", window, cx));
+
+                // Last of 3 pages of 500: read backwards from the end.
+                {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.page = 2;
+                    tab.total_rows = Some(1200);
+                }
+                assert_eq!(
+                    ws.table_query(id, cx),
+                    format!(r#"{base} ORDER BY "c" DESC, "a""b" DESC LIMIT 200"#)
+                );
+
+                // A view: no key, no order.
+                ws.tab_mut(id).unwrap().table_pk = Some(vec![]);
+                ws.tab_mut(id).unwrap().page = 0;
+                assert_eq!(ws.table_query(id, cx), format!("{base} LIMIT 500"));
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     fn table_query_builds_where(cx: &mut TestAppContext) {

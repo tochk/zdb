@@ -25,6 +25,8 @@ pub(super) enum Modal {
     Palette,
     /// "Cancel the running query?" — a click on a tab's loader asks it.
     ConfirmCancel(u64),
+    /// A tab's staged changes as statements, to review before they run.
+    ConfirmApply(u64),
 }
 
 /// Dialog focus bookkeeping (see the module docs).

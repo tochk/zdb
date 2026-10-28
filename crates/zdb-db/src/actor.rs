@@ -37,7 +37,7 @@ use crate::introspect::{
 };
 use crate::tls::make_connector;
 use crate::{
-    edit, query, ConnSetup, ConnectionConfig, ConnId, DbError, DescribedResult, EditTarget,
+    edit, query, ConnId, ConnSetup, ConnectionConfig, DbError, DescribedResult, EditTarget,
     QueryEvent, RowEdit,
 };
 use std::collections::{HashMap, VecDeque};
@@ -62,6 +62,7 @@ enum IntrospectKind {
     Columns { schema: String, table: String },
     RelationDetail { schema: String, table: String },
     SchemaObjects { schema: String },
+    PrimaryKey { schema: String, table: String },
 }
 
 /// Result of an introspection request (variant matches the request kind).
@@ -71,6 +72,7 @@ enum Introspection {
     Columns(Vec<ColumnInfo>),
     RelationDetail(RelationDetail),
     SchemaObjects(SchemaObjects),
+    PrimaryKey(Vec<String>),
 }
 
 /// Who a job belongs to: the shared session (`id` 0 — introspection, and what
@@ -291,14 +293,23 @@ impl ConnState {
             open: 1,
             dialing: 0,
             pinned: 0,
-            idle: vec![(Pooled { client: first, gen: 0 }, Instant::now())],
+            idle: vec![(
+                Pooled {
+                    client: first,
+                    gen: 0,
+                },
+                Instant::now(),
+            )],
             queue: VecDeque::new(),
             sessions: HashMap::new(),
         }
     }
 
     fn submit(&mut self, session: u64, job: Job) {
-        let s = self.sessions.entry(session).or_insert_with(SessionState::new);
+        let s = self
+            .sessions
+            .entry(session)
+            .or_insert_with(SessionState::new);
         // Reused after a close: numbering goes on, so the close's cancel
         // doesn't reach the new jobs.
         s.closed = false;
@@ -318,7 +329,9 @@ impl ConnState {
     }
 
     fn is_pinned(&self, session: u64) -> bool {
-        self.sessions.get(&session).is_some_and(|s| s.pinned.is_some())
+        self.sessions
+            .get(&session)
+            .is_some_and(|s| s.pinned.is_some())
     }
 
     /// An idle connection that is still alive.
@@ -343,7 +356,10 @@ impl ConnState {
                 continue;
             }
             let session = self.queue[i].session;
-            let pinned = self.sessions.get_mut(&session).and_then(|s| s.pinned.take());
+            let pinned = self
+                .sessions
+                .get_mut(&session)
+                .and_then(|s| s.pinned.take());
             let ran = Ran {
                 was_pinned: pinned.is_some(),
                 in_transaction: pinned.is_some(),
@@ -381,7 +397,10 @@ impl ConnState {
         before: Ran,
         tx: &mpsc::UnboundedSender<Command>,
     ) {
-        let s = self.sessions.entry(q.session).or_insert_with(SessionState::new);
+        let s = self
+            .sessions
+            .entry(q.session)
+            .or_insert_with(SessionState::new);
         s.running += 1;
         let cancelled = s.cancelled.subscribe();
         tokio::spawn(run_pooled(
@@ -619,7 +638,12 @@ impl DbHandle {
         schema: impl Into<String>,
     ) -> Result<Vec<RelationInfo>, DbError> {
         match self
-            .introspect(conn, IntrospectKind::Relations { schema: schema.into() })
+            .introspect(
+                conn,
+                IntrospectKind::Relations {
+                    schema: schema.into(),
+                },
+            )
             .await?
         {
             Introspection::Relations(v) => Ok(v),
@@ -671,6 +695,29 @@ impl DbHandle {
         }
     }
 
+    /// A relation's primary-key columns, in key order (empty: it has none,
+    /// e.g. a view).
+    pub async fn primary_key(
+        &self,
+        conn: ConnId,
+        schema: impl Into<String>,
+        table: impl Into<String>,
+    ) -> Result<Vec<String>, DbError> {
+        match self
+            .introspect(
+                conn,
+                IntrospectKind::PrimaryKey {
+                    schema: schema.into(),
+                    table: table.into(),
+                },
+            )
+            .await?
+        {
+            Introspection::PrimaryKey(v) => Ok(v),
+            _ => Err(DbError::WorkerGone),
+        }
+    }
+
     /// Sequences + functions of a schema.
     pub async fn schema_objects(
         &self,
@@ -678,7 +725,12 @@ impl DbHandle {
         schema: impl Into<String>,
     ) -> Result<SchemaObjects, DbError> {
         match self
-            .introspect(conn, IntrospectKind::SchemaObjects { schema: schema.into() })
+            .introspect(
+                conn,
+                IntrospectKind::SchemaObjects {
+                    schema: schema.into(),
+                },
+            )
             .await?
         {
             Introspection::SchemaObjects(o) => Ok(o),
@@ -995,12 +1047,10 @@ async fn worker(tx: mpsc::UnboundedSender<Command>, mut rx: mpsc::UnboundedRecei
                 }
                 None
             }
-            Command::CloseSession { session } => {
-                conns.get_mut(&session.conn).map(|state| {
-                    state.close(session.id);
-                    session.conn
-                })
-            }
+            Command::CloseSession { session } => conns.get_mut(&session.conn).map(|state| {
+                state.close(session.id);
+                session.conn
+            }),
             Command::SetPoolSize { conn, size } => conns.get_mut(&conn).map(|state| {
                 state.set_size(size);
                 conn
@@ -1100,6 +1150,9 @@ async fn run_introspect(client: &Client, kind: IntrospectKind) -> Result<Introsp
         ),
         IntrospectKind::SchemaObjects { schema } => {
             Introspection::SchemaObjects(introspect::schema_objects(client, &schema).await?)
+        }
+        IntrospectKind::PrimaryKey { schema, table } => {
+            Introspection::PrimaryKey(introspect::primary_key(client, &schema, &table).await?)
         }
     })
 }

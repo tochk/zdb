@@ -75,10 +75,18 @@ async fn apply_insert_update_delete() {
         &target,
         &[
             RowEdit::Insert {
-                values: vec![("id".into(), text("1")), ("name".into(), text("alpha")), ("qty".into(), text("10"))],
+                values: vec![
+                    ("id".into(), text("1")),
+                    ("name".into(), text("alpha")),
+                    ("qty".into(), text("10")),
+                ],
             },
             RowEdit::Insert {
-                values: vec![("id".into(), text("2")), ("name".into(), text("beta")), ("qty".into(), CellValue::Null)],
+                values: vec![
+                    ("id".into(), text("2")),
+                    ("name".into(), text("beta")),
+                    ("qty".into(), CellValue::Null),
+                ],
             },
         ],
     )
@@ -86,7 +94,9 @@ async fn apply_insert_update_delete() {
     .expect("insert batch");
 
     assert_eq!(
-        scalar(&db, conn, "SELECT count(*)::text FROM zdb_edit.widget").await.as_deref(),
+        scalar(&db, conn, "SELECT count(*)::text FROM zdb_edit.widget")
+            .await
+            .as_deref(),
         Some("2")
     );
 
@@ -103,20 +113,36 @@ async fn apply_insert_update_delete() {
     .expect("update");
 
     assert_eq!(
-        scalar(&db, conn, "SELECT name FROM zdb_edit.widget WHERE id=1").await.as_deref(),
+        scalar(&db, conn, "SELECT name FROM zdb_edit.widget WHERE id=1")
+            .await
+            .as_deref(),
         Some("o'brien")
     );
     assert_eq!(
-        scalar(&db, conn, "SELECT qty::text FROM zdb_edit.widget WHERE id=1").await.as_deref(),
+        scalar(
+            &db,
+            conn,
+            "SELECT qty::text FROM zdb_edit.widget WHERE id=1"
+        )
+        .await
+        .as_deref(),
         Some("99")
     );
 
     // Delete row 2.
-    db.apply_edits(conn, &target, &[RowEdit::Delete { pk: vec![("id".into(), text("2"))] }])
-        .await
-        .expect("delete");
+    db.apply_edits(
+        conn,
+        &target,
+        &[RowEdit::Delete {
+            pk: vec![("id".into(), text("2"))],
+        }],
+    )
+    .await
+    .expect("delete");
     assert_eq!(
-        scalar(&db, conn, "SELECT count(*)::text FROM zdb_edit.widget").await.as_deref(),
+        scalar(&db, conn, "SELECT count(*)::text FROM zdb_edit.widget")
+            .await
+            .as_deref(),
         Some("1")
     );
 
@@ -134,7 +160,12 @@ async fn failed_batch_rolls_back_atomically() {
 
     exec(&db, conn, "DROP SCHEMA IF EXISTS zdb_edit_tx CASCADE").await;
     exec(&db, conn, "CREATE SCHEMA zdb_edit_tx").await;
-    exec(&db, conn, "CREATE TABLE zdb_edit_tx.t (id int PRIMARY KEY, name text)").await;
+    exec(
+        &db,
+        conn,
+        "CREATE TABLE zdb_edit_tx.t (id int PRIMARY KEY, name text)",
+    )
+    .await;
     exec(&db, conn, "INSERT INTO zdb_edit_tx.t VALUES (1,'orig')").await;
 
     let target = EditTarget {
@@ -153,7 +184,9 @@ async fn failed_batch_rolls_back_atomically() {
                     pk: vec![("id".into(), text("1"))],
                     set: vec![("name".into(), text("changed"))],
                 },
-                RowEdit::Insert { values: vec![("id".into(), text("1")), ("name".into(), text("dup"))] },
+                RowEdit::Insert {
+                    values: vec![("id".into(), text("1")), ("name".into(), text("dup"))],
+                },
             ],
         )
         .await;
@@ -161,7 +194,9 @@ async fn failed_batch_rolls_back_atomically() {
 
     // The earlier update must NOT have persisted.
     assert_eq!(
-        scalar(&db, conn, "SELECT name FROM zdb_edit_tx.t WHERE id=1").await.as_deref(),
+        scalar(&db, conn, "SELECT name FROM zdb_edit_tx.t WHERE id=1")
+            .await
+            .as_deref(),
         Some("orig"),
         "transaction must roll back atomically"
     );
