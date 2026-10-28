@@ -47,8 +47,39 @@ fn export_basename(tab: &Tab) -> String {
     }
 }
 
+/// The data layer's format for the one picked in Settings.
+pub(super) fn export_format(fmt: zdb_config::ExportFormat) -> ExportFormat {
+    match fmt {
+        zdb_config::ExportFormat::Csv => ExportFormat::Csv,
+        zdb_config::ExportFormat::Json => ExportFormat::Json,
+        zdb_config::ExportFormat::Inserts => ExportFormat::Inserts,
+    }
+}
+
+/// How a format is named in the UI.
+pub(super) fn export_label(fmt: zdb_config::ExportFormat) -> &'static str {
+    match fmt {
+        zdb_config::ExportFormat::Csv => "CSV",
+        zdb_config::ExportFormat::Json => "JSON",
+        zdb_config::ExportFormat::Inserts => "SQL INSERTs",
+    }
+}
+
+/// Every export format, in menu order.
+pub(super) const EXPORT_FORMATS: [zdb_config::ExportFormat; 3] = [
+    zdb_config::ExportFormat::Csv,
+    zdb_config::ExportFormat::Json,
+    zdb_config::ExportFormat::Inserts,
+];
+
 impl Workspace {
     // ---- export ----------------------------------------------------------
+
+    /// The toolbar's Export button: the active tab's result in the format
+    /// chosen in Settings (CSV unless changed).
+    pub(super) fn export_default(&mut self, cx: &mut Context<Self>) {
+        self.export_active(export_format(self.settings.export_format), cx)
+    }
 
     /// Serialize the active tab's result in `fmt` and save it via a native
     /// file dialog (no-op with a status message when the result is empty).

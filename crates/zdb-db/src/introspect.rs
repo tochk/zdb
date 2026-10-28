@@ -119,6 +119,16 @@ WHERE n.nspname = $1 AND c.relname = $2
   AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY a.attnum";
 
+const PRIMARY_KEY_SQL: &str = "\
+SELECT a.attname
+FROM pg_index i
+JOIN pg_class c ON c.oid = i.indrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+CROSS JOIN LATERAL unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, ord)
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
+WHERE n.nspname = $1 AND c.relname = $2 AND i.indisprimary
+ORDER BY k.ord";
+
 const INDEXES_SQL: &str = "\
 SELECT ic.relname AS name,
        ix.indisunique,
@@ -206,6 +216,19 @@ pub(crate) async fn columns(
             is_primary_key: r.get(5),
         })
         .collect())
+}
+
+/// A relation's primary-key columns, in key order; empty when it has none.
+pub(crate) async fn primary_key(
+    client: &Client,
+    schema: &str,
+    table: &str,
+) -> Result<Vec<String>, DbError> {
+    let rows = client
+        .query(PRIMARY_KEY_SQL, &[&schema, &table])
+        .await
+        .map_err(|e| DbError::from_pg(&e))?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
 async fn indexes(client: &Client, schema: &str, table: &str) -> Result<Vec<IndexInfo>, DbError> {

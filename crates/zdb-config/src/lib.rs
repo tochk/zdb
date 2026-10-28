@@ -41,6 +41,10 @@ pub struct Settings {
     /// Bottom-panel visibility, toggled from the status bar.
     pub show_query_log: bool,
     pub show_messages: bool,
+    /// The toolbar Export button's format (the menu next to it has the others).
+    pub export_format: ExportFormat,
+    /// Applying staged edits first shows their statements for review.
+    pub confirm_apply: bool,
 }
 
 /// `Settings::pool_size` range the UI allows.
@@ -60,6 +64,8 @@ impl Default for Settings {
             confirm_query_cancel: true,
             show_query_log: true,
             show_messages: true,
+            export_format: ExportFormat::default(),
+            confirm_apply: true,
         }
     }
 }
@@ -114,6 +120,17 @@ pub enum Theme {
     Light,
     /// Black scheme.
     Dark,
+}
+
+/// A file format results export to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExportFormat {
+    #[default]
+    Csv,
+    Json,
+    /// `INSERT` statements (a `.sql` file).
+    Inserts,
 }
 
 /// A fresh connection id.
@@ -260,8 +277,11 @@ mod tests {
             confirm_query_cancel: false,
             show_query_log: false,
             show_messages: true,
+            export_format: ExportFormat::Inserts,
+            confirm_apply: false,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
+        assert!(json.contains(r#""export_format": "inserts""#));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.connections.len(), 1);
         assert_eq!(back.connections[0].port, 5433);
@@ -276,6 +296,8 @@ mod tests {
         assert_eq!(back.connections[0].init_sql, "SET search_path TO app");
         assert!(!back.show_query_log && back.show_messages);
         assert!(!back.confirm_query_cancel);
+        assert_eq!(back.export_format, ExportFormat::Inserts);
+        assert!(!back.confirm_apply);
     }
 
     #[test]
@@ -309,6 +331,9 @@ mod tests {
         // Both bottom panels showing; cancelling from the loader asks first.
         assert!(s.show_query_log && s.show_messages);
         assert!(s.confirm_query_cancel);
+        // Export goes to CSV; Apply shows the statements first.
+        assert_eq!(s.export_format, ExportFormat::Csv);
+        assert!(s.confirm_apply);
     }
 
     #[test]

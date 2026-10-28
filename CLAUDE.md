@@ -66,10 +66,22 @@ The UI talks to the DB only through `DbHandle` channels; it never touches Tokio
   `ZDB_TEST_HOST=127.0.0.1 ZDB_TEST_USER=zdb ZDB_TEST_DB=zdb ZDB_TEST_PASSWORD=zdb cargo test`.
   A native Postgres 16 runs locally (no docker): `sudo pg_ctlcluster 16 main start`
   (role/db/pw all `zdb`).
+- Format with `make fmt` (`cargo fmt --all`, config in `rustfmt.toml`); CI's `fmt` job
+  runs `cargo fmt --all --check` and fails on anything unformatted.
 - gpui UI tests use `#[gpui::test]` and need gpui's `test-support` dev-feature
   (already set in zdb-app `[dev-dependencies]`).
-- Run dev with a connection via env: `ZDB_HOST/USER/DB/PASSWORD`, `ZDB_SSL_DISABLE=1`.
+- Run dev with a connection via env: `ZDB_HOST/USER/DB/PASSWORD`, `ZDB_SSL_DISABLE=1`
+  (`ZDB_NAME` labels it; default "dev").
   `ZDB_LOG=1` prints milestones; `ZDB_SELFTEST=1` runs a demo query after connect.
+- **Drive the GUI on a virtual display, not the user's.** WSLg windows land on the user's
+  desktop and `xdotool` moves THEIR mouse. Xvfb is installed: `Xvfb :99 -screen 0
+  2400x1600x24 &`, then run zdb with `DISPLAY=:99` (+ `env -u WAYLAND_DISPLAY`) and an
+  isolated `XDG_CONFIG_HOME=/tmp/...` (a `settings.json` there sets theme / window size /
+  panels; seed `zdb/tabs/env.json` + `zdb/scratch/env.sql` to restore tabs). Screenshot with
+  `import -window <id>`. Rendering works (lavapipe). `GPUI_X11_SCALE_FACTOR=1.25` reproduces
+  the user's Windows DPI — fractional-scale layout bugs show up here (see the editor-split
+  note). README screenshots (`docs/screenshots/`) were taken this way at 1440×900 @1.25
+  against the demo DB `shop` (`scripts/demo-shop.sql`; how to create it is in its header).
 
 ## Windows builds
 
@@ -214,12 +226,36 @@ The WSL host can run Windows exes directly:
 - Inline editing couples the table delegate to the workspace: `ResultDelegate`
   holds `WeakEntity<Workspace>`, reads editing state in `render_td`, and calls back
   via `weak.update(...)`. Edits accumulate in `pending: Vec<RowEdit>` (optimistically
-  shown in the grid); the review pane renders the combined `build_batch` SQL
-  (`BEGIN; … COMMIT;`); Apply runs the whole batch in one transaction (`apply_edits`),
-  Cancel discards and reloads. Edits survive a failed Apply so they can be retried.
-- gpui-component `Input` element defaults to CONTENT height (one line). For a
-  full-height multi-line editor call `Input::new(state).h_full()` — the wrapping
-  `div().size_full()`/`flex_1` is not enough on its own.
+  shown in the grid, + a blue "N changes staged" toolbar badge). **Apply** = the green ✓
+  next to Run / Ctrl+S / the badge → `edit.rs::request_apply`: stages the cell being typed,
+  then opens `Modal::ConfirmApply(tab)` listing `pending_statements` (`zdb_db::edit_statements`
+  — the statements WITHOUT the `BEGIN`/`COMMIT`; the batch still runs in one transaction via
+  `apply_edits`/`build_batch`). "Don't ask again" (`apply_dont_ask`, reset per opening) counts
+  only with Apply and clears `Settings.confirm_apply` (also a Settings checkbox) — then Apply
+  runs at once. After success it re-runs `last_sql` (same WHERE/sort/page; `table_page_of`
+  knows the page) and forgets `total_rows` if rows were inserted/deleted. ↶ Revert
+  (`cancel_pending`) discards + reloads. Edits survive a failed Apply for a retry. There is
+  no bottom-panel review pane any more. (Rows don't jump pages after the reload: an empty
+  ORDER BY box means primary-key order — see the Table-tab notes.)
+- gpui-component `Input` element defaults to CONTENT height (one line). A full-height
+  multi-line editor needs its height set: `.h_full()` (a percentage — see the next note for
+  when that fails) or, as the Query editor does, flex: `.flex_grow().flex_basis(px(0.))`
+  inside a flex column.
+- **Percentage heights can silently not resolve (scale-dependent).** The Query/Scratch
+  editor used to sit in a gpui-component `v_resizable` panel with `Input::h_full()`; at
+  fractional device sizes (the user's 1.25 Windows DPI: 170px → 212.5 device px) taffy left
+  the 100% unresolved → the editor collapsed to its one line of text, the rest of its panel
+  empty (and sometimes the results stuck at the 100px panel minimum). Fine at scale 1 on
+  Linux, so it looked Windows-only. gpui lays out in DEVICE pixels (`taffy.rs` multiplies by
+  `scale_factor`). Now `view.rs::editor_split` builds the split from flex WEIGHTS
+  (`weighted`/`fill`: grow = share, basis 0, min 0) — no percentages — with our own drag
+  handle (`EditorSplitDrag`, `Tab.editor_split`, default `grid::EDITOR_SPLIT` = half;
+  `tabs::editor_split_at` clamps panes to 60px; double-click = half again).
+  `view.rs::layout_tests` sweeps window heights (×1.37px steps, bottom panel on/off) and
+  checks every box; the test platform's scale is 2.0, and the sweep DOES reproduce the old
+  collapse (verified by swapping the old `v_resizable` code back in). Elements that can't
+  take a `debug_selector` (the `Input`) are measured with the `#[cfg(test)]`
+  `layout_probe::probe` canvas (it sits inside the input's 1px border).
 - App icon: regen with `python3 scripts/gen-icon.py` (black rounded square + white DB
   cylinder, no letter) → `resources/zdb.ico`, embedded via build.rs. build.rs has
   `rerun-if-changed` on the .ico so it re-embeds. Windows Explorer may still show the
@@ -244,7 +280,7 @@ The WSL host can run Windows exes directly:
 - Resizable panels: gpui-component seeds any `resizable_panel()` WITHOUT an explicit
   `.size()` to `PANEL_MIN_SIZE` (state.rs `sync_panels_count`), then ratio-scales to
   the container. A group where the first panel had no size squeezed the last panel
-  off-screen (the bottom query-log / review pane was clipped below the window). Give
+  off-screen (the bottom query-log pane was clipped below the window). Give
   EVERY panel an explicit `.size()` (the ratios are scaled to fit) — don't leave one
   unsized expecting it to flex-fill.
 - **Wide results must be able to scroll horizontally**: a flex item's automatic
@@ -404,8 +440,10 @@ The WSL host can run Windows exes directly:
   it keeping filter + sort: a Table tab REBUILDS from its WHERE / ORDER BY boxes (as Run
   does — `base_sql` predates a header sort, which only `run_sql`s), a Query tab re-runs
   `base_sql` under its header sort. (`render_center` = tab strip + active tab body |
-  welcome pane.) Groups, divided by 1px rules: row actions | pager (Table tabs) |
-  Explain / Export / Copy (/ Format) as ICON buttons. Toolbar icons get NO explicit
+  welcome pane.) Groups, divided by 1px rules: Run + Apply ✓ / Revert ↶ (enabled with staged
+  changes) | row actions | pager (Table tabs) | Explain / Explain Analyze / Export + ▾ /
+  Copy (/ Format) as ICON buttons, then the staged-changes and transaction badges. Toolbar
+  icons get NO explicit
   `text_color` (except the semantic red/green ones): inside a gpui-component `Button`
   the icon inherits the button's text color, which is what dims it when disabled — a
   fixed color made a disabled button look live.
@@ -425,8 +463,7 @@ The WSL host can run Windows exes directly:
 - **Status bar + collapsible bottom panels** (`view.rs::render_status_bar`, Zed-style): ghost
   icon toggles (`.selected` + a `theme.blue` icon while open) for QUERY LOG / MESSAGES, persisted as
   `Settings.show_query_log` / `show_messages` (also in the palette). With Messages hidden the
-  bar shows the latest status line. The PENDING review pane ignores the Messages toggle (it
-  holds Apply/Cancel). Hidden bottom = the `zdb-root` panel stays in the group with
+  bar shows the latest status line. Hidden bottom = the `zdb-root` panel stays in the group with
   `.visible(false)` (its height survives the toggle) and the top panel's 1200px cap is lifted.
   The bar is pinned to `viewport_size().width` like the title bar.
 - **Pager** (`view.rs::render_pager`, `query.rs::go_page`): `« ‹ 501–1000 of N › »`. A page
@@ -474,6 +511,14 @@ The WSL host can run Windows exes directly:
   orig_rows/base_sql/last_sql/sort_state/edit_target/edit_cols/editing/current_row/
   new_row_idx/pending/edited_cells/running) so switching tabs preserves each one's grid,
   selection, and staged edits. Key rules baked in:
+  - **Empty ORDER BY box = primary-key order** (`Tab.table_pk`, `TableSql::new`'s
+    `pk_order`): without any order Postgres returns rows as stored and an UPDATE moves a
+    row, so after Apply's reload edited rows jumped to another page. The key is looked up
+    (`DbHandle::primary_key`, shared session) before a Table tab's FIRST query —
+    `tabs.rs::with_table_pk` gates `apply_where` / `reload_data` (and so open, restore,
+    pager); it counts as a run (loader, Stop drops it); a failed lookup or a view = no
+    key = no ORDER BY. Errors in that implicit clause aren't pinned on the empty box
+    (`order_at` only for typed text). Far-page reversal works on it like any order.
   - **Table-tab sorting rebuilds, never rewrites.** A Table tab's SQL is generated by
     `tabs.rs::table_query` from its own parts: `SELECT * FROM "s"."t" [WHERE <where_input>]
     [ORDER BY <order_input>] [LIMIT <limit_input>] [OFFSET page*limit]` (`TableSql`, which
@@ -760,15 +805,21 @@ The WSL host can run Windows exes directly:
 - **Result export** (`zdb-db/src/export.rs`, pure fns `to_csv`/`to_json`/`to_inserts`/`to_tsv`
   + `ExportFormat`): CSV/JSON/SQL-INSERTs to a file via the native save dialog
   (`cx.prompt_for_new_path`), TSV to the clipboard (`cx.write_to_clipboard`). Toolbar
-  Export(=CSV)/Copy buttons + all formats in the palette. `export_active`/`copy_active_tsv`
+  Export button = `export_default` (`Settings.export_format`, a `zdb_config::ExportFormat`,
+  CSV by default, picked in Settings); the ▾ next to it is a separate `Button` with
+  `DropdownMenu::dropdown_menu` listing every format (default checked) + Copy as TSV — NOT
+  gpui-component's `DropdownButton`, whose caret button can't opt out of the Tab order.
+  Copy button + all formats in the palette too. `export_active`/`copy_active_tsv`
   read the ACTIVE tab; build the bytes while the tab is borrowed, then drop the borrow before
   touching `self.status` (borrow-conflict trap). INSERT target = the Table tab's relation, else
   `edit_target`, else `result` (`export_table_name`, a free fn).
 
 - **EXPLAIN** (`explain_active`): prefixes the active tab's SQL with `EXPLAIN ` /
-  `EXPLAIN (ANALYZE, BUFFERS) ` and runs via `run_sql` (NOT `run_new_query`, so it doesn't
-  clobber `base_sql`/sort). Clears `edit_target`/`edit_cols` first so plan rows aren't editable.
-  Toolbar "Explain" + palette (plain + analyze). ANALYZE actually executes the query.
+  `EXPLAIN (ANALYZE, BUFFERS) ` and runs it (`run_explain`) into `Tab.plan` (shown in place
+  of the grid; `Tab.plan_analyze` says which kind). Two toolbar buttons, Explain (list-tree)
+  and Explain Analyze (gauge), each a TOGGLE: lit (`.selected`) while its own plan is up, and
+  clicked then it closes the plan; the other kind replaces it. Palette has both too.
+  ANALYZE actually executes the query.
 
 - **SQL editor extras**: `Format` button/palette → `sqlformat` crate (`util::format_sql`,
   2-space, uppercased keywords) rewrites the editor via `InputState::set_value` (needs

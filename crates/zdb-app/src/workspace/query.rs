@@ -80,7 +80,7 @@ impl Workspace {
 
     /// Start a run of `tab_id`: whatever it still has in flight is stale from
     /// here on. Returns the run's number for `current_run`.
-    fn begin_run(&mut self, tab_id: u64) -> Option<u64> {
+    pub(super) fn begin_run(&mut self, tab_id: u64) -> Option<u64> {
         let tab = self.tab_mut(tab_id)?;
         tab.run_gen += 1;
         tab.running = true;
@@ -88,7 +88,7 @@ impl Workspace {
     }
 
     /// `tab_id`, if run `gen` is still its latest (not stopped or superseded).
-    fn current_run(&mut self, tab_id: u64, gen: u64) -> Option<&mut Tab> {
+    pub(super) fn current_run(&mut self, tab_id: u64, gen: u64) -> Option<&mut Tab> {
         self.tab_mut(tab_id).filter(|t| t.run_gen == gen)
     }
 
@@ -150,8 +150,16 @@ impl Workspace {
 
     /// Run `EXPLAIN` (or `EXPLAIN (ANALYZE, BUFFERS)`) on the active tab's SQL and
     /// show the text plan in a dedicated plan view (not the results grid). Plain
-    /// EXPLAIN does not execute the query; ANALYZE does.
+    /// EXPLAIN does not execute the query; ANALYZE does. A toggle: asked again
+    /// while its own plan is up, it closes the plan instead (the other kind
+    /// replaces it).
     pub(super) fn explain_active(&mut self, analyze: bool, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            if tab.plan.is_some() && tab.plan_analyze == analyze && !tab.running {
+                let id = tab.id;
+                return self.close_plan(id, cx);
+            }
+        }
         let sql = self.active_sql(cx).trim().trim_end_matches(';').to_string();
         if sql.is_empty() {
             self.status = "Nothing to explain".into();
@@ -164,12 +172,18 @@ impl Workspace {
         } else {
             "EXPLAIN "
         };
-        self.run_explain(id, format!("{prefix}{sql}"), cx);
+        self.run_explain(id, format!("{prefix}{sql}"), analyze, cx);
     }
 
     /// Execute an `EXPLAIN …` query and collect the `QUERY PLAN` text into the
     /// tab's plan view (leaves the grid untouched).
-    pub(super) fn run_explain(&mut self, tab_id: u64, sql: String, cx: &mut Context<Self>) {
+    pub(super) fn run_explain(
+        &mut self,
+        tab_id: u64,
+        sql: String,
+        analyze: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(session) = self.tab_session(tab_id) else {
             self.status = "Not connected".into();
             cx.notify();
@@ -189,6 +203,7 @@ impl Workspace {
                 return;
             };
             tab.running = false;
+            tab.plan_analyze = analyze;
             match out.error {
                 Some(e) => {
                     tab.plan = Some(format!("Error: {e}"));
@@ -236,8 +251,10 @@ impl Workspace {
             // header arrow stays while the box still holds what its click wrote.
             let order = tab.order_input.read(cx).value().trim().to_string();
             let keep = sort.filter(|_| order == sort_clause(&tab.headers, sort));
-            let sql = self.table_query(tab_id, cx);
-            self.start_query(tab_id, sql.clone(), sql, keep, cx);
+            self.with_table_pk(tab_id, cx, move |this, cx| {
+                let sql = this.table_query(tab_id, cx);
+                this.start_query(tab_id, sql.clone(), sql, keep, cx);
+            });
             return;
         }
         let Some(base) = tab.base_sql.clone() else {
@@ -737,6 +754,36 @@ mod tests {
                 assert_eq!(ws.tab(id).unwrap().sort_state, Some((0, true))); // descending
                 ws.toggle_sort(id, 0, window, cx);
                 assert_eq!(ws.tab(id).unwrap().sort_state, None); // cleared
+            })
+            .unwrap();
+    }
+
+    /// Explain / Explain Analyze are toggles: clicked while their own plan is
+    /// up they close it; the other kind doesn't (it would replace the plan).
+    #[gpui::test]
+    fn explain_again_closes_its_plan(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                let show = |ws: &mut Workspace, analyze: bool| {
+                    let tab = ws.tab_mut(id).unwrap();
+                    tab.plan = Some("Seq Scan on t".into());
+                    tab.plan_analyze = analyze;
+                };
+                let plan_shown = |ws: &Workspace| ws.tab(id).unwrap().plan.is_some();
+
+                show(ws, false);
+                ws.explain_active(true, cx);
+                assert!(plan_shown(ws), "Analyze isn't the plain plan's toggle");
+                ws.explain_active(false, cx);
+                assert!(!plan_shown(ws));
+
+                show(ws, true);
+                ws.explain_active(false, cx);
+                assert!(plan_shown(ws));
+                ws.explain_active(true, cx);
+                assert!(!plan_shown(ws));
             })
             .unwrap();
     }

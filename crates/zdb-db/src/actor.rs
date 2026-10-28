@@ -62,6 +62,7 @@ enum IntrospectKind {
     Columns { schema: String, table: String },
     RelationDetail { schema: String, table: String },
     SchemaObjects { schema: String },
+    PrimaryKey { schema: String, table: String },
 }
 
 /// Result of an introspection request (variant matches the request kind).
@@ -71,6 +72,7 @@ enum Introspection {
     Columns(Vec<ColumnInfo>),
     RelationDetail(RelationDetail),
     SchemaObjects(SchemaObjects),
+    PrimaryKey(Vec<String>),
 }
 
 /// Who a job belongs to: the shared session (`id` 0 — introspection, and what
@@ -693,6 +695,29 @@ impl DbHandle {
         }
     }
 
+    /// A relation's primary-key columns, in key order (empty: it has none,
+    /// e.g. a view).
+    pub async fn primary_key(
+        &self,
+        conn: ConnId,
+        schema: impl Into<String>,
+        table: impl Into<String>,
+    ) -> Result<Vec<String>, DbError> {
+        match self
+            .introspect(
+                conn,
+                IntrospectKind::PrimaryKey {
+                    schema: schema.into(),
+                    table: table.into(),
+                },
+            )
+            .await?
+        {
+            Introspection::PrimaryKey(v) => Ok(v),
+            _ => Err(DbError::WorkerGone),
+        }
+    }
+
     /// Sequences + functions of a schema.
     pub async fn schema_objects(
         &self,
@@ -1125,6 +1150,9 @@ async fn run_introspect(client: &Client, kind: IntrospectKind) -> Result<Introsp
         ),
         IntrospectKind::SchemaObjects { schema } => {
             Introspection::SchemaObjects(introspect::schema_objects(client, &schema).await?)
+        }
+        IntrospectKind::PrimaryKey { schema, table } => {
+            Introspection::PrimaryKey(introspect::primary_key(client, &schema, &table).await?)
         }
     })
 }

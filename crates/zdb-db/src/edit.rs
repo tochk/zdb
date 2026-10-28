@@ -96,6 +96,12 @@ impl RowEdit {
     }
 }
 
+/// The statements a set of edits runs, in order (no semicolons, and none of
+/// the `BEGIN` / `COMMIT` that [`build_batch`] wraps them in).
+pub fn edit_statements(target: &EditTarget, edits: &[RowEdit]) -> Result<Vec<String>, DbError> {
+    edits.iter().map(|edit| edit.to_sql(target)).collect()
+}
+
 /// Build one transactional batch (`BEGIN; … ; COMMIT;`) for a set of edits.
 /// Returns `None` if there is nothing to apply.
 pub fn build_batch(target: &EditTarget, edits: &[RowEdit]) -> Result<Option<String>, DbError> {
@@ -103,8 +109,8 @@ pub fn build_batch(target: &EditTarget, edits: &[RowEdit]) -> Result<Option<Stri
         return Ok(None);
     }
     let mut sql = String::from("BEGIN;\n");
-    for edit in edits {
-        sql.push_str(&edit.to_sql(target)?);
+    for stmt in edit_statements(target, edits)? {
+        sql.push_str(&stmt);
         sql.push_str(";\n");
     }
     sql.push_str("COMMIT;\n");
@@ -219,6 +225,26 @@ mod tests {
         assert!(batch.starts_with("BEGIN;\n"));
         assert!(batch.trim_end().ends_with("COMMIT;"));
         assert_eq!(batch.matches(";\n").count(), 4); // begin + 2 stmts + commit
+    }
+
+    #[test]
+    fn statements_are_the_batch_without_its_transaction() {
+        let edits = vec![
+            RowEdit::Insert {
+                values: vec![("id".into(), text("1"))],
+            },
+            RowEdit::Delete {
+                pk: vec![("id".into(), text("2"))],
+            },
+        ];
+        let stmts = edit_statements(&target(), &edits).unwrap();
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].starts_with("INSERT INTO") && stmts[1].starts_with("DELETE FROM"));
+        let batch = build_batch(&target(), &edits).unwrap().unwrap();
+        assert_eq!(
+            batch,
+            format!("BEGIN;\n{};\n{};\nCOMMIT;\n", stmts[0], stmts[1])
+        );
     }
 
     #[test]

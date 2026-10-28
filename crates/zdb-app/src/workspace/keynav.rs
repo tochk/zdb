@@ -223,7 +223,7 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
         &[
             ("Run statement under cursor", "Ctrl+Enter"),
             ("Accept completion", "Enter / Tab"),
-            ("Apply staged edits", "Ctrl+S"),
+            ("Apply staged changes", "Ctrl+S"),
         ],
     ),
     (
@@ -512,12 +512,11 @@ impl Workspace {
         }
     }
 
-    /// `ctrl-s`: apply the active tab's staged batch (staging the cell being
-    /// edited first, so it is part of it).
+    /// `ctrl-s`: apply the active tab's staged changes, as its toolbar button
+    /// does (after showing them, unless that's turned off).
     pub(super) fn apply_active(&mut self, cx: &mut Context<Self>) {
-        self.commit_cell_edit(cx);
         if let Some(id) = self.active_id() {
-            self.apply_pending(id, cx);
+            self.request_apply(id, cx);
         }
     }
 
@@ -559,6 +558,24 @@ impl Workspace {
     /// Settings → ask before cancelling a query from its loader.
     pub(super) fn set_confirm_query_cancel(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.confirm_query_cancel = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Settings → applying staged edits shows their statements first.
+    pub(super) fn set_confirm_apply(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.confirm_apply = on;
+        self.save_settings();
+        cx.notify();
+    }
+
+    /// Settings → the format the toolbar's Export button saves.
+    pub(super) fn set_export_format(
+        &mut self,
+        fmt: zdb_config::ExportFormat,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.export_format = fmt;
         self.save_settings();
         cx.notify();
     }

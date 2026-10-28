@@ -126,7 +126,7 @@ const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
     ("Next tab", PaletteCmd::NextTab),
     ("Previous tab", PaletteCmd::PrevTab),
     ("Close tab", PaletteCmd::CloseTab),
-    ("Apply staged edits", PaletteCmd::ApplyEdits),
+    ("Apply staged changes", PaletteCmd::ApplyEdits),
 ];
 
 /// Lightweight milestone logging to stderr, enabled by setting `ZDB_LOG`.
@@ -192,6 +192,8 @@ pub struct Workspace {
     modal: Option<Modal>,
     /// The cancel confirmation's "Don't ask again" box (taken on confirm only).
     cancel_dont_ask: bool,
+    /// The apply-changes dialog's "Don't ask again" box.
+    apply_dont_ask: bool,
     modal_focus: ModalFocus,
     palette_input: Entity<InputState>,
 
@@ -338,6 +340,7 @@ impl Workspace {
             log: QueryLog::default(),
             modal: None,
             cancel_dont_ask: false,
+            apply_dont_ask: false,
             modal_focus: ModalFocus::new(cx),
             palette_input,
             terminal: None,

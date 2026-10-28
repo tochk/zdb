@@ -141,12 +141,14 @@ fn main() {
 }
 
 /// Build a connection config from `ZDB_*` env vars, for development
-/// auto-connect. Returns `None` if `ZDB_HOST` is unset.
+/// auto-connect. Returns `None` if `ZDB_HOST` is unset. `ZDB_NAME` labels it
+/// (default "dev").
 fn config_from_env() -> Option<ConnectionConfig> {
     let host = std::env::var("ZDB_HOST").ok()?;
     let user = std::env::var("ZDB_USER").unwrap_or_else(|_| "postgres".into());
     let dbname = std::env::var("ZDB_DB").unwrap_or_else(|_| user.clone());
-    let mut cfg = ConnectionConfig::new("dev", host, dbname, user);
+    let name = std::env::var("ZDB_NAME").unwrap_or_else(|_| "dev".into());
+    let mut cfg = ConnectionConfig::new(name, host, dbname, user);
     cfg.password = std::env::var("ZDB_PASSWORD").ok();
     if let Ok(p) = std::env::var("ZDB_PORT") {
         if let Ok(p) = p.parse() {

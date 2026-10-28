@@ -231,8 +231,7 @@ impl Workspace {
         };
         tab.needs_load = false;
         let id = tab.id;
-        let sql = self.table_query(id, cx);
-        self.run_new_query(id, sql, cx);
+        self.apply_where(id, cx);
     }
 }
 

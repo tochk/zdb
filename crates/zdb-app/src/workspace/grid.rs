@@ -562,6 +562,10 @@ pub(crate) struct Tab {
     /// Table tabs: rows under the current WHERE, once "last page" has counted
     /// them (forgotten when the boxes are applied again).
     pub(crate) total_rows: Option<usize>,
+    /// Table tabs: the relation's primary-key columns — the order rows come in
+    /// while the ORDER BY box is empty (none for a view). `None` until looked
+    /// up, before the tab's first query.
+    pub(crate) table_pk: Option<Vec<String>>,
     pub(crate) table: Entity<TableState<ResultDelegate>>,
     /// The grid's focus handle (a clone of the `TableState`'s). Kept here because
     /// `render_td` runs while that entity is being rendered and can't read it.
@@ -617,6 +621,12 @@ pub(crate) struct Tab {
 
     /// When set, an EXPLAIN plan to show in its own text view instead of the grid.
     pub(crate) plan: Option<String>,
+    /// Whether `plan` came from EXPLAIN ANALYZE (its toolbar button is lit, and
+    /// a second click on it closes the plan).
+    pub(crate) plan_analyze: bool,
+    /// Query / Scratch tabs: the share of the pane under the toolbar that the
+    /// editor gets; the results take the rest (dragged by the handle between).
+    pub(crate) editor_split: f32,
 
     /// The statement last run from the editor, and its byte offset in the
     /// editor text: where a failure's error position goes back as a mark.
@@ -624,6 +634,9 @@ pub(crate) struct Tab {
     /// Table tabs: the box the last failed run's error points into.
     pub(crate) clause_error: Option<Clause>,
 }
+
+/// A new Query / Scratch tab's editor share of the pane: half, results below.
+pub(crate) const EDITOR_SPLIT: f32 = 0.5;
 
 /// The loader over a tab's results while it runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -758,6 +771,7 @@ impl Tab {
             page: 0,
             first_row: 0,
             total_rows: None,
+            table_pk: None,
             table,
             grid_focus,
             headers: Vec::new(),
@@ -783,6 +797,8 @@ impl Tab {
             in_transaction: false,
             needs_load: false,
             plan: None,
+            plan_analyze: false,
+            editor_split: EDITOR_SPLIT,
             editor_run: None,
             clause_error: None,
         }
@@ -905,7 +921,7 @@ impl Tab {
             window,
             cx,
         );
-        let order_input = clause_input("order", "ORDER BY", "e.g. created_at DESC", window, cx);
+        let order_input = clause_input("order", "ORDER BY", "default: primary key", window, cx);
         let limit_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("none")

@@ -101,3 +101,36 @@ async fn introspect_schema_relations_columns() {
 
     exec(&db, conn, "DROP SCHEMA zdb_introspect CASCADE").await;
 }
+
+/// Primary-key columns come back in KEY order (not table order); a relation
+/// without one (a view) has none.
+#[tokio::test]
+async fn primary_key_columns_in_key_order() {
+    let Some(cfg) = test_config() else {
+        eprintln!("skipping: ZDB_TEST_* not set");
+        return;
+    };
+    let db = DbHandle::spawn();
+    let conn = db.connect(cfg).await.expect("connect");
+    exec(&db, conn, "DROP SCHEMA IF EXISTS zdb_pk CASCADE").await;
+    exec(&db, conn, "CREATE SCHEMA zdb_pk").await;
+    exec(
+        &db,
+        conn,
+        "CREATE TABLE zdb_pk.pair (a int, b text, c int, PRIMARY KEY (c, a))",
+    )
+    .await;
+    exec(
+        &db,
+        conn,
+        "CREATE VIEW zdb_pk.pair_v AS SELECT * FROM zdb_pk.pair",
+    )
+    .await;
+
+    let pk = db.primary_key(conn, "zdb_pk", "pair").await.expect("pk");
+    assert_eq!(pk, ["c", "a"]);
+    let none = db.primary_key(conn, "zdb_pk", "pair_v").await.expect("pk");
+    assert!(none.is_empty());
+
+    exec(&db, conn, "DROP SCHEMA zdb_pk CASCADE").await;
+}
