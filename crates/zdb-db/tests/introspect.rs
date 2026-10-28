@@ -63,10 +63,16 @@ async fn introspect_schema_relations_columns() {
     );
 
     // Relations
-    let rels = db.relations(conn, "zdb_introspect").await.expect("relations");
+    let rels = db
+        .relations(conn, "zdb_introspect")
+        .await
+        .expect("relations");
     let table = rels.iter().find(|r| r.name == "widget").expect("widget");
     assert_eq!(table.kind, RelationKind::Table);
-    let view = rels.iter().find(|r| r.name == "widget_v").expect("widget_v");
+    let view = rels
+        .iter()
+        .find(|r| r.name == "widget_v")
+        .expect("widget_v");
     assert_eq!(view.kind, RelationKind::View);
 
     // Columns

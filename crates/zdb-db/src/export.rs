@@ -175,10 +175,7 @@ mod tests {
     fn csv_quotes_and_nulls() {
         let (h, r) = sample();
         let csv = to_csv(&h, &r);
-        assert_eq!(
-            csv,
-            "id,name\r\n1,\"a,b\"\r\n2,\r\n3,o'brien\r\n"
-        );
+        assert_eq!(csv, "id,name\r\n1,\"a,b\"\r\n2,\r\n3,o'brien\r\n");
     }
 
     #[test]

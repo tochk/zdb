@@ -175,7 +175,10 @@ mod tests {
         assert_eq!(axis_speed(-DEAD_ZONE), 0.0);
         // Past the dead zone, speed grows with distance and keeps the sign.
         assert!(axis_speed(DEAD_ZONE + 10.0) > 0.0);
-        assert_eq!(axis_speed(-(DEAD_ZONE + 10.0)), -axis_speed(DEAD_ZONE + 10.0));
+        assert_eq!(
+            axis_speed(-(DEAD_ZONE + 10.0)),
+            -axis_speed(DEAD_ZONE + 10.0)
+        );
         assert!(axis_speed(DEAD_ZONE + 100.0) > axis_speed(DEAD_ZONE + 10.0));
         // And is capped.
         assert_eq!(axis_speed(100_000.0), MAX_SPEED);

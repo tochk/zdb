@@ -12,8 +12,8 @@ use gpui::ClipboardItem;
 use gpui::{
     actions, div, prelude::FluentBuilder as _, px, rgba, App, AppContext, ClickEvent, Context,
     Entity, Focusable, FontWeight, Hsla, InteractiveElement, IntoElement, ParentElement, Render,
-    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Window, WindowBounds,
-    WindowControlArea,
+    ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, Window,
+    WindowBounds, WindowControlArea,
 };
 use gpui_component::{
     button::{Button, ButtonVariants},
@@ -28,8 +28,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use zdb_config::{ConnectionEntry, Settings};
 use zdb_db::{
-    CellValue, ConnId, ConnSetup, ConnectionConfig, DbHandle, EditTarget, ExportFormat,
-    QueryEvent, RelationDetail, RelationKind, RowEdit, SchemaObjects,
+    CellValue, ConnId, ConnSetup, ConnectionConfig, DbHandle, EditTarget, ExportFormat, QueryEvent,
+    RelationDetail, RelationKind, RowEdit, SchemaObjects,
 };
 
 mod autoscroll;

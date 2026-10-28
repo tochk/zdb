@@ -53,7 +53,11 @@ impl ConnForm {
             port: input(window, cx, "port", "5432"),
             user: input(window, cx, "user", ""),
             db: input(window, cx, "database", ""),
-            password: cx.new(|cx| InputState::new(window, cx).placeholder("password").masked(true)),
+            password: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("password")
+                    .masked(true)
+            }),
             ssl: input(
                 window,
                 cx,
@@ -216,7 +220,12 @@ impl Workspace {
     }
 
     /// The list's edit button: the form, loaded with saved connection `idx`.
-    pub(super) fn show_edit_form(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn show_edit_form(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(entry) = self.settings.connections.get(idx).cloned() else {
             return;
         };
@@ -295,8 +304,17 @@ impl Workspace {
         };
         let editing = self.form.editing.clone();
         if let Some(id) = &editing {
-            if self.settings.connections.iter().any(|c| c.name == name && &c.id != id) {
-                return fail(self, format!("A connection named \"{name}\" already exists"), cx);
+            if self
+                .settings
+                .connections
+                .iter()
+                .any(|c| c.name == name && &c.id != id)
+            {
+                return fail(
+                    self,
+                    format!("A connection named \"{name}\" already exists"),
+                    cx,
+                );
             }
         }
         self.form.error = None;
@@ -316,7 +334,11 @@ impl Workspace {
         let pw = (!password.is_empty()).then_some(password);
 
         let Some(old) = editing.and_then(|id| {
-            self.settings.connections.iter().find(|c| c.id == id).cloned()
+            self.settings
+                .connections
+                .iter()
+                .find(|c| c.id == id)
+                .cloned()
         }) else {
             // Adding.
             self.store_entry(None, &entry, pw.clone(), cx);
@@ -326,16 +348,27 @@ impl Workspace {
             return;
         };
 
-        let live = self.conn.filter(|_| self.conn_key.as_deref() == Some(old.id.as_str()));
+        let live = self
+            .conn
+            .filter(|_| self.conn_key.as_deref() == Some(old.id.as_str()));
         let target = |e: &ConnectionEntry| {
-            (e.host.clone(), e.port, e.dbname.clone(), e.user.clone(), e.ssl_mode.clone())
+            (
+                e.host.clone(),
+                e.port,
+                e.dbname.clone(),
+                e.user.clone(),
+                e.ssl_mode.clone(),
+            )
         };
         let moved = target(&old) != target(&entry) || pw.is_some();
         let new_setup = old.params != entry.params || old.init_sql != entry.init_sql;
         match live {
             Some(_) if moved => {
                 let renamed = self.store_entry(Some(&old.name), &entry, pw.clone(), cx);
-                let mut cfg = entry_config(&entry, pw.or_else(|| self.passwords.get(&entry.name).cloned()));
+                let mut cfg = entry_config(
+                    &entry,
+                    pw.or_else(|| self.passwords.get(&entry.name).cloned()),
+                );
                 cfg.setup = setup;
                 let key = Some(entry.id.clone());
                 match renamed.filter(|_| cfg.password.is_none()) {
@@ -344,7 +377,8 @@ impl Workspace {
                     Some(moving) => {
                         cx.spawn(async move |this, cx| {
                             cfg.password = moving.await;
-                            let _ = this.update(cx, |this, cx| this.switch_connection(cfg, key, cx));
+                            let _ =
+                                this.update(cx, |this, cx| this.switch_connection(cfg, key, cx));
                         })
                         .detach();
                     }
@@ -363,8 +397,10 @@ impl Workspace {
                         match res {
                             Ok(()) => {
                                 this.finish_edit(&old.name, &entry, pw, Some(applied), cx);
-                                this.status =
-                                    format!("Saved {}; its connections now use the new setup", entry.name);
+                                this.status = format!(
+                                    "Saved {}; its connections now use the new setup",
+                                    entry.name
+                                );
                             }
                             Err(e) => this.form.error = Some(e.to_string()),
                         }
@@ -413,7 +449,12 @@ impl Workspace {
         pw: Option<String>,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Task<Option<String>>> {
-        match self.settings.connections.iter_mut().find(|c| c.id == entry.id) {
+        match self
+            .settings
+            .connections
+            .iter_mut()
+            .find(|c| c.id == entry.id)
+        {
             Some(slot) => *slot = entry.clone(),
             None => {
                 self.settings.connections.retain(|c| c.name != entry.name);
@@ -549,7 +590,11 @@ mod tests {
                 entry.params = vec!["connect_timeout=soon".into()];
                 ws.settings.connections.push(entry);
                 ws.connect_saved(0, cx);
-                assert!(ws.status.contains("a: parameters, line 1"), "status: {}", ws.status);
+                assert!(
+                    ws.status.contains("a: parameters, line 1"),
+                    "status: {}",
+                    ws.status
+                );
                 assert!(ws.cfg.is_none());
             })
             .unwrap();
@@ -581,7 +626,12 @@ mod tests {
                 assert!(ws.form.error.as_deref().unwrap().contains("already exists"));
 
                 type_into(&ws.form.name, "a2", window, cx);
-                type_into(&ws.form.params, "application_name=x\n\nwork_mem=64MB", window, cx);
+                type_into(
+                    &ws.form.params,
+                    "application_name=x\n\nwork_mem=64MB",
+                    window,
+                    cx,
+                );
                 type_into(&ws.form.init_sql, " SET lock_timeout = '5s' ", window, cx);
                 ws.save_connection(cx);
                 assert_eq!(ws.form.error, None);

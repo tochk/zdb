@@ -919,7 +919,10 @@ mod tests {
                 ws.ask_cancel(id, cx);
                 ws.confirm_cancel(id, cx);
                 assert!(!ws.modal_open());
-                assert!(ws.settings.confirm_query_cancel, "box not ticked: still asks");
+                assert!(
+                    ws.settings.confirm_query_cancel,
+                    "box not ticked: still asks"
+                );
                 // Stopped: no loader, and the grid answers again.
                 assert_eq!(ws.tab(id).unwrap().loader(), None);
                 ws.grid_motion(Motion::Down, cx);

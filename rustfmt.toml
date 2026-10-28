@@ -1,0 +1,4 @@
+# Formatting for every crate: `cargo fmt --all` (`make fmt`). CI fails on any
+# unformatted file (`cargo fmt --all --check`, the `fmt` job in build.yml).
+edition = "2021"
+newline_style = "Unix"

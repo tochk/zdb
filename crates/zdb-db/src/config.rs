@@ -125,8 +125,13 @@ impl ConnSetup {
             if PER_CONNECTION_KEYS.contains(&key.as_str()) {
                 return Err(err(format!("`{key}` is set on each connection")));
             }
-            apply_param(&mut tokio_postgres::Config::new(), &mut Vec::new(), &key, value)
-                .map_err(err)?;
+            apply_param(
+                &mut tokio_postgres::Config::new(),
+                &mut Vec::new(),
+                &key,
+                value,
+            )
+            .map_err(err)?;
             out.push((key, value.to_string()));
         }
         Ok(Self {
@@ -347,7 +352,9 @@ mod tests {
             Some("-c geqo=off -c search_path=a\\ b\\\\c")
         );
         // Without a setup: the built-in defaults, no options.
-        let plain = ConnectionConfig::new("n", "h", "db", "u").to_pg_config().unwrap();
+        let plain = ConnectionConfig::new("n", "h", "db", "u")
+            .to_pg_config()
+            .unwrap();
         assert_eq!(plain.get_application_name(), Some("zdb"));
         assert_eq!(plain.get_options(), None);
     }

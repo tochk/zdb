@@ -68,10 +68,7 @@ pub enum QueryEvent {
     Rows(Vec<Row>),
     /// A statement finished. `affected` is the row count reported by
     /// `CommandComplete` (rows returned for SELECT, rows changed for DML).
-    Done {
-        affected: u64,
-        elapsed: Duration,
-    },
+    Done { affected: u64, elapsed: Duration },
     /// Execution failed; no results follow.
     Failed(DbError),
     /// Sent last: whether the query's session is now inside a transaction

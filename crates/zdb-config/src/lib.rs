@@ -133,8 +133,7 @@ impl Settings {
     /// Path to the settings file (`<config dir>/zdb/settings.json`), if the OS
     /// exposes a config directory.
     pub fn path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "", "zdb")
-            .map(|d| d.config_dir().join("settings.json"))
+        directories::ProjectDirs::from("", "", "zdb").map(|d| d.config_dir().join("settings.json"))
     }
 
     /// Load settings from the default path, returning defaults if the file is
@@ -168,10 +167,10 @@ impl Settings {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
-        let settings = serde_json::from_str(&text)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        let settings =
+            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         Ok(settings)
     }
 
@@ -183,8 +182,7 @@ impl Settings {
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         }
         let text = serde_json::to_string_pretty(self)?;
         std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;

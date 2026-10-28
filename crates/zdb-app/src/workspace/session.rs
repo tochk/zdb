@@ -252,7 +252,12 @@ mod tests {
 
     /// Open a Query tab, a filtered Table tab and the scratch tab under `key`,
     /// with the Table tab active.
-    fn seed_session(ws: &mut Workspace, key: &str, window: &mut Window, cx: &mut Context<Workspace>) {
+    fn seed_session(
+        ws: &mut Workspace,
+        key: &str,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         ws.conn_key = Some(key.into());
         ws.session_ready = true;
         ws.open_query_tab(window, cx);

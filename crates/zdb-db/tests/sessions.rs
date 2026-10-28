@@ -338,7 +338,10 @@ async fn setup_applies_to_every_connection() {
     assert!(err.to_string().contains("connection setup SQL"), "{err}");
     let bad = ConnSetup::parse("zdb_no_such_param=1", "").unwrap();
     assert!(db.set_setup(conn, bad).await.is_err());
-    assert_eq!(settings(run(&db, a, SHOW).await.unwrap()).0, "zdb-setup 12MB 7s");
+    assert_eq!(
+        settings(run(&db, a, SHOW).await.unwrap()).0,
+        "zdb-setup 12MB 7s"
+    );
 
     // …a working one replaces it on every connection.
     let good = ConnSetup::parse("", "SET lock_timeout = '3s'").unwrap();
@@ -346,7 +349,10 @@ async fn setup_applies_to_every_connection() {
     // (work_mem back at the server's default, whatever that is here.)
     let (ra, rb) = tokio::join!(run(&db, a, SHOW), run(&db, b, SHOW));
     for (s, _) in [settings(ra.unwrap()), settings(rb.unwrap())] {
-        assert!(s.starts_with("zdb ") && s.ends_with(" 3s") && !s.contains("12MB"), "{s}");
+        assert!(
+            s.starts_with("zdb ") && s.ends_with(" 3s") && !s.contains("12MB"),
+            "{s}"
+        );
     }
 
     // Connecting with init SQL that fails fails the connect.

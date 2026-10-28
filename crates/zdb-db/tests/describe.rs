@@ -33,12 +33,20 @@ async fn describe_editability() {
 
     exec(&db, conn, "DROP SCHEMA IF EXISTS zdb_desc CASCADE").await;
     exec(&db, conn, "CREATE SCHEMA zdb_desc").await;
-    exec(&db, conn, "CREATE TABLE zdb_desc.widget (id int PRIMARY KEY, name text, qty int)").await;
+    exec(
+        &db,
+        conn,
+        "CREATE TABLE zdb_desc.widget (id int PRIMARY KEY, name text, qty int)",
+    )
+    .await;
     exec(&db, conn, "CREATE TABLE zdb_desc.nopk (a int, b text)").await;
 
     // Single table, PK present and aliased columns map to real names.
     let d = db
-        .describe(conn, "SELECT id, name AS label FROM zdb_desc.widget WHERE qty > 0")
+        .describe(
+            conn,
+            "SELECT id, name AS label FROM zdb_desc.widget WHERE qty > 0",
+        )
         .await
         .expect("describe ok")
         .expect("editable");

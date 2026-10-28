@@ -21,7 +21,7 @@ WIN_ARM_ENV = \
 	AR_aarch64_pc_windows_gnullvm=llvm-ar \
 	CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_LINKER=aarch64-w64-mingw32-clang
 
-.PHONY: all build run test clippy fmt sqls dev-sqls \
+.PHONY: all build run test clippy fmt fmt-check sqls dev-sqls \
         windows windows-x64 package-windows deploy-windows-test \
         macos macos-arm macos-x64 package-macos clean help
 
@@ -41,8 +41,11 @@ test: ## Run all tests
 clippy: ## Lint
 	$(CARGO) clippy -p zdb-app -p zdb-db
 
-fmt: ## Format
-	$(CARGO) fmt
+fmt: ## Format every crate (rustfmt.toml)
+	$(CARGO) fmt --all
+
+fmt-check: ## Fail on unformatted code (what CI runs)
+	$(CARGO) fmt --all --check
 
 ## --- sqls language server (Go, all arches) --------------------------------
 

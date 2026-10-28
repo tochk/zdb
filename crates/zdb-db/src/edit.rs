@@ -65,7 +65,10 @@ impl RowEdit {
                     .map(|(c, v)| format!("{} = {}", quote_ident(c), quote_literal(v)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                Ok(format!("UPDATE {tbl} SET {assignments} WHERE {}", pk_where(pk)))
+                Ok(format!(
+                    "UPDATE {tbl} SET {assignments} WHERE {}",
+                    pk_where(pk)
+                ))
             }
             RowEdit::Insert { values } => {
                 if values.is_empty() {
@@ -153,7 +156,10 @@ mod tests {
     fn update_sql() {
         let e = RowEdit::Update {
             pk: vec![("id".into(), text("5"))],
-            set: vec![("name".into(), text("o'brien")), ("note".into(), CellValue::Null)],
+            set: vec![
+                ("name".into(), text("o'brien")),
+                ("note".into(), CellValue::Null),
+            ],
         };
         assert_eq!(
             e.to_sql(&target()).unwrap(),
@@ -202,8 +208,12 @@ mod tests {
     #[test]
     fn batch_wraps_in_transaction() {
         let edits = vec![
-            RowEdit::Insert { values: vec![("id".into(), text("1"))] },
-            RowEdit::Delete { pk: vec![("id".into(), text("2"))] },
+            RowEdit::Insert {
+                values: vec![("id".into(), text("1"))],
+            },
+            RowEdit::Delete {
+                pk: vec![("id".into(), text("2"))],
+            },
         ];
         let batch = build_batch(&target(), &edits).unwrap().unwrap();
         assert!(batch.starts_with("BEGIN;\n"));

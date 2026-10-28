@@ -20,6 +20,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Formatting gate: `cargo fmt --all` (config in rustfmt.toml) must leave the
+  # tree unchanged. Run `make fmt` before pushing.
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
   # macOS regression guard: the app hung on selecting a saved connection because
   # the keychain read ran on the UI thread (blocking gpui's render loop). Run the
   # test suite on macOS, where that bug manifested.

@@ -516,27 +516,27 @@ impl Workspace {
         let shown = if let Some(plan) = &tab.plan {
             Self::plan_view(tab_id, plan, c, cx).into_any_element()
         } else {
-                div()
-                    .size_full()
-                    .min_w(px(0.))
-                    .overflow_hidden()
-                    .key_context(grid_context)
-                    // Type-to-edit: keys no binding claimed.
-                    .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
-                        this.grid_key_down(tab_id, ev, window, cx)
-                    }))
-                    // Wheel press = autoscroll (see `autoscroll.rs`). Stopping
-                    // propagation keeps the workspace root's "any click exits"
-                    // handler from undoing the press that just started it.
-                    .on_mouse_down(
-                        MouseButton::Middle,
-                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                            this.toggle_autoscroll(tab_id, ev.position, cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .child(Table::new(&tab.table).stripe(true).bordered(true))
-                    .into_any_element()
+            div()
+                .size_full()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .key_context(grid_context)
+                // Type-to-edit: keys no binding claimed.
+                .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
+                    this.grid_key_down(tab_id, ev, window, cx)
+                }))
+                // Wheel press = autoscroll (see `autoscroll.rs`). Stopping
+                // propagation keeps the workspace root's "any click exits"
+                // handler from undoing the press that just started it.
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.toggle_autoscroll(tab_id, ev.position, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .child(Table::new(&tab.table).stripe(true).bordered(true))
+                .into_any_element()
         };
         let loader = tab.loader();
         results = results.child(
@@ -611,53 +611,55 @@ impl Workspace {
     /// "Cancel the running query?" — asked by a click on a tab's loader.
     fn render_confirm_cancel(&self, tab_id: u64, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
-        let title = self.tab(tab_id).map(|t| t.title.clone()).unwrap_or_default();
-        let body = v_flex()
-            .p_4()
-            .gap_3()
-            .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(c.fg)
-                    .child("Cancel the running query?"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(c.fg_dim)
-                    .child(format!("“{title}” is still waiting for the database.")),
-            )
-            .child(
-                h_flex()
-                    .pt_1()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div().flex_1().child(
-                            Checkbox::new("cancel-dont-ask")
-                                .label("Don't ask again")
-                                .checked(self.cancel_dont_ask)
-                                .on_click(cx.listener(|this, on: &bool, _, cx| {
-                                    this.cancel_dont_ask = *on;
-                                    cx.notify();
+        let title = self
+            .tab(tab_id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        let body =
+            v_flex()
+                .p_4()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(c.fg)
+                        .child("Cancel the running query?"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .child(format!("“{title}” is still waiting for the database.")),
+                )
+                .child(
+                    h_flex()
+                        .pt_1()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div().flex_1().child(
+                                Checkbox::new("cancel-dont-ask")
+                                    .label("Don't ask again")
+                                    .checked(self.cancel_dont_ask)
+                                    .on_click(cx.listener(|this, on: &bool, _, cx| {
+                                        this.cancel_dont_ask = *on;
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                        .child(Button::new("keep-running").label("Keep running").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx)),
+                        ))
+                        .child(
+                            Button::new("confirm-cancel")
+                                .label("Cancel query")
+                                .danger()
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.confirm_cancel(tab_id, cx)
                                 })),
                         ),
-                    )
-                    .child(
-                        Button::new("keep-running")
-                            .label("Keep running")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx))),
-                    )
-                    .child(
-                        Button::new("confirm-cancel")
-                            .label("Cancel query")
-                            .danger()
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.confirm_cancel(tab_id, cx)
-                            })),
-                    ),
-            );
+                );
         self.modal_layer(v_flex().mt(px(120.)).w(px(460.)).child(body), cx)
     }
 
@@ -998,7 +1000,9 @@ impl Workspace {
     /// toggled on in the status bar, or staged edits wait for review (that
     /// pane holds their Apply / Cancel, so it never hides).
     fn bottom_visible(&self) -> bool {
-        self.settings.show_query_log || self.settings.show_messages || self.pending_review().is_some()
+        self.settings.show_query_log
+            || self.settings.show_messages
+            || self.pending_review().is_some()
     }
 
     fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1227,7 +1231,11 @@ impl Workspace {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_conn_form(cx)));
             v_flex()
                 .child(section_header(
-                    if editing { "EDIT CONNECTION" } else { "ADD CONNECTION" },
+                    if editing {
+                        "EDIT CONNECTION"
+                    } else {
+                        "ADD CONNECTION"
+                    },
                     c,
                 ))
                 .child(
@@ -1313,7 +1321,9 @@ impl Workspace {
                                         .child(
                                             div().text_sm().text_color(c.fg).child(e.name.clone()),
                                         )
-                                        .child(div().text_xs().text_color(c.fg_dim).child(subtitle)),
+                                        .child(
+                                            div().text_xs().text_color(c.fg_dim).child(subtitle),
+                                        ),
                                 )
                                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                     this.connect_saved(i, cx)
@@ -1395,81 +1405,80 @@ impl Workspace {
             .unwrap_or_else(|| "(unavailable)".into());
 
         // Taller than a small window: it scrolls instead of running off it.
-        let body =
-            v_flex()
-                .id("settings-body")
-                .max_h(window.viewport_size().height - modal::TITLEBAR_H - px(52.))
-                .overflow_y_scroll()
-                .child(section_header("SETTINGS", c))
-                .child(setting_row(
-                    "Theme",
-                    h_flex()
-                        .gap_1()
-                        .child(theme_btn("Light", zdb_config::Theme::Light))
-                        .child(theme_btn("Dark", zdb_config::Theme::Dark))
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Esc saves cell edit",
-                    Checkbox::new("esc-saves")
-                        .checked(self.settings.esc_saves_edit)
-                        .on_click(cx.listener(|this, on: &bool, _, cx| this.set_esc_saves(*on, cx)))
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Vim navigation (hjkl, gg / G, 0 / $, i, y)",
-                    Checkbox::new("vim-nav")
-                        .checked(self.settings.vim_navigation)
-                        .on_click(
-                            cx.listener(|this, on: &bool, _, cx| this.set_vim_navigation(*on, cx)),
-                        )
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Restore tabs per connection",
-                    Checkbox::new("restore-tabs")
-                        .checked(self.settings.restore_tabs)
-                        .on_click(
-                            cx.listener(|this, on: &bool, _, cx| this.set_restore_tabs(*on, cx)),
-                        )
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Ask before cancelling a query (click on its loader)",
-                    Checkbox::new("confirm-cancel")
-                        .checked(self.settings.confirm_query_cancel)
-                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+        let body = v_flex()
+            .id("settings-body")
+            .max_h(window.viewport_size().height - modal::TITLEBAR_H - px(52.))
+            .overflow_y_scroll()
+            .child(section_header("SETTINGS", c))
+            .child(setting_row(
+                "Theme",
+                h_flex()
+                    .gap_1()
+                    .child(theme_btn("Light", zdb_config::Theme::Light))
+                    .child(theme_btn("Dark", zdb_config::Theme::Dark))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Esc saves cell edit",
+                Checkbox::new("esc-saves")
+                    .checked(self.settings.esc_saves_edit)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| this.set_esc_saves(*on, cx)))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Vim navigation (hjkl, gg / G, 0 / $, i, y)",
+                Checkbox::new("vim-nav")
+                    .checked(self.settings.vim_navigation)
+                    .on_click(
+                        cx.listener(|this, on: &bool, _, cx| this.set_vim_navigation(*on, cx)),
+                    )
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Restore tabs per connection",
+                Checkbox::new("restore-tabs")
+                    .checked(self.settings.restore_tabs)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| this.set_restore_tabs(*on, cx)))
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Ask before cancelling a query (click on its loader)",
+                Checkbox::new("confirm-cancel")
+                    .checked(self.settings.confirm_query_cancel)
+                    .on_click(
+                        cx.listener(|this, on: &bool, _, cx| {
                             this.set_confirm_query_cancel(*on, cx)
-                        }))
-                        .into_any_element(),
-                ))
-                .child(setting_row(
-                    "Connections per database",
-                    self.render_pool_size(c, cx).into_any_element(),
-                ))
-                .child(setting_row(
-                    "Keyboard shortcuts",
-                    Button::new("show-shortcuts")
-                        .label("Show (F1)")
-                        .on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_shortcuts(cx)),
-                        )
-                        .into_any_element(),
-                ))
-                .child(section_header("CONFIG FILE", c))
-                .child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .text_xs()
-                        .text_color(c.fg_dim)
-                        .child(path),
-                )
-                .child(h_flex().p_2().gap_2().justify_end().child(
+                        }),
+                    )
+                    .into_any_element(),
+            ))
+            .child(setting_row(
+                "Connections per database",
+                self.render_pool_size(c, cx).into_any_element(),
+            ))
+            .child(setting_row(
+                "Keyboard shortcuts",
+                Button::new("show-shortcuts")
+                    .label("Show (F1)")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_shortcuts(cx)))
+                    .into_any_element(),
+            ))
+            .child(section_header("CONFIG FILE", c))
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(path),
+            )
+            .child(
+                h_flex().p_2().gap_2().justify_end().child(
                     Button::new("close-settings").label("Close").on_click(
                         cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_settings(cx)),
                     ),
-                ));
+                ),
+            );
 
         self.modal_layer(v_flex().mt(px(26.)).w(px(520.)).child(body), cx)
     }
@@ -1483,12 +1492,19 @@ impl Workspace {
                 .small()
                 .icon(Icon::empty().path(icon))
                 .disabled(!on)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pool_size(to, cx)))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.set_pool_size(to, cx)),
+                )
         };
         h_flex()
             .gap_1()
             .items_center()
-            .child(step("pool-less", "icons/minus.svg", n.saturating_sub(1), n > 1))
+            .child(step(
+                "pool-less",
+                "icons/minus.svg",
+                n.saturating_sub(1),
+                n > 1,
+            ))
             .child(
                 div()
                     .w(px(28.))
@@ -1780,17 +1796,19 @@ impl Workspace {
         #[cfg(target_os = "windows")]
         let btn = btn.window_control_area(area);
         #[cfg(not(target_os = "windows"))]
-        let btn = btn.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| match id {
-            "win-min" => window.minimize_window(),
-            "win-max" => window.zoom_window(),
-            _ => {
-                // `remove_window` bypasses the OS close path, so the hook in
-                // `Workspace::new` never runs — save geometry and tabs here.
-                super::save_window_geometry(window);
-                this.flush_session(cx);
-                window.remove_window()
-            }
-        }));
+        let btn = btn.on_click(
+            cx.listener(move |this, _: &ClickEvent, window, cx| match id {
+                "win-min" => window.minimize_window(),
+                "win-max" => window.zoom_window(),
+                _ => {
+                    // `remove_window` bypasses the OS close path, so the hook in
+                    // `Workspace::new` never runs — save geometry and tabs here.
+                    super::save_window_geometry(window);
+                    this.flush_session(cx);
+                    window.remove_window()
+                }
+            }),
+        );
 
         btn
     }
