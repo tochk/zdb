@@ -106,9 +106,12 @@ jobs:
       SHA: ${{ needs.prepare.outputs.sha }}
       GH_TOKEN: ${{ github.token }}
     steps:
+      # Full history: from a shallow clone git can't see that the bump commit
+      # descends from master's tip, and refuses the push ("fetch first").
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v8
         with:
