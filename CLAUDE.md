@@ -95,9 +95,11 @@ Target is **Windows on ARM64** (the dev box is WSL2 aarch64; the host is ARM64).
   on the user's machine. (We used to work around this with a vendored/patched
   gpui + `debug-assertions = true` + a bundled `shaders/` folder; that whole
   path was removed — see BUILDING-WINDOWS.md.)
-- Manifest: `crates/zdb-app/build.rs` (embed-resource) compiles `resources/zdb.rc`
-  embedding `zdb.manifest` (Common-Controls v6 → fixes `TaskDialogIndirect`) and
-  `zdb.ico` (app icon). GUI subsystem via `#![cfg_attr(target_os="windows", ...)]`.
+- Resources: `crates/zdb-app/build.rs` (embed-resource) GENERATES `zdb.rc` into
+  `OUT_DIR` (absolute forward-slash paths to `resources/`): `zdb.ico` (app icon) +
+  a `VERSIONINFO` block from the build info (Explorer → Properties → Details), and
+  `zdb.manifest` (Common-Controls v6 → fixes `TaskDialogIndirect`) ONLY when
+  cross-compiling — a native build gets gpui's manifest and a second one collides. GUI subsystem via `#![cfg_attr(target_os="windows", ...)]`.
   MSVC's `link.exe` also auto-embeds a default manifest which collides with ours
   → `/MANIFEST:NO` in `.cargo/config.toml` for the msvc targets.
 - CI's Package step drops `zdb.exe` + `sqls.exe` into the artifact; no extra
@@ -129,6 +131,40 @@ That was the whole "it starts a terminal first / has no icon" symptom.
   layout, so the inner `ditto` zip is required, not cosmetic.
 - Distributing it: ad-hoc signing ≠ notarized, so a downloaded copy needs
   `xattr -dr com.apple.quarantine /Applications/zdb.app` once (documented in README).
+
+## Releases + build info
+
+- **Releasing** = `.github/workflows/release.yml`, manual (`workflow_dispatch`) with
+  `version` (`0.6.0`, no `v`; a `-rc.1` suffix → pre-release) + `notes` (markdown). The
+  web form's text box is ONE line, so multi-line notes go via the CLI:
+  `gh workflow run release.yml -f version=0.6.0 -f notes="$(cat notes.md)"`.
+  Flow: `prepare` bumps `[workspace.package] version` + `cargo update --workspace`
+  (rewrites only the member entries of Cargo.lock — libc stays pinned), commits
+  "Release vX" as github-actions[bot] onto a temp `release/vX` branch → `build.yml`
+  runs as a reusable workflow (`workflow_call`, inputs `ref` + `version`) on that
+  commit, incl. the fmt / macOS-test gates → `publish` fast-forwards master to it
+  (plain push: fails if master moved — re-run), and `gh release create vX --target
+  <sha>` makes the tag + release with one flat zip per target (exec bit restored on
+  Linux — artifacts drop it) → `cleanup` deletes the temp branch whatever happened.
+  Nothing hits master or gets tagged before every build passed. GITHUB_TOKEN pushes
+  don't trigger `build.yml`'s `on: push`, so no duplicate runs. A branch protection
+  rule on master would block the bump push.
+- `build.yml`'s concurrency group is `${{ github.workflow }}-${{ github.ref }}`:
+  under `workflow_call` that's the CALLER's name, so a push to master can't cancel a
+  release's builds.
+- **Build info** (`crates/zdb-app/build.rs` → `ZDB_BUILD_*` rustc envs →
+  `src/build_info.rs`): version = `$ZDB_VERSION` (the release passes it; the bump
+  commit isn't tagged yet when it builds) else `git describe --tags --dirty` else the
+  Cargo version; commit + dirty flag, commit date, build date (`SOURCE_DATE_EPOCH`
+  honored), target, profile, `rustc -V`. Shown in Settings → ABOUT (commit links to
+  GitHub via `CARGO_PKG_REPOSITORY`, Copy = the `--version` text) and by
+  `zdb --version`/`-V` (checked first thing in `main`; on Windows it
+  `AttachConsole`s the parent console — GUI-subsystem exe). build.rs reruns only when
+  git HEAD / the branch ref / tags / the index change, so "dirty" follows `git add`,
+  not unsaved edits. CI checks out with `fetch-depth: 0` for describe. A local clone
+  without the latest tag describes from an older one (`git fetch --tags`).
+- macOS `Info.plist` versions come from the root Cargo.toml (numeric part) in
+  `package-macos.sh`.
 
 ## Testing Windows builds HERE (WSL interop)
 

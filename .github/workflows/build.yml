@@ -8,15 +8,30 @@ name: build
 # Runner labels used:
 #   linux  x64   -> ubuntu-latest        arm64 -> ubuntu-24.04-arm
 #   windows x64  -> windows-latest        arm64 -> windows-11-arm
-#   macos  x64   -> macos-13 (Intel)      arm64 -> macos-14 (Apple Silicon)
+#   macos  arm64 -> macos-14 (Apple Silicon)
 # The arm64 Linux/Windows runners are GA; a private repo needs them enabled.
+#
+# release.yml calls this workflow (`workflow_call`) to build the commit it is
+# releasing, passing that commit and the version to stamp into the binaries.
 
 on:
   push:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build (default = the triggering ref)
+        type: string
+        default: ""
+      version:
+        description: Version baked into the binaries (default = git describe)
+        type: string
+        default: ""
 
+# `github.workflow` is the CALLER's name under workflow_call, so a release build
+# never shares a group with (and gets cancelled by) a push build of the same ref.
 concurrency:
-  group: build-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -27,6 +42,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -42,6 +59,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -66,7 +85,11 @@ jobs:
           - { name: macos-arm64,   os: macos-14,         goos: darwin,  goarch: arm64, sqls: sqls-darwin-arm64,     bin: zdb }
 
     steps:
+      # Full history + tags: build.rs names dev builds via `git describe`.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
 
       # gpui (blade/Vulkan) build + link deps on Linux. macOS/Windows ship theirs.
       - name: Linux deps
@@ -104,7 +127,7 @@ jobs:
         if: steps.sqls-cache.outputs.cache-hit != 'true'
         uses: actions/setup-go@v7
         with:
-          go-version: "1.25"
+          go-version: "1.27"
           cache: false # no go.sum in this repo; sqls is cloned by the script
 
       # Cross-builds sqls for all arches into dist/sqls/ (Go, fast). Uniform via
@@ -115,6 +138,8 @@ jobs:
         run: bash scripts/build-sqls.sh
 
       - name: Build zdb (release)
+        env:
+          ZDB_VERSION: ${{ inputs.version }}
         run: cargo build -p zdb-app --release
 
       - name: Package

@@ -1707,6 +1707,8 @@ impl Workspace {
                     .text_color(c.fg_dim)
                     .child(path),
             )
+            .child(section_header("ABOUT", c))
+            .child(self.render_about(c, cx))
             .child(
                 h_flex().p_2().gap_2().justify_end().child(
                     Button::new("close-settings").label("Close").on_click(
@@ -1716,6 +1718,58 @@ impl Workspace {
             );
 
         self.modal_layer(v_flex().mt(px(26.)).w(px(520.)).child(body), cx)
+    }
+
+    /// Version + build info (`crate::build_info`): one row per field, the
+    /// commit linking to GitHub, and Copy for bug reports.
+    fn render_about(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let link = cx.theme().blue;
+        let mut list = v_flex().px_3().py_2().gap_1().text_xs();
+        for (label, value) in crate::build_info::rows() {
+            let value = match (label, crate::build_info::commit_url()) {
+                ("Commit", Some(url)) => div()
+                    .id("about-commit")
+                    .text_color(link)
+                    .cursor_pointer()
+                    .hover(|s| s.underline())
+                    .child(value)
+                    .on_click(move |_, _, cx| cx.open_url(&url))
+                    .into_any_element(),
+                _ => div().text_color(c.fg).child(value).into_any_element(),
+            };
+            list = list.child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(80.))
+                            .flex_none()
+                            .text_color(c.fg_dim)
+                            .child(label),
+                    )
+                    .child(div().min_w(px(0.)).child(value)),
+            );
+        }
+        h_flex()
+            .items_start()
+            .border_b_1()
+            .border_color(c.border)
+            .child(div().flex_1().min_w(px(0.)).child(list))
+            .child(
+                div()
+                    .p_2()
+                    .child(
+                        Button::new("copy-build-info")
+                            .label("Copy")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    crate::build_info::summary(),
+                                ));
+                                this.status = "Build info copied".into();
+                                cx.notify();
+                            })),
+                    ),
+            )
     }
 
     /// `− N +` for the pool size. Tabs inside a transaction hold one more

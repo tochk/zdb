@@ -37,6 +37,12 @@ else
     cargo build -p zdb-app --release --target "$RUST_TARGET"
 fi
 
+# Bundle version = the workspace version (the release workflow bumps it before
+# building). Numeric part only: CFBundleVersion must be dot-separated integers.
+VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+VERSION="${VERSION%%[-+]*}"
+[ -n "$VERSION" ] || { echo "ERROR: no version in Cargo.toml"; exit 1; }
+
 APP="$ROOT/dist/zdb.app"
 MACOS="$APP/Contents/MacOS"
 RESOURCES="$APP/Contents/Resources"
@@ -66,8 +72,8 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>zdb</string>
   <key>CFBundleDisplayName</key><string>zdb</string>
   <key>CFBundleIdentifier</key><string>dev.zdb.app</string>
-  <key>CFBundleVersion</key><string>0.1.0</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>zdb</string>

@@ -4,6 +4,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod assets;
+mod build_info;
 mod lsp;
 mod terminal;
 mod workspace;
@@ -21,6 +22,14 @@ use workspace::{
 use zdb_db::{ConnectionConfig, DbHandle, SslMode};
 
 fn main() {
+    if std::env::args()
+        .skip(1)
+        .any(|a| a == "--version" || a == "-V")
+    {
+        build_info::print_version();
+        return;
+    }
+
     // WSLg ships a Wayland compositor whose protocol version gpui 0.2.2 rejects
     // (panics with `UnsupportedVersion`). WSLg also provides XWayland, and gpui's
     // X11 backend works there, so under WSL we drop WAYLAND_DISPLAY to force X11.
