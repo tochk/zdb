@@ -79,11 +79,14 @@ Windows and macOS (x64 and ARM64).
 
 ## Download
 
-Every push to the repository builds all platforms on GitHub Actions: open the latest
-[build run](https://github.com/tochk/zdb/actions/workflows/build.yml) and download the
-artifact for your system (`zdb-linux-x64`, `zdb-linux-arm64`, `zdb-windows-x64`,
-`zdb-windows-arm64`, `zdb-macos-arm64`). Each contains the app and `sqls` (keep them
-side by side — completion needs it).
+Grab the zip for your system from the latest
+[release](https://github.com/tochk/zdb/releases/latest) (`zdb-linux-x64`,
+`zdb-linux-arm64`, `zdb-windows-x64`, `zdb-windows-arm64`, `zdb-macos-arm64`). Each
+contains the app and `sqls` (keep them side by side — completion needs it). Builds of
+every push are also available as artifacts of the
+[build runs](https://github.com/tochk/zdb/actions/workflows/build.yml).
+
+Settings → About (or `zdb --version`) shows the version, commit, build dates and target.
 
 **macOS:** the artifact holds `zdb.app.zip`. The app is only ad-hoc signed, so clear the
 quarantine flag once after unzipping (otherwise Gatekeeper reports it as damaged):
