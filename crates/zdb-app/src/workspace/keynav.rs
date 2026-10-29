@@ -116,6 +116,10 @@ pub fn bind_nav_keys(cx: &mut App) {
         KeyBinding::new("tab", NoAction, Some("Terminal")),
         KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
         KeyBinding::new("escape", NoAction, Some("Terminal")),
+        // Paste: Ctrl+V itself is a shell key (PowerShell pastes on it itself).
+        KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
+        KeyBinding::new("cmd-shift-v", TerminalPaste, Some("Terminal")),
+        KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
         // Grid: the keys the Table widget binds itself. Its `escape` would
         // clear the row highlight out from under the cursor.
         KeyBinding::new("up", GridUp, TABLE),
@@ -203,6 +207,7 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
             ("Settings", "Ctrl+,"),
             ("Connections", "Ctrl+Shift+O"),
             ("Terminal", "Ctrl+`"),
+            ("Paste in the terminal", "Ctrl+Shift+V"),
             ("Close dialog / cancel", "Esc"),
         ],
     ),

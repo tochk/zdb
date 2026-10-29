@@ -50,7 +50,8 @@ crates/
                Child modules see Workspace's private fields (defined in the
                parent module) — methods moved out of mod.rs are `pub(super)`
                so siblings/tests can call them. No visibility bumps beyond that.
-               Also terminal.rs, main.rs (entry, WSL X11 guard, keybindings, theme).
+               Also terminal.rs (PTY + theme palette + shell resolution; see the
+               terminal notes), main.rs (entry, WSL X11 guard, keybindings, theme).
 ```
 
 The UI talks to the DB only through `DbHandle` channels; it never touches Tokio
@@ -498,7 +499,8 @@ The WSL host can run Windows exes directly:
   disabled while running.
 - **Status bar + collapsible bottom panels** (`view.rs::render_status_bar`, Zed-style): ghost
   icon toggles (`.selected` + a `theme.blue` icon while open) for QUERY LOG / MESSAGES, persisted as
-  `Settings.show_query_log` / `show_messages` (also in the palette). With Messages hidden the
+  `Settings.show_query_log` / `show_messages` (also in the palette), and TERMINAL (not
+  persisted — starting a shell at launch unasked would be a side effect). With Messages hidden the
   bar shows the latest status line. Hidden bottom = the `zdb-root` panel stays in the group with
   `.visible(false)` (its height survives the toggle) and the top panel's 1200px cap is lifted.
   The bar is pinned to `viewport_size().width` like the title bar.
@@ -780,6 +782,8 @@ The WSL host can run Windows exes directly:
     keystroke through to the terminal's `on_key_down`. `tab`/`shift-tab`/`escape` are
     bound to `NoAction` in the `"Terminal"` context (its wrapper div): `NoAction` masks
     every lower binding, so they reach the shell (completion, vi) instead of moving focus.
+    Paste = `TerminalPaste` on `"Terminal"` (Ctrl+Shift+V, Cmd+V / Cmd+Shift+V); plain
+    Ctrl+V stays a shell key (PSReadLine pastes on it itself).
   - **Dialogs own mouse + keyboard** (`modal.rs`): one `Modal` at a time (opening one
     replaces another); the backdrop `occlude()`s the panes (a press on it closes) and
     starts BELOW the title bar so the window stays movable/closable; the panel tracks a
@@ -793,6 +797,40 @@ The WSL host can run Windows exes directly:
   - Verifying: synthetic `xdotool key` DOES reach the app on WSL X11 once the window
     is activated + focused (`xdotool windowactivate/windowfocus`); the whole feature
     was checked that way with `import -window` screenshots.
+
+- **Embedded terminal** (`src/terminal.rs` + `mod.rs` `open/toggle/close_terminal`,
+  `view.rs::terminal_pane`). `gpui-terminal` 0.1.0 (held with the UI stack) over
+  `portable-pty`. It lives in the BOTTOM panel (log | messages | terminal; beside it the log
+  and messages shrink to `SIDE_W`, the terminal takes the rest, and the panel may grow to
+  1000px), toggled from the status bar / Ctrl+` / palette. Hidden = still running; the
+  header's × kills it. Things that cost time / aren't obvious:
+  - **Theme**: the crate's view hardcodes a dark `bg(0x1e1e1e)` on its root div, but its
+    renderer paints the palette's background over the whole bounds, so a `ColorPalette`
+    built from the theme (`TerminalStyle::from_theme`: bg = `theme.sidebar` like the other
+    bottom panes, fg, `caret`, mono font) is enough. ANSI colors are One Dark / One Light;
+    the light set maps white→grey and bright white→near-black (real whites vanish on a light
+    ground). `set_theme` calls `Terminal::restyle` (`update_config`) for the live switch.
+  - **Shell**: `Settings.terminal_shell` = a command line (`terminal::split_command`: quotes
+    group, no backslash escapes — Windows paths); empty = `default_shell()`: `pwsh.exe` if on
+    PATH else `powershell.exe` (Windows), `$SHELL -l` (macOS: a Finder-launched app has a
+    bare PATH, a login shell reads the profile), `$SHELL` / bash / sh (Linux). portable-pty
+    resolves PATH itself and starts in HOME / USERPROFILE. Settings row: input (placeholder
+    = the default), ▾ of `shell_choices()` (/etc/shells; pwsh/powershell/cmd/wsl/Git Bash on
+    Windows; the first = default and picking it EMPTIES the field), Browse (folder icon,
+    `prompt_for_paths`). Picks land in `pending_shell` → `render` sets the input (needs the
+    window) → its Change saves. Applies to the next terminal started.
+  - **Exit**: a thread `child.wait()`s and resolves a oneshot → `terminal_exited(gen)` drops
+    it (`terminal_gen` ignores a replaced one). Needed because on Windows ConPTY's output
+    pipe does NOT hit EOF when the shell exits (only when the console is closed), so the
+    crate's own Exit event never fires there. `Drop for Terminal` kills the child
+    (`clone_killer`) — closing the panel or the app doesn't orphan a shell.
+  - **Paste**: the PTY writer can be taken once, so it's wrapped in a shared `SharedWriter`
+    given to the view AND kept for `Terminal::paste` (newlines → CR).
+  - **Sizing**: the view's root is `size_full`; it sits in an absolutely inset box (definite
+    size) rather than relying on percentage heights in flex (see the editor-split note).
+  - **Crate limits** (TODOs in gpui-terminal 0.1.0, not fixable without vendoring): no
+    scrollback / wheel scroll, no mouse selection or copy, block cursor painted over the
+    glyph.
 
 - **Schema tree = the `gpui_component::tree` widget** (Zed-project-panel style: virtualized
   `uniform_list`, selection highlight, arrow-key nav, per-depth indent guides). Hierarchy:
@@ -840,12 +878,11 @@ The WSL host can run Windows exes directly:
 
 - **Result export** (`zdb-db/src/export.rs`, pure fns `to_csv`/`to_json`/`to_inserts`/`to_tsv`
   + `ExportFormat`): CSV/JSON/SQL-INSERTs to a file via the native save dialog
-  (`cx.prompt_for_new_path`), TSV to the clipboard (`cx.write_to_clipboard`). Toolbar
-  Export button = `export_default` (`Settings.export_format`, a `zdb_config::ExportFormat`,
-  CSV by default, picked in Settings); the ▾ next to it is a separate `Button` with
-  `DropdownMenu::dropdown_menu` listing every format (default checked) + Copy as TSV — NOT
-  gpui-component's `DropdownButton`, whose caret button can't opt out of the Tab order.
-  Copy button + all formats in the palette too. `export_active`/`copy_active_tsv`
+  (`cx.prompt_for_new_path`), TSV to the clipboard (`cx.write_to_clipboard`). The format is
+  chosen in Settings ONLY (the user's call — a ▾ format menu next to Export was removed): the
+  toolbar Export button and the palette's single "Export result" entry = `export_default`
+  (`Settings.export_format`, a `zdb_config::ExportFormat`, CSV by default). Copy (TSV) is its
+  own toolbar button + palette entry. `export_active`/`copy_active_tsv`
   read the ACTIVE tab; build the bytes while the tab is borrowed, then drop the borrow before
   touching `self.status` (borrow-conflict trap). INSERT target = the Table tab's relation, else
   `edit_target`, else `result` (`export_table_name`, a free fn).
@@ -859,7 +896,11 @@ The WSL host can run Windows exes directly:
 
 - **SQL editor extras**: `Format` button/palette → `sqlformat` crate (`util::format_sql`,
   2-space, uppercased keywords) rewrites the editor via `InputState::set_value` (needs
-  `&mut Window`). Run / Ctrl+Enter runs the **statement under the cursor**, not the whole
+  `&mut Window`). It formats ONE STATEMENT AT A TIME (split by `util::statement_spans`, the
+  same scanner `statement_range` uses) and re-joins them keeping the original count of blank
+  lines between statements, minimum one (the user's ask) — `sqlformat` on the whole text
+  puts statements on consecutive lines. A `--` comment on the line a statement ends on is
+  kept on that line. Run / Ctrl+Enter runs the **statement under the cursor**, not the whole
   editor: `util::statement_range(sql, cursor_byte_offset)` splits on top-level `;` honoring
   `'`/`"` quotes, `--`/`/* */` comments, and `$tag$` dollar-quoting (`InputState::cursor()`
   gives the byte offset). **Syntax highlight is NOT automatic**: `code_editor("sql")` alone
@@ -933,7 +974,23 @@ The WSL host can run Windows exes directly:
   their generated SQL (`tabs.rs::TableSql`) and redden WHERE or ORDER BY. Diagnostics are
   byte offsets into the text they were made for: `grid::clear_marks` drops them on EVERY
   editor change (stale offsets past the end would hit the same gpui text-run panic), and
-  each run clears the previous marks. Deliberately NOT checked as-you-type: that means
+  each run clears the previous marks. EXPLAIN runs the statement under the cursor too and
+  marks it: `run_explain(prefix, body)` passes `shift` = the prefix's char count, which
+  `mark_failure` subtracts from the position.
+  **Error banner** (`view.rs::render_run_error`, `Tab.run_error: Option<grid::RunError>`):
+  every failed run / explain / count shows message + DETAIL / HINT + SQLSTATE across the top
+  of the results (`query.rs::fail_run` sets it; `begin_run` clears it; × dismisses). Its
+  `at: Option<ErrorAt>` (editor line/col, or Table box + col via `tabs.rs::clause_spot`)
+  drives a "Line L, column C" link → `go_to_error` (cursor there + focus, Root-guarded);
+  any edit of that text drops `at` (`forget_error_spot`, from the same Change
+  subscriptions that clear the marks). The failing Table box also gets a red tinted pill
+  (border always drawn, transparent when fine, so nothing shifts). WHY it exists: the user
+  reported "error highlighting doesn't work, at least on Windows". The CI Windows build
+  DID render both marks (verified via WSL interop + PrintWindow) — they were just too faint:
+  gpui-component's diagnostic is a fixed 1px wavy underline (a 1-char token like `-` gets a
+  speck), the Table cue was only the tiny keyword turning red, and with Messages hidden (the
+  user's setting) the error text was a grey status-bar line. Don't regress to marks-only.
+  Deliberately NOT checked as-you-type: that means
   server round-trips (an error per pause in the server log, and a parse error inside the
   user's open transaction aborts it — needs a separate connection), and local parsers
   aren't exact Postgres.

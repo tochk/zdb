@@ -84,6 +84,7 @@ impl Workspace {
         let tab = self.tab_mut(tab_id)?;
         tab.run_gen += 1;
         tab.running = true;
+        tab.run_error = None;
         Some(tab.run_gen)
     }
 
@@ -160,30 +161,47 @@ impl Workspace {
                 return self.close_plan(id, cx);
             }
         }
-        let sql = self.active_sql(cx).trim().trim_end_matches(';').to_string();
+        let Some(id) = self.active_id() else { return };
+        // Like Run: the statement under the cursor, which an error is then
+        // marked in.
+        let sql = match self.active_tab() {
+            Some(tab) if !matches!(tab.kind, TabKind::Table { .. }) => {
+                let ed = tab.editor.read(cx);
+                let full = ed.value().to_string();
+                let range = util::statement_range(&full, ed.cursor());
+                let stmt = full[range.clone()].to_string();
+                if let Some(tab) = self.tab_mut(id) {
+                    tab.editor_run = Some((stmt.clone(), range.start));
+                }
+                stmt
+            }
+            _ => self.active_sql(cx).trim().trim_end_matches(';').to_string(),
+        };
         if sql.is_empty() {
             self.status = "Nothing to explain".into();
             cx.notify();
             return;
         }
-        let Some(id) = self.active_id() else { return };
         let prefix = if analyze {
             "EXPLAIN (ANALYZE, BUFFERS) "
         } else {
             "EXPLAIN "
         };
-        self.run_explain(id, format!("{prefix}{sql}"), analyze, cx);
+        self.run_explain(id, prefix, sql, analyze, cx);
     }
 
-    /// Execute an `EXPLAIN …` query and collect the `QUERY PLAN` text into the
-    /// tab's plan view (leaves the grid untouched).
+    /// Execute `prefix` (`EXPLAIN …`) + `sql` and collect the `QUERY PLAN`
+    /// text into the tab's plan view (leaves the grid untouched).
     pub(super) fn run_explain(
         &mut self,
         tab_id: u64,
-        sql: String,
+        prefix: &str,
+        body: String,
         analyze: bool,
         cx: &mut Context<Self>,
     ) {
+        let sql = format!("{prefix}{body}");
+        let shift = prefix.chars().count() as u32;
         let Some(session) = self.tab_session(tab_id) else {
             self.status = "Not connected".into();
             cx.notify();
@@ -197,18 +215,23 @@ impl Workspace {
         let db = self.db.clone();
         let logged = sql.clone();
         let fut = async move { drain_query(db.query(session, sql)).await };
-        self.spawn_db(cx, fut, move |this, out, _cx| {
+        self.spawn_db(cx, fut, move |this, out, cx| {
             this.note_transaction(tab_id, out.in_transaction);
             let Some(tab) = this.current_run(tab_id, gen) else {
                 return;
             };
             tab.running = false;
             tab.plan_analyze = analyze;
+            tab.clause_error = None;
+            let editor = tab.editor.clone();
+            grid::clear_marks(&editor, cx);
             match out.error {
                 Some(e) => {
-                    tab.plan = Some(format!("Error: {e}"));
+                    // Back to the grid, under the error banner.
+                    tab.plan = None;
                     this.log.push(&logged, false);
                     this.status = format!("Error: {e}");
+                    this.fail_run(tab_id, &body, shift, &e, cx);
                 }
                 None => {
                     // Single "QUERY PLAN" column of text per row.
@@ -322,10 +345,13 @@ impl Workspace {
                 }
                 (error, _) => {
                     this.log.push(&logged, false);
-                    this.status = match error {
+                    this.status = match &error {
                         Some(e) => format!("Error: {e}"),
                         None => "Couldn't count the rows".into(),
                     };
+                    if let (Some(e), Some(tab)) = (error, this.tab_mut(tab_id)) {
+                        tab.run_error = Some(grid::RunError::new(&e));
+                    }
                 }
             }
         });
@@ -466,7 +492,7 @@ impl Workspace {
                 Some(e) => {
                     let s = format!("Error: {e}");
                     this.log.push(&logged, false);
-                    this.mark_failure(tab_id, &logged, &e, cx);
+                    this.fail_run(tab_id, &logged, 0, &e, cx);
                     s
                 }
                 None => {
@@ -585,10 +611,38 @@ impl Workspace {
         cx.notify();
     }
 
+    /// A run of `tab_id` failed: show its error over the results and mark
+    /// where it happened. `sql` is what the server's error position counts
+    /// in, after `shift` characters of a prefix the tab didn't write
+    /// (`EXPLAIN …`).
+    fn fail_run(
+        &mut self,
+        tab_id: u64,
+        sql: &str,
+        shift: u32,
+        err: &DbError,
+        cx: &mut Context<Self>,
+    ) {
+        let at = self.mark_failure(tab_id, sql, shift, err, cx);
+        if let Some(tab) = self.tab_mut(tab_id) {
+            let mut error = grid::RunError::new(err);
+            error.at = at;
+            tab.run_error = Some(error);
+        }
+    }
+
     /// Put a failed run's error back where it happened: underline the token
     /// Postgres points at in the editor (hovering shows the message), or flag
     /// the Table tab box it falls in. Either clears on the next edit or run.
-    fn mark_failure(&mut self, tab_id: u64, sql: &str, err: &DbError, cx: &mut Context<Self>) {
+    /// Returns the spot, for the error banner's "go to".
+    fn mark_failure(
+        &mut self,
+        tab_id: u64,
+        sql: &str,
+        shift: u32,
+        err: &DbError,
+        cx: &mut Context<Self>,
+    ) -> Option<grid::ErrorAt> {
         let DbError::Postgres {
             message,
             position: Some(pos),
@@ -597,31 +651,26 @@ impl Workspace {
             ..
         } = err
         else {
-            return;
+            return None;
         };
-        let Some(tab) = self.tab(tab_id) else {
-            return;
-        };
+        // An error in the prefix itself has nowhere to go.
+        let pos = pos.checked_sub(shift).filter(|&p| p > 0)?;
+        let tab = self.tab(tab_id)?;
         if matches!(tab.kind, TabKind::Table { .. }) {
-            let clause = self.clause_at(tab_id, sql, *pos, cx);
-            if let Some(tab) = self.tab_mut(tab_id) {
-                tab.clause_error = clause;
-            }
-            return;
+            let (clause, col) = self.clause_spot(tab_id, sql, pos, cx)?;
+            self.tab_mut(tab_id)?.clause_error = Some(clause);
+            return Some(grid::ErrorAt::Clause { clause, col });
         }
         // Only a statement run from the editor maps back onto its text (not a
         // re-sort's wrapper, say).
-        let Some(start) = tab
+        let start = tab
             .editor_run
             .as_ref()
             .filter(|(run, _)| run == sql)
-            .map(|(_, start)| *start)
-        else {
-            return;
-        };
-        let span = util::error_span(sql, *pos);
+            .map(|(_, start)| *start)?;
+        let span = util::error_span(sql, pos);
         if span.is_empty() {
-            return;
+            return None;
         }
         let mut text = message.clone();
         for (label, extra) in [("DETAIL", detail), ("HINT", hint)] {
@@ -633,10 +682,14 @@ impl Workspace {
             let rope = state.text().clone();
             // Edited while it ran: the offsets no longer line up.
             if rope.to_string().get(start..start + sql.len()) != Some(sql) {
-                return;
+                return None;
             }
             let range = rope.offset_to_position(start + span.start)
                 ..rope.offset_to_position(start + span.end);
+            let at = grid::ErrorAt::Editor {
+                line: range.start.line,
+                col: range.start.character,
+            };
             if let Some(marks) = state.diagnostics_mut() {
                 marks.reset(&rope);
                 marks.push(Diagnostic {
@@ -648,7 +701,47 @@ impl Workspace {
                 });
             }
             cx.notify();
+            Some(at)
+        })
+    }
+
+    /// The tab's text was edited: its error banner keeps the message but no
+    /// longer knows where in the text it was.
+    pub(super) fn forget_error_spot(&mut self, tab_id: u64) {
+        if let Some(error) = self.tab_mut(tab_id).and_then(|t| t.run_error.as_mut()) {
+            error.at = None;
+        }
+    }
+
+    /// The error banner's close button.
+    pub(super) fn dismiss_run_error(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tab_mut(tab_id) {
+            tab.run_error = None;
+        }
+        cx.notify();
+    }
+
+    /// The error banner's "go to": put the cursor where the error is, in the
+    /// editor or the Table tab's box.
+    pub(super) fn go_to_error(&mut self, tab_id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab(tab_id) else {
+            return;
+        };
+        let Some(at) = tab.run_error.as_ref().and_then(|e| e.at) else {
+            return;
+        };
+        let (input, line, col) = match at {
+            grid::ErrorAt::Editor { line, col } => (tab.editor.clone(), line, col),
+            grid::ErrorAt::Clause { clause, col } => (tab.clause_input(clause).clone(), 0, col),
+        };
+        input.update(cx, |state, cx| {
+            state.set_cursor_position(gpui_component::input::Position::new(line, col), window, cx)
         });
+        // Focusing an input needs the window's `Root` (absent in headless tests).
+        if window.root::<gpui_component::Root>().flatten().is_some() {
+            input.read(cx).focus_handle(cx).focus(window);
+        }
+        cx.notify();
     }
 
     // ---- sorting ---------------------------------------------------------
@@ -1033,17 +1126,17 @@ mod tests {
                     e.set_value(format!("select 1;\n{stmt}"), window, cx)
                 });
                 ws.tab_mut(id).unwrap().editor_run = Some((stmt.into(), 10));
-                ws.mark_failure(id, stmt, &pg_error(8), cx);
+                ws.mark_failure(id, stmt, 0, &pg_error(8), cx);
                 assert_eq!(editor.read(cx).diagnostics().map(|d| d.len()), Some(1));
 
                 // The run's text no longer where it was: nothing is marked.
                 ws.tab_mut(id).unwrap().editor_run = Some((stmt.into(), 3));
                 grid::clear_marks(&editor, cx);
-                ws.mark_failure(id, stmt, &pg_error(8), cx);
+                ws.mark_failure(id, stmt, 0, &pg_error(8), cx);
                 assert_eq!(editor.read(cx).diagnostics().map(|d| d.len()), Some(0));
 
                 ws.tab_mut(id).unwrap().editor_run = Some((stmt.into(), 10));
-                ws.mark_failure(id, stmt, &pg_error(8), cx);
+                ws.mark_failure(id, stmt, 0, &pg_error(8), cx);
                 editor.update(cx, |e, cx| e.set_value("select 2", window, cx));
                 editor
             })
@@ -1053,12 +1146,67 @@ mod tests {
         assert_eq!(left, Some(0));
     }
 
+    /// A failed run puts its error over the results, with the spot it points
+    /// at (a link to it): forgotten once the text is edited, gone with the
+    /// next run. An EXPLAIN's error lands on the statement, past its prefix.
+    #[gpui::test]
+    fn failed_run_shows_its_error(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                let editor = ws.tab(id).unwrap().editor.clone();
+                let stmt = "select nme from t";
+                editor.update(cx, |e, cx| {
+                    e.set_value(format!("select 1;\n{stmt}"), window, cx)
+                });
+                ws.tab_mut(id).unwrap().editor_run = Some((stmt.into(), 10));
+                ws.fail_run(id, stmt, 0, &pg_error(8), cx);
+                let err = ws.tab(id).unwrap().run_error.clone().unwrap();
+                assert_eq!(err.message, "column \"nme\" does not exist");
+                assert_eq!(err.code.as_deref(), Some("42703"));
+                assert_eq!(err.hint.as_deref(), Some("Perhaps you meant \"name\"."));
+                assert_eq!(err.at, Some(grid::ErrorAt::Editor { line: 1, col: 7 }));
+                ws.go_to_error(id, window, cx);
+                assert_eq!(editor.read(cx).cursor(), 10 + 7);
+
+                // EXPLAIN's prefix isn't in the editor: the same error, counted
+                // from the prefix, marks the same token.
+                grid::clear_marks(&editor, cx);
+                let shift = "EXPLAIN ".len() as u32;
+                ws.fail_run(id, stmt, shift, &pg_error(8 + shift), cx);
+                assert_eq!(editor.read(cx).diagnostics().map(|d| d.len()), Some(1));
+                assert_eq!(
+                    ws.tab(id).unwrap().run_error.as_ref().unwrap().at,
+                    Some(grid::ErrorAt::Editor { line: 1, col: 7 })
+                );
+                // …and one inside the prefix has no spot (but still shows).
+                ws.fail_run(id, stmt, shift, &pg_error(3), cx);
+                let err = ws.tab(id).unwrap().run_error.clone().unwrap();
+                assert_eq!(err.at, None);
+
+                ws.fail_run(id, stmt, 0, &pg_error(8), cx);
+                ws.forget_error_spot(id);
+                let err = ws.tab(id).unwrap().run_error.clone().unwrap();
+                assert_eq!((err.at, err.message.is_empty()), (None, false));
+                ws.begin_run(id);
+                assert!(ws.tab(id).unwrap().run_error.is_none());
+                // Not a server error (the connection dropped, say): the text.
+                ws.fail_run(id, stmt, 0, &DbError::Query("connection closed".into()), cx);
+                let err = ws.tab(id).unwrap().run_error.clone().unwrap();
+                assert_eq!(err.message, "query failed: connection closed");
+                ws.dismiss_run_error(id, cx);
+                assert!(ws.tab(id).unwrap().run_error.is_none());
+            })
+            .unwrap();
+    }
+
     /// A Table tab error is pinned on the box it falls in — including one
     /// reported just past the box's text, at the next keyword.
     #[gpui::test]
     fn table_errors_point_at_their_box(cx: &mut TestAppContext) {
         let window = new_workspace(cx);
-        window
+        let id = window
             .update(cx, |ws, window, cx| {
                 ws.open_table_tab("public".into(), "users".into(), window, cx);
                 let id = ws.active_id().unwrap();
@@ -1084,8 +1232,26 @@ mod tests {
                 // SQL the boxes no longer produce isn't attributed.
                 assert_eq!(ws.clause_at(id, "SELECT 1", 1, cx), None);
 
-                ws.mark_failure(id, &sql, &pg_error(at("nme")), cx);
+                ws.fail_run(id, &sql, 0, &pg_error(at("nme") + 1), cx);
                 assert_eq!(ws.tab(id).unwrap().clause_error, Some(Clause::OrderBy));
+                assert_eq!(
+                    ws.tab(id).unwrap().run_error.as_ref().unwrap().at,
+                    Some(grid::ErrorAt::Clause {
+                        clause: Clause::OrderBy,
+                        col: 1
+                    })
+                );
+                ws.go_to_error(id, window, cx);
+                assert_eq!(order.read(cx).cursor(), 1);
+                // Typing in the box forgets the spot.
+                order.update(cx, |i, cx| i.set_value("name", window, cx));
+                id
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _, _| {
+                assert_eq!(ws.tab(id).unwrap().run_error.as_ref().unwrap().at, None);
             })
             .unwrap();
     }

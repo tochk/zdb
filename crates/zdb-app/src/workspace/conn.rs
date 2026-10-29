@@ -180,6 +180,9 @@ impl Workspace {
             zdb_config::Theme::Dark => gpui_component::ThemeMode::Dark,
         };
         gpui_component::Theme::change(mode, Some(window), cx);
+        if let Some(term) = &self.terminal {
+            term.restyle(crate::terminal::TerminalStyle::from_theme(cx), cx);
+        }
         if let Err(e) = self.settings.save() {
             self.status = format!("Theme set (disk write failed: {e})");
         }

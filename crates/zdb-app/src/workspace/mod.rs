@@ -66,6 +66,7 @@ actions!(
         TogglePalette,
         ClosePalette,
         ToggleTerminal,
+        TerminalPaste,
         ToggleConnections,
         ToggleScratch,
         ToggleSettings,
@@ -94,9 +95,7 @@ enum PaletteCmd {
     PrevTab,
     CloseTab,
     ApplyEdits,
-    ExportCsv,
-    ExportJson,
-    ExportInserts,
+    Export,
     CopyTsv,
     Format,
     QueryLog,
@@ -108,9 +107,7 @@ const PALETTE_COMMANDS: &[(&str, PaletteCmd)] = &[
     ("Explain query", PaletteCmd::Explain),
     ("Explain analyze (runs query)", PaletteCmd::ExplainAnalyze),
     ("Format SQL", PaletteCmd::Format),
-    ("Export result as CSV", PaletteCmd::ExportCsv),
-    ("Export result as JSON", PaletteCmd::ExportJson),
-    ("Export result as SQL INSERTs", PaletteCmd::ExportInserts),
+    ("Export result (format: Settings)", PaletteCmd::Export),
     ("Copy result (TSV) to clipboard", PaletteCmd::CopyTsv),
     ("Cancel query", PaletteCmd::Cancel),
     ("Refresh schemas", PaletteCmd::Refresh),
@@ -197,9 +194,19 @@ pub struct Workspace {
     modal_focus: ModalFocus,
     palette_input: Entity<InputState>,
 
-    // Embedded terminal.
+    // Embedded terminal (a bottom panel). Hidden, it keeps running; it goes
+    // when its shell exits or the panel's close button kills it.
     terminal: Option<crate::terminal::Terminal>,
     terminal_open: bool,
+    /// Bumped per spawned terminal, so a late "exited" from a replaced one is
+    /// ignored.
+    terminal_gen: u64,
+    /// Settings' shell field, and the shells found on this machine for its
+    /// picker. A pick / Browse lands in `pending_shell` (setting the field
+    /// needs the window, which `render` has).
+    shell_input: Entity<InputState>,
+    shell_choices: Vec<String>,
+    pending_shell: Option<String>,
 
     // Connections.
     settings: Settings,
@@ -303,6 +310,23 @@ impl Workspace {
         let form = ConnForm::new(window, cx);
         let tree = SchemaTree::new(window, cx);
 
+        // The terminal's shell (Settings): empty runs the platform default,
+        // which the placeholder names. Saved as typed; the next terminal
+        // started uses it.
+        let shell_choices = crate::terminal::shell_choices();
+        let shell_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::terminal::default_shell())
+                .default_value(settings.terminal_shell.clone())
+        });
+        cx.subscribe(&shell_input, |this, input, event: &InputEvent, cx| {
+            if let InputEvent::Change = event {
+                let shell = input.read(cx).value().trim().to_string();
+                this.set_terminal_shell(shell, cx);
+            }
+        })
+        .detach();
+
         // Remember the window geometry so the next launch reopens the same size
         // and position (otherwise gpui picks its default bounds every start).
         // Fires on the OS close path (Windows close button / Alt+F4); the Linux
@@ -345,6 +369,10 @@ impl Workspace {
             palette_input,
             terminal: None,
             terminal_open: false,
+            terminal_gen: 0,
+            shell_input,
+            shell_choices,
+            pending_shell: None,
             settings,
             passwords: HashMap::new(),
             conn_adding: false,
@@ -450,9 +478,7 @@ impl Workspace {
             PaletteCmd::Explain => self.explain_active(false, cx),
             PaletteCmd::ExplainAnalyze => self.explain_active(true, cx),
             PaletteCmd::Format => self.format_active(window, cx),
-            PaletteCmd::ExportCsv => self.export_active(ExportFormat::Csv, cx),
-            PaletteCmd::ExportJson => self.export_active(ExportFormat::Json, cx),
-            PaletteCmd::ExportInserts => self.export_active(ExportFormat::Inserts, cx),
+            PaletteCmd::Export => self.export_default(cx),
             PaletteCmd::CopyTsv => self.copy_active_tsv(cx),
             PaletteCmd::Cancel => self.cancel(cx),
             PaletteCmd::Refresh => self.connect_or_refresh(cx),
@@ -472,26 +498,133 @@ impl Workspace {
         }
     }
 
-    fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.terminal.is_none() {
-            match crate::terminal::spawn(cx) {
-                Ok(term) => {
-                    term.view.read(cx).focus_handle().focus(window);
-                    self.terminal = Some(term);
-                    self.terminal_open = true;
-                    self.status = "Terminal opened".into();
-                }
-                Err(e) => self.status = format!("Terminal failed: {e}"),
+    /// Ctrl+` / the status-bar button: start a terminal, or show / hide the
+    /// running one (hidden, its shell keeps running).
+    pub(super) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(term) = &self.terminal else {
+            return self.open_terminal(window, cx);
+        };
+        self.terminal_open = !self.terminal_open;
+        let focus = term.view.read(cx).focus_handle().clone();
+        if self.terminal_open {
+            focus.focus(window);
+        } else if focus.is_focused(window) {
+            // Its view unmounts: don't leave the keyboard on it.
+            self.root_focus.focus(window);
+        }
+        cx.notify();
+    }
+
+    /// Whether the terminal panel shows.
+    pub(super) fn terminal_shown(&self) -> bool {
+        self.terminal_open && self.terminal.is_some()
+    }
+
+    fn open_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let style = crate::terminal::TerminalStyle::from_theme(cx);
+        match crate::terminal::spawn(&self.settings.terminal_shell, style, cx) {
+            Ok((term, exited)) => {
+                self.terminal_gen += 1;
+                let gen = self.terminal_gen;
+                cx.spawn(async move |this, cx| {
+                    // Sent, or dropped with the watcher: the shell is gone
+                    // either way.
+                    let _ = exited.await;
+                    this.update(cx, |this, cx| this.terminal_exited(gen, cx))
+                        .ok();
+                })
+                .detach();
+                term.view.read(cx).focus_handle().focus(window);
+                self.status = format!("Terminal: {}", term.command);
+                self.terminal = Some(term);
+                self.terminal_open = true;
             }
-        } else {
-            self.terminal_open = !self.terminal_open;
-            if self.terminal_open {
-                if let Some(t) = &self.terminal {
-                    t.view.read(cx).focus_handle().focus(window);
-                }
+            Err(e) => {
+                let shell = match self.settings.terminal_shell.trim() {
+                    "" => crate::terminal::default_shell(),
+                    s => s.to_string(),
+                };
+                self.status = format!("Terminal failed to start {shell}: {e} (shell: Settings)");
             }
         }
         cx.notify();
+    }
+
+    /// The shell of terminal `gen` exited (typed `exit`, or killed).
+    fn terminal_exited(&mut self, gen: u64, cx: &mut Context<Self>) {
+        if gen != self.terminal_gen || self.terminal.is_none() {
+            return;
+        }
+        self.terminal = None;
+        self.terminal_open = false;
+        self.status = "Terminal exited".into();
+        cx.notify();
+    }
+
+    /// The terminal panel's close button: end the shell.
+    pub(super) fn close_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(term) = self.terminal.take() {
+            if term.view.read(cx).focus_handle().is_focused(window) {
+                self.root_focus.focus(window);
+            }
+        }
+        self.terminal_open = false;
+        self.status = "Terminal closed".into();
+        cx.notify();
+    }
+
+    /// Ctrl+Shift+V (Cmd+V) in the terminal: the clipboard's text as input.
+    pub(super) fn paste_into_terminal(&mut self, cx: &mut Context<Self>) {
+        let text = cx.read_from_clipboard().and_then(|item| item.text());
+        if let (Some(term), Some(text)) = (&self.terminal, text) {
+            term.paste(&text);
+        }
+    }
+
+    /// Settings' shell field changed. Takes effect for the next terminal.
+    fn set_terminal_shell(&mut self, shell: String, cx: &mut Context<Self>) {
+        if self.settings.terminal_shell == shell {
+            return;
+        }
+        self.settings.terminal_shell = shell;
+        if let Err(e) = self.settings.save() {
+            self.status = format!("Terminal shell set (disk write failed: {e})");
+        }
+        cx.notify();
+    }
+
+    /// Settings' Browse…: pick the shell's executable.
+    pub(super) fn browse_terminal_shell(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use as shell".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let shell = crate::terminal::quote(&path.to_string_lossy());
+            this.update(cx, |this, cx| {
+                this.pending_shell = Some(shell);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A shell picked from Settings' list (or Browse) goes into the field —
+    /// which saves it, like typing would.
+    pub(super) fn flush_pending_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(shell) = self.pending_shell.take() {
+            self.shell_input
+                .update(cx, |i, cx| i.set_value(shell, window, cx));
+        }
     }
 }
 

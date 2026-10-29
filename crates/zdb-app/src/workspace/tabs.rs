@@ -317,20 +317,46 @@ impl Workspace {
         self.table_sql(tab_id, cx).map(|q| q.count_sql)
     }
 
-    /// Which of a Table tab's boxes a failure of `sql` at 1-based character
-    /// `pos` points into. An error just past a box's text (`WHERE id >` fails
-    /// at the next keyword) belongs to that box too. `None` if the boxes no
-    /// longer produce `sql` (edited since) or the error is in the fixed part.
+    /// `clause_spot` without the column.
+    #[cfg(test)]
     pub(super) fn clause_at(&self, tab_id: u64, sql: &str, pos: u32, cx: &App) -> Option<Clause> {
+        self.clause_spot(tab_id, sql, pos, cx)
+            .map(|(clause, _)| clause)
+    }
+
+    /// Which of a Table tab's boxes a failure of `sql` at 1-based character
+    /// `pos` points into, and the error's column in that box's text
+    /// (characters, at most its length). An error just past a box's text
+    /// (`WHERE id >` fails at the next keyword) belongs to that box too.
+    /// `None` if the boxes no longer produce `sql` (edited since) or the error
+    /// is in the fixed part.
+    pub(super) fn clause_spot(
+        &self,
+        tab_id: u64,
+        sql: &str,
+        pos: u32,
+        cx: &App,
+    ) -> Option<(Clause, u32)> {
         let q = self.table_sql(tab_id, cx).filter(|q| q.sql == sql)?;
-        let at = pos.checked_sub(1)? as usize;
-        [
+        let at = sql
+            .char_indices()
+            .nth(pos.checked_sub(1)? as usize)
+            .map_or(sql.len(), |(i, _)| i);
+        let (start, clause) = [
             (q.limit_at, Clause::Limit),
             (q.order_at, Clause::OrderBy),
             (q.where_at, Clause::Where),
         ]
         .into_iter()
-        .find_map(|(start, clause)| start.filter(|&s| at >= s).map(|_| clause))
+        .find_map(|(start, clause)| start.filter(|&s| at >= s).map(|s| (s, clause)))?;
+        let len = self
+            .tab(tab_id)?
+            .clause_input(clause)
+            .read(cx)
+            .value()
+            .chars()
+            .count();
+        Some((clause, sql[start..at].chars().count().min(len) as u32))
     }
 
     /// Re-run a table tab from its WHERE / ORDER BY / LIMIT inputs, from its first

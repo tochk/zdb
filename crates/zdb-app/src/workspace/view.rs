@@ -23,6 +23,8 @@ const PENDING_BLUE: u32 = 0x3b82f6ff;
 const STATUS_BAR_H: gpui::Pixels = px(26.);
 /// Width of the query log while Messages shares the bottom panel with it.
 const LOG_W: gpui::Pixels = px(520.);
+/// The query log's / Messages' width beside the terminal.
+const SIDE_W: gpui::Pixels = px(360.);
 
 impl Workspace {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -488,7 +490,7 @@ impl Workspace {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.explain_active(true, cx))),
             )
             // Export / copy the current result.
-            .child(Self::export_buttons(has_result, export_fmt, cx))
+            .child(Self::export_button(has_result, export_fmt, cx))
             .child(
                 action(
                     "copy-tsv",
@@ -570,6 +572,7 @@ impl Workspace {
         if matches!(tab.kind, TabKind::Table { .. }) {
             results = results.child(Self::render_filter_bar(tab, window, c, cx));
         }
+        results = results.children(Self::render_run_error(tab, c, cx));
         // The results area shows the grid, or — after EXPLAIN — the plan text in
         // that same place (query data vs. plan, same spot). A running query
         // puts its loader over it.
@@ -700,56 +703,21 @@ impl Workspace {
             )
     }
 
-    /// Export: the button saves the result in the default format (Settings),
-    /// the chevron next to it opens every format (and the clipboard copy).
-    fn export_buttons(
+    /// Export: saves the result in the format picked in Settings.
+    fn export_button(
         has_result: bool,
-        default: zdb_config::ExportFormat,
+        format: zdb_config::ExportFormat,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let weak = cx.weak_entity();
-        h_flex()
-            .child(
-                Button::new("export")
-                    .tab_stop(false)
-                    .icon(Icon::empty().path("icons/download.svg"))
-                    .tooltip(format!(
-                        "Export result as {} (default format: Settings)",
-                        export::export_label(default)
-                    ))
-                    .disabled(!has_result)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.export_default(cx))),
-            )
-            .child(
-                Button::new("export-menu")
-                    .tab_stop(false)
-                    .compact()
-                    .icon(Icon::empty().path("icons/chevron-down.svg").xsmall())
-                    .disabled(!has_result)
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for fmt in export::EXPORT_FORMATS {
-                            let w = weak.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(format!(
-                                    "Export as {}",
-                                    export::export_label(fmt)
-                                ))
-                                .checked(fmt == default)
-                                .on_click(move |_, _, cx| {
-                                    w.update(cx, |this, cx| {
-                                        this.export_active(export::export_format(fmt), cx)
-                                    })
-                                    .ok();
-                                }),
-                            );
-                        }
-                        let w = weak.clone();
-                        menu.separator()
-                            .item(PopupMenuItem::new("Copy as TSV").on_click(move |_, _, cx| {
-                                w.update(cx, |this, cx| this.copy_active_tsv(cx)).ok();
-                            }))
-                    }),
-            )
+        Button::new("export")
+            .tab_stop(false)
+            .icon(Icon::empty().path("icons/download.svg"))
+            .tooltip(format!(
+                "Export result as {} (format: Settings)",
+                export::export_label(format)
+            ))
+            .disabled(!has_result)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.export_default(cx)))
     }
 
     /// The loader over a running tab's results: an animated spinner, on a
@@ -928,13 +896,115 @@ impl Workspace {
         self.modal_layer(v_flex().mt(px(90.)).w(width).child(body), cx)
     }
 
+    /// The last run's error, across the top of the results: the message
+    /// (DETAIL / HINT under it), its SQLSTATE, and — while the text it ran
+    /// from is unedited — a link that puts the cursor where it happened (the
+    /// spot is underlined in the editor, or its Table tab box tinted).
+    fn render_run_error(tab: &Tab, c: Colors, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let err = tab.run_error.as_ref()?;
+        let tab_id = tab.id;
+        let spot = err.at.map(|at| match at {
+            grid::ErrorAt::Editor { line, col } => {
+                format!("Line {}, column {}", line + 1, col + 1)
+            }
+            grid::ErrorAt::Clause { clause, col } => {
+                format!("{}, column {}", clause.keyword(), col + 1)
+            }
+        });
+        let link = cx.theme().blue;
+        let extra = |label: &'static str, text: &Option<String>| {
+            text.as_ref().map(|t| {
+                div()
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(format!("{label}: {t}"))
+            })
+        };
+        Some(
+            h_flex()
+                .debug_selector(|| "run-error".into())
+                .flex_none()
+                .items_start()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .max_h(px(140.))
+                .overflow_hidden()
+                .bg(c.danger.opacity(0.08))
+                .border_b_1()
+                .border_color(c.danger.opacity(0.4))
+                .child(
+                    div().flex_none().pt(px(2.)).child(
+                        Icon::empty()
+                            .path("icons/circle-x.svg")
+                            .small()
+                            .text_color(c.danger),
+                    ),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .gap(px(2.))
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .flex_wrap()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(c.danger)
+                                        .child(err.message.clone()),
+                                )
+                                .children(spot.map(|spot| {
+                                    div()
+                                        .id("run-error-goto")
+                                        .text_xs()
+                                        .text_color(link)
+                                        .cursor_pointer()
+                                        .hover(|s| s.underline())
+                                        .child(spot)
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, window, cx| {
+                                                this.go_to_error(tab_id, window, cx)
+                                            },
+                                        ))
+                                })),
+                        )
+                        .children(extra("DETAIL", &err.detail))
+                        .children(extra("HINT", &err.hint)),
+                )
+                .children(err.code.clone().map(|code| {
+                    div()
+                        .flex_none()
+                        .pt(px(2.))
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .child(code)
+                }))
+                .child(
+                    Button::new("run-error-close")
+                        .ghost()
+                        .xsmall()
+                        .tab_stop(false)
+                        .icon(Icon::empty().path("icons/close.svg"))
+                        .tooltip("Dismiss")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.dismiss_run_error(tab_id, cx)
+                        })),
+                ),
+        )
+    }
+
     /// A Table tab's WHERE / ORDER BY / LIMIT strip, built like Zed's "Search
     /// threads…" box: one full-width bar with no field chrome — a muted icon and
     /// the SQL keyword, a borderless input that reads as the rest of the clause,
     /// and a clear button once there's something to clear (not on LIMIT, where
     /// empty means every row). The focused box lights up in place of a focus
     /// border, and turns red when the last run failed on its text (the error
-    /// itself is in MESSAGES). Enter (or Run / refresh) applies them all.
+    /// itself is in the banner under the bar). Enter (or Run / refresh) applies them all.
     fn render_filter_bar(
         tab: &Tab,
         window: &Window,
@@ -950,7 +1020,8 @@ impl Workspace {
                      clearable: bool,
                      cx: &mut Context<Self>| {
             let state = input.read(cx);
-            let tint = if tab.clause_error == Some(clause) {
+            let failed = tab.clause_error == Some(clause);
+            let tint = if failed {
                 c.danger
             } else if state.focus_handle(cx).is_focused(window) {
                 c.fg
@@ -974,10 +1045,20 @@ impl Workspace {
                     }))
             });
             h_flex()
-                .h_full()
+                .h(px(24.))
                 .min_w(px(0.))
+                .px_1p5()
                 .gap_1p5()
                 .items_center()
+                .rounded_md()
+                // The run failed on this box's text: the whole box says so.
+                // (The border is always there, so the text doesn't shift.)
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .when(failed, |d| {
+                    d.bg(c.danger.opacity(0.12))
+                        .border_color(c.danger.opacity(0.5))
+                })
                 .child(tree_icon(icon, tint))
                 .child(
                     div()
@@ -1262,14 +1343,17 @@ impl Workspace {
             )
     }
 
-    /// Whether the bottom panel shows at all: the query log or Messages is
-    /// toggled on in the status bar.
+    /// Whether the bottom panel shows at all: the query log, Messages or the
+    /// terminal is toggled on in the status bar.
     fn bottom_visible(&self) -> bool {
-        self.settings.show_query_log || self.settings.show_messages
+        self.settings.show_query_log || self.settings.show_messages || self.terminal_shown()
     }
 
+    /// The bottom panel, left to right: query log | messages | terminal. The
+    /// last one shown takes the width that's left; the others keep a fixed one.
     fn render_bottom(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
+        let terminal = self.terminal.as_ref().filter(|_| self.terminal_open);
         let show_right = self.settings.show_messages;
 
         let mut log_list = v_flex().p_1().gap(px(1.));
@@ -1291,7 +1375,9 @@ impl Workspace {
             .h_full()
             .overflow_hidden()
             .map(|d| {
-                if show_right {
+                if terminal.is_some() {
+                    d.w(SIDE_W).flex_none().border_r_1().border_color(c.border)
+                } else if show_right {
                     d.w(LOG_W).flex_none().border_r_1().border_color(c.border)
                 } else {
                     d.flex_1().min_w(px(0.))
@@ -1308,9 +1394,15 @@ impl Workspace {
             );
 
         let right = v_flex()
-            .flex_grow()
             .h_full()
             .overflow_hidden()
+            .map(|d| {
+                if terminal.is_some() {
+                    d.w(SIDE_W).flex_none().border_r_1().border_color(c.border)
+                } else {
+                    d.flex_grow()
+                }
+            })
             .child(section_header("MESSAGES", c))
             .child(
                 div()
@@ -1333,6 +1425,69 @@ impl Workspace {
             .border_color(c.border)
             .when(self.settings.show_query_log, |d| d.child(log_panel))
             .when(show_right, |d| d.child(right))
+            .children(terminal.map(|t| Self::terminal_pane(t, c, cx)))
+    }
+
+    /// The terminal's pane: what it runs in the header, with a button that
+    /// ends it; the view itself in the theme's colors (see `terminal.rs`).
+    fn terminal_pane(
+        term: &crate::terminal::Terminal,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let header = section_header("TERMINAL", c)
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .font_weight(FontWeight::NORMAL)
+                    .child(term.command.clone()),
+            )
+            .child(
+                div()
+                    .id("terminal-close")
+                    .flex_none()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(c.hover))
+                    .child(Icon::empty().path("icons/close.svg").xsmall())
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new("Close terminal (ends the shell)")
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.close_terminal(window, cx)
+                    })),
+            );
+        // The view fills its box with `size_full`; an absolutely inset box has
+        // a definite size for those percentages to resolve against at any
+        // scale (see the editor-split note in CLAUDE.md).
+        let body = div()
+            .flex_1()
+            .min_h(px(0.))
+            .relative()
+            .overflow_hidden()
+            // Tab / Esc are shell keys here (see `bind_nav_keys`).
+            .key_context("Terminal")
+            .on_action(cx.listener(|this, _: &TerminalPaste, _, cx| this.paste_into_terminal(cx)))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(term.view.clone()),
+            );
+        v_flex()
+            .flex_1()
+            .min_w(px(0.))
+            .h_full()
+            .overflow_hidden()
+            .child(header)
+            .child(body)
     }
 
     /// Zed-style status bar along the window's bottom edge: toggles for the
@@ -1380,6 +1535,19 @@ impl Workspace {
                     self.settings.show_messages,
                 )
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_messages(cx))),
+            )
+            .child(
+                toggle(
+                    "toggle-terminal",
+                    "icons/square-terminal.svg",
+                    "Terminal",
+                    self.terminal_shown(),
+                )
+                .on_click(
+                    cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.toggle_terminal(window, cx)
+                    }),
+                ),
             )
             .when(!self.settings.show_messages, |bar| {
                 bar.child(
@@ -1691,6 +1859,7 @@ impl Workspace {
                 "Connections per database",
                 self.render_pool_size(c, cx).into_any_element(),
             ))
+            .child(self.render_shell_setting(c, cx))
             .child(setting_row(
                 "Keyboard shortcuts",
                 Button::new("show-shortcuts")
@@ -1770,6 +1939,78 @@ impl Workspace {
                             })),
                     ),
             )
+    }
+
+    /// The terminal's shell: typed (a command line), picked from the shells
+    /// found on this machine, or browsed for. Empty = the platform default,
+    /// which the placeholder shows.
+    fn render_shell_setting(&self, c: Colors, cx: &mut Context<Self>) -> impl IntoElement {
+        let weak = cx.weak_entity();
+        let choices = self.shell_choices.clone();
+        let current = self.settings.terminal_shell.clone();
+        let picker = Button::new("shell-choices")
+            .small()
+            .icon(Icon::empty().path("icons/chevron-down.svg"))
+            .tooltip("Shells on this computer")
+            .dropdown_menu(move |mut menu, _, _| {
+                for (i, shell) in choices.iter().enumerate() {
+                    // The first is the default: picking it empties the field,
+                    // so the setting keeps following the platform's default.
+                    let (label, value) = if i == 0 {
+                        (format!("{shell}  (default)"), String::new())
+                    } else {
+                        (shell.clone(), shell.clone())
+                    };
+                    let w = weak.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .checked(current == value)
+                            .on_click(move |_, _, cx| {
+                                let value = value.clone();
+                                w.update(cx, |this, cx| {
+                                    this.pending_shell = Some(value);
+                                    cx.notify();
+                                })
+                                .ok();
+                            }),
+                    );
+                }
+                menu
+            });
+        let browse = Button::new("shell-browse")
+            .small()
+            .icon(Icon::empty().path("icons/folder-open.svg"))
+            .tooltip("Browse for the shell's program")
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.browse_terminal_shell(cx)));
+        v_flex()
+            .px_3()
+            .py_2()
+            .gap_1()
+            .border_b_1()
+            .border_color(c.border)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_sm().text_color(c.fg).child("Terminal shell"))
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(250.))
+                                    .child(Input::new(&self.shell_input).small()),
+                            )
+                            .child(picker)
+                            .child(browse),
+                    ),
+            )
+            .child(div().text_xs().text_color(c.fg_dim).child(
+                "Empty runs the default shown. Arguments go after the program. \
+                 Applies to the next terminal (close the running one to switch).",
+            ))
     }
 
     /// `− N +` for the pool size. Tabs inside a transaction hold one more
@@ -2132,6 +2373,7 @@ impl Render for Workspace {
             self.restore_session(window, cx);
         }
         self.load_restored_tab(cx);
+        self.flush_pending_shell(window, cx);
         // Filter cleared from a window-less context (connection switch).
         if self.tree.pending_clear_filter {
             self.tree.pending_clear_filter = false;
@@ -2160,7 +2402,7 @@ impl Render for Workspace {
             }
         }
         let center = self.render_center(window, cx).into_any_element();
-        let mut top = h_resizable("zdb-top")
+        let top = h_resizable("zdb-top")
             .child(
                 resizable_panel()
                     .size(px(280.))
@@ -2168,22 +2410,6 @@ impl Render for Workspace {
                     .child(self.render_sidebar(cx)),
             )
             .child(resizable_panel().child(center));
-        if self.terminal_open {
-            if let Some(t) = &self.terminal {
-                top = top.child(
-                    resizable_panel()
-                        .size(px(480.))
-                        .size_range(px(200.)..px(900.))
-                        // Tab / Esc are shell keys here (see `bind_nav_keys`).
-                        .child(
-                            div()
-                                .size_full()
-                                .key_context("Terminal")
-                                .child(t.view.clone()),
-                        ),
-                );
-            }
-        }
 
         // Both panels need an explicit size: gpui-component's resizable seeds any
         // panel without one to PANEL_MIN_SIZE, which squeezed the bottom panel
@@ -2192,6 +2418,12 @@ impl Render for Workspace {
         // invisible panel (so its height is remembered for the next show) and
         // the top one, uncapped, fills the space.
         let bottom = self.bottom_visible();
+        // A terminal wants more height than the log / messages do.
+        let bottom_max = if self.terminal_shown() {
+            px(1000.)
+        } else {
+            px(460.)
+        };
         let main = v_resizable("zdb-root")
             .child(
                 resizable_panel()
@@ -2202,7 +2434,7 @@ impl Render for Workspace {
             .child(
                 resizable_panel()
                     .size(px(200.))
-                    .size_range(px(80.)..px(460.))
+                    .size_range(px(80.)..bottom_max)
                     .visible(bottom)
                     .when(bottom, |p| p.child(self.render_bottom(cx))),
             );
@@ -2497,7 +2729,7 @@ impl Render for EditorSplitDrag {
     }
 }
 
-fn section_header(label: impl Into<SharedString>, c: Colors) -> impl IntoElement {
+fn section_header(label: impl Into<SharedString>, c: Colors) -> gpui::Div {
     h_flex()
         .px_3()
         .py_1()

@@ -49,9 +49,12 @@ Windows and macOS (x64 and ARM64).
 **SQL editor**
 - Tree-sitter highlighting and schema-aware **completion** (the bundled
   [sqls](https://github.com/sqls-server/sqls) language server). `Ctrl/Cmd+Enter` runs the
-  statement under the cursor; a failed one is underlined where Postgres says it failed.
+  statement under the cursor. A failed one shows its error above the results, with a link
+  to the spot Postgres points at — underlined in the editor (on a table tab, the WHERE /
+  ORDER BY box it's in turns red).
 - The editor and its results share the tab half and half — drag the divider between them
-  (double-click it to even them out). **Format** button for the SQL.
+  (double-click it to even them out). **Format** button for the SQL — it keeps the blank
+  lines between statements.
 
 **Results**
 - A virtualized grid with row numbers, resizable columns and middle-click autoscroll;
@@ -59,7 +62,7 @@ Windows and macOS (x64 and ARM64).
 - **EXPLAIN** and **EXPLAIN ANALYZE** buttons — the plan shows in place of the rows; click
   the same button again to close it.
 - **Export** to CSV, JSON or SQL `INSERT`s, or copy as TSV. The Export button saves in the
-  format picked in Settings (CSV by default); the arrow next to it offers every format.
+  format picked in Settings (CSV by default).
 
 **Inline editing**
 - Any result that maps to one table with a primary key is editable: double-click (or
@@ -73,9 +76,11 @@ Windows and macOS (x64 and ARM64).
 **Everything else**
 - **Keyboard-first**: panes, tabs, grid and tree are all keyboard-driven, with an optional
   **Vim** mode; `F1` lists every shortcut, `Ctrl/Cmd+Shift+P` opens the command palette.
-- **Embedded terminal** (`` Ctrl/Cmd+` ``) — a real PTY shell for `psql`, `claude`, …
-- Light and dark themes, a Zed-style title bar, a query log and message panel you can
-  hide from the status bar; the window remembers its size and place.
+- **Embedded terminal** (`` Ctrl/Cmd+` `` or the status bar) — a real PTY shell for `psql`,
+  `claude`, … in the bottom panel, in the app's theme. The shell is set in Settings
+  (default: PowerShell on Windows, your login shell on macOS, `$SHELL` on Linux).
+- Light and dark themes, a Zed-style title bar, a query log, message panel and terminal you
+  can show and hide from the status bar; the window remembers its size and place.
 
 ## Download
 
@@ -145,6 +150,7 @@ them all.
 | `Ctrl+Shift+O` | Connections |
 | `Ctrl+,` | Settings |
 | `` Ctrl+` `` | Terminal |
+| `Ctrl+Shift+V` | Paste in the terminal |
 | `F1` | All keyboard shortcuts |
 | `Esc` | Close a dialog / discard a cell edit |
 
