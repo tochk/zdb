@@ -828,6 +828,16 @@ The WSL host can run Windows exes directly:
     given to the view AND kept for `Terminal::paste` (newlines → CR).
   - **Sizing**: the view's root is `size_full`; it sits in an absolutely inset box (definite
     size) rather than relying on percentage heights in flex (see the editor-split note).
+  - **Blank terminal on Windows = the ConPTY cursor handshake.** portable-pty opens ConPTY
+    with `PSEUDOCONSOLE_INHERIT_CURSOR` (hardcoded), so conhost first sends `ESC[6n` and
+    draws NOTHING until the terminal answers. alacritty makes the answer, as
+    `Event::PtyWrite`, but gpui-terminal's event proxy drops every `PtyWrite`. So the
+    reader is wrapped in `terminal::CursorReport` (Windows only), which answers each
+    `ESC[6n` with `ESC[1;1R` straight into the PTY input. Only that startup query reaches
+    us there (conhost answers its programs' queries itself); on Unix a program's query
+    wants the real position, which only the view knows, so it isn't answered there.
+    Symptom: the header shows `powershell.exe`, `powershell.exe` + `conhost.exe` are
+    running, the pane stays empty with the cursor top-left.
   - **Crate limits** (TODOs in gpui-terminal 0.1.0, not fixable without vendoring): no
     scrollback / wheel scroll, no mouse selection or copy, block cursor painted over the
     glyph.
@@ -990,9 +1000,11 @@ The WSL host can run Windows exes directly:
   gpui-component's diagnostic is a fixed 1px wavy underline (a 1-char token like `-` gets a
   speck), the Table cue was only the tiny keyword turning red, and with Messages hidden (the
   user's setting) the error text was a grey status-bar line. Don't regress to marks-only.
-  Deliberately NOT checked as-you-type: that means
-  server round-trips (an error per pause in the server log, and a parse error inside the
-  user's open transaction aborts it — needs a separate connection), and local parsers
-  aren't exact Postgres.
+  Errors show only AFTER a run — NOT checked as-you-type (the user's call, offered
+  server-side parse vs a local parser and chose neither): that means server round-trips (an
+  error per pause in the server log, and a parse error inside the user's open transaction
+  aborts it — needs a separate connection), and local parsers aren't exact Postgres. sqls
+  can't do it either: v0.2.48 never sends `publishDiagnostics` and its parser is lenient by
+  design (it reads half-typed SQL for completion).
 
 See the auto-memory under the Claude projects dir for the running phase log.

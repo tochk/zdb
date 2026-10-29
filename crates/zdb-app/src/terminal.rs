@@ -8,7 +8,7 @@ use futures_channel::oneshot;
 use gpui::{px, AppContext, Context, Edges, Entity, Hsla, Rgba, SharedString};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -48,6 +48,54 @@ impl Terminal {
             let config = style.apply(view.config().clone());
             view.update_config(config, cx);
         });
+    }
+}
+
+/// Answers the "where is the cursor?" query (`ESC [ 6 n`) in the shell's
+/// output on its way to the view. portable-pty opens ConPTY with
+/// `PSEUDOCONSOLE_INHERIT_CURSOR`, so conhost asks that first and draws
+/// NOTHING until it hears back — PowerShell sat on a blank terminal. alacritty
+/// does produce the reply, as an `Event::PtyWrite`, but gpui-terminal drops
+/// those. Windows only: there conhost answers its programs' own queries, so
+/// this one (sent while the screen is still empty — top left) is the only one
+/// that reaches us; elsewhere a shell's query wants the real position, which
+/// only the view knows.
+struct CursorReport<R> {
+    inner: R,
+    input: SharedWriter,
+    /// Bytes of the query matched so far (it may span two reads).
+    matched: usize,
+}
+
+const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+const CURSOR_AT_TOP_LEFT: &[u8] = b"\x1b[1;1R";
+
+impl<R> CursorReport<R> {
+    fn new(inner: R, input: SharedWriter) -> Self {
+        Self {
+            inner,
+            input,
+            matched: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for CursorReport<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        for &b in &buf[..n] {
+            self.matched = if b == CURSOR_QUERY[self.matched] {
+                self.matched + 1
+            } else {
+                usize::from(b == CURSOR_QUERY[0])
+            };
+            if self.matched == CURSOR_QUERY.len() {
+                self.matched = 0;
+                let _ = self.input.write_all(CURSOR_AT_TOP_LEFT);
+                let _ = self.input.flush();
+            }
+        }
+        Ok(n)
     }
 }
 
@@ -192,6 +240,12 @@ pub fn spawn<V: 'static>(
 
     let input = SharedWriter(Arc::new(Mutex::new(pair.master.take_writer()?)));
     let reader = pair.master.try_clone_reader()?;
+    // See `CursorReport`: without it nothing ever shows on Windows.
+    let reader: Box<dyn Read + Send> = if cfg!(windows) {
+        Box::new(CursorReport::new(reader, input.clone()))
+    } else {
+        reader
+    };
     let master = Arc::new(Mutex::new(pair.master));
 
     let resize_master = master.clone();
@@ -381,6 +435,41 @@ mod tests {
         let shell = default_shell();
         assert!(!split_command(&shell).is_empty());
         assert_eq!(shell_choices().first(), Some(&shell));
+    }
+
+    /// The cursor query is answered once per query, also when a read splits
+    /// it, and the output itself goes through untouched.
+    #[test]
+    fn cursor_queries_are_answered() {
+        let replies = Arc::new(Mutex::new(Vec::<u8>::new()));
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let input = SharedWriter(Arc::new(Mutex::new(Box::new(Sink(replies.clone())))));
+        // Reads of at most 3 bytes: the query arrives in pieces.
+        struct Chunks(std::collections::VecDeque<u8>);
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = buf.len().min(3).min(self.0.len());
+                for b in buf.iter_mut().take(n) {
+                    *b = self.0.pop_front().unwrap();
+                }
+                Ok(n)
+            }
+        }
+        let output = b"\x1b[?25l\x1b[6nPS C:\\> \x1b\x1b[6n".to_vec();
+        let mut report = CursorReport::new(Chunks(output.clone().into()), input);
+        let mut seen = Vec::new();
+        report.read_to_end(&mut seen).unwrap();
+        assert_eq!(seen, output);
+        assert_eq!(*replies.lock().unwrap(), b"\x1b[1;1R\x1b[1;1R");
     }
 
     #[test]
