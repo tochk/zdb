@@ -41,10 +41,13 @@ pub struct Settings {
     /// Bottom-panel visibility, toggled from the status bar.
     pub show_query_log: bool,
     pub show_messages: bool,
-    /// The toolbar Export button's format (the menu next to it has the others).
+    /// The format the toolbar's Export button saves in.
     pub export_format: ExportFormat,
     /// Applying staged edits first shows their statements for review.
     pub confirm_apply: bool,
+    /// The embedded terminal's shell: a command line (program, then any
+    /// arguments; quote a path with spaces). Empty = the platform default.
+    pub terminal_shell: String,
 }
 
 /// `Settings::pool_size` range the UI allows.
@@ -66,6 +69,7 @@ impl Default for Settings {
             show_messages: true,
             export_format: ExportFormat::default(),
             confirm_apply: true,
+            terminal_shell: String::new(),
         }
     }
 }
@@ -279,6 +283,7 @@ mod tests {
             show_messages: true,
             export_format: ExportFormat::Inserts,
             confirm_apply: false,
+            terminal_shell: r#""C:\Program Files\Git\bin\bash.exe" -l"#.into(),
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         assert!(json.contains(r#""export_format": "inserts""#));
@@ -298,6 +303,10 @@ mod tests {
         assert!(!back.confirm_query_cancel);
         assert_eq!(back.export_format, ExportFormat::Inserts);
         assert!(!back.confirm_apply);
+        assert_eq!(
+            back.terminal_shell,
+            r#""C:\Program Files\Git\bin\bash.exe" -l"#
+        );
     }
 
     #[test]
@@ -334,6 +343,8 @@ mod tests {
         // Export goes to CSV; Apply shows the statements first.
         assert_eq!(s.export_format, ExportFormat::Csv);
         assert!(s.confirm_apply);
+        // The terminal runs the platform's default shell.
+        assert!(s.terminal_shell.is_empty());
     }
 
     #[test]

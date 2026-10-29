@@ -15,7 +15,7 @@ use gpui_component::{
 };
 use std::collections::HashSet;
 use std::rc::Rc;
-use zdb_db::{CellValue, DbHandle, EditTarget, RowEdit, Session};
+use zdb_db::{CellValue, DbError, DbHandle, EditTarget, RowEdit, Session};
 
 use super::colors::{palette, Colors};
 use super::session;
@@ -633,6 +633,63 @@ pub(crate) struct Tab {
     pub(crate) editor_run: Option<(String, usize)>,
     /// Table tabs: the box the last failed run's error points into.
     pub(crate) clause_error: Option<Clause>,
+    /// The last run's failure, shown over the results until the next run
+    /// (or its close button).
+    pub(crate) run_error: Option<RunError>,
+}
+
+/// A failed run, as the error banner over the results shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RunError {
+    pub(crate) message: String,
+    pub(crate) detail: Option<String>,
+    pub(crate) hint: Option<String>,
+    /// SQLSTATE, e.g. `42703`.
+    pub(crate) code: Option<String>,
+    /// Where in the tab's own text it happened — while that text is as it was
+    /// run (an edit forgets it).
+    pub(crate) at: Option<ErrorAt>,
+}
+
+impl RunError {
+    pub(crate) fn new(err: &DbError) -> Self {
+        match err {
+            DbError::Postgres {
+                message,
+                code,
+                detail,
+                hint,
+                ..
+            } => Self {
+                message: message.clone(),
+                detail: detail.clone(),
+                hint: hint.clone(),
+                code: code.clone(),
+                at: None,
+            },
+            other => Self {
+                message: other.to_string(),
+                detail: None,
+                hint: None,
+                code: None,
+                at: None,
+            },
+        }
+    }
+}
+
+/// Where an error points, 0-based, columns in characters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ErrorAt {
+    Editor {
+        line: u32,
+        col: u32,
+    },
+    /// A Table tab's box (single line).
+    Clause {
+        clause: Clause,
+        col: u32,
+    },
 }
 
 /// A new Query / Scratch tab's editor share of the pane: half, results below.
@@ -668,6 +725,17 @@ pub(crate) enum Clause {
     Where,
     OrderBy,
     Limit,
+}
+
+impl Clause {
+    /// The keyword the box is labelled with.
+    pub(crate) fn keyword(self) -> &'static str {
+        match self {
+            Clause::Where => "WHERE",
+            Clause::OrderBy => "ORDER BY",
+            Clause::Limit => "LIMIT",
+        }
+    }
 }
 
 /// Where the pager goes.
@@ -733,6 +801,15 @@ pub(crate) fn make_sql_editor(
 }
 
 impl Tab {
+    /// A Table tab's WHERE / ORDER BY / LIMIT input.
+    pub(crate) fn clause_input(&self, clause: Clause) -> &Entity<InputState> {
+        match clause {
+            Clause::Where => &self.where_input,
+            Clause::OrderBy => &self.order_input,
+            Clause::Limit => &self.limit_input,
+        }
+    }
+
     /// The loader to draw: from the moment a run starts until it is over.
     pub(crate) fn loader(&self) -> Option<Loader> {
         if !self.running {
@@ -801,6 +878,7 @@ impl Tab {
             editor_split: EDITOR_SPLIT,
             editor_run: None,
             clause_error: None,
+            run_error: None,
         }
     }
 
@@ -814,9 +892,10 @@ impl Tab {
     ) -> Self {
         let weak = cx.weak_entity();
         let editor = make_sql_editor("SELECT * FROM ... ;  (press Run)", slot, id, window, cx);
-        cx.subscribe(&editor, |this, input, event: &InputEvent, cx| {
+        cx.subscribe(&editor, move |this, input, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 clear_marks(&input, cx);
+                this.forget_error_spot(id);
                 this.mark_session_dirty(cx);
             }
         })
@@ -859,9 +938,10 @@ impl Tab {
             state
         });
         // Persist scratch text to disk on every change.
-        cx.subscribe(&editor, move |_this, emitter, event: &InputEvent, cx| {
+        cx.subscribe(&editor, move |this, emitter, event: &InputEvent, cx| {
             if let InputEvent::Change = event {
                 clear_marks(&emitter, cx);
+                this.forget_error_spot(id);
                 session::store::save_scratch(key.as_deref(), &emitter.read(cx).value());
             }
         })
@@ -934,6 +1014,7 @@ impl Tab {
                     if let Some(tab) = this.tab_mut(id) {
                         tab.clause_error = None;
                     }
+                    this.forget_error_spot(id);
                     this.mark_session_dirty(cx);
                 }
                 _ => {}

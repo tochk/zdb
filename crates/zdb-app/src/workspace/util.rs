@@ -4,9 +4,10 @@ use gpui_component::table::ColumnSort;
 use zdb_config::ConnectionEntry;
 use zdb_db::{ConnSetup, ConnectionConfig, RelationKind, SslMode};
 
-/// Pretty-print SQL: 2-space indent, uppercased keywords, one blank line between
-/// statements. Best-effort — `sqlformat` returns the input unchanged on SQL it
-/// cannot parse.
+/// Pretty-print SQL: 2-space indent, uppercased keywords. Statements are
+/// formatted one at a time and keep the blank lines that were between them —
+/// at least one — and a `--` comment on the line a statement ends on stays
+/// there. Best-effort — `sqlformat` returns SQL it cannot parse unchanged.
 pub(crate) fn format_sql(sql: &str) -> String {
     let opts = sqlformat::FormatOptions {
         uppercase: Some(true),
@@ -14,7 +15,46 @@ pub(crate) fn format_sql(sql: &str) -> String {
         dialect: sqlformat::Dialect::PostgreSql,
         ..Default::default()
     };
-    sqlformat::format(sql, &sqlformat::QueryParams::None, &opts)
+    let format = |stmt: &str| {
+        sqlformat::format(stmt, &sqlformat::QueryParams::None, &opts)
+            .trim()
+            .to_string()
+    };
+    let mut out = String::new();
+    for (start, end) in statement_spans(sql) {
+        // The span stops before its `;`; format the statement with it.
+        let end = if sql[end..].starts_with(';') {
+            end + 1
+        } else {
+            end
+        };
+        let mut part = &sql[start..end];
+        if !out.is_empty() {
+            let rest = part.trim_start_matches([' ', '\t']);
+            if rest.starts_with("--") {
+                let eol = rest.find('\n').unwrap_or(rest.len());
+                out.push(' ');
+                out.push_str(rest[..eol].trim_end());
+                part = &rest[eol..];
+            }
+        }
+        let body = part.trim();
+        if body.is_empty() || body == ";" {
+            continue;
+        }
+        if !out.is_empty() {
+            // The first line break ends the previous statement's line; any
+            // more are blank lines.
+            let lead = &part[..part.len() - part.trim_start().len()];
+            let blank = lead.matches('\n').count().saturating_sub(1).max(1);
+            out.push_str(&"\n".repeat(blank + 1));
+        }
+        out.push_str(&format(body));
+    }
+    if sql.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 /// Wrap a query so it is ordered by one of its result columns. `Default` clears
@@ -137,13 +177,11 @@ fn reverse_item(item: &str) -> Option<String> {
     (!expr.is_empty()).then(|| format!("{expr}{dir}{nulls}"))
 }
 
-/// Byte range of the single SQL statement containing byte offset `cursor`,
-/// trimmed. Splits on top-level `;`, honoring single/double quotes, line (`--`)
-/// and block (`/* */`) comments, and dollar-quoted bodies (`$$ … $$`,
-/// `$tag$ … $tag$`). Falls back to the whole (trimmed) input when the picked
-/// statement is empty. A range rather than the text, so an error the server
-/// reports in it can be put back on the editor text.
-pub(crate) fn statement_range(sql: &str, cursor: usize) -> std::ops::Range<usize> {
+/// The statements of `sql` as byte spans, split on top-level `;` (each span
+/// stops before its `;`; the last runs to the end). Honors single/double
+/// quotes, line (`--`) and block (`/* */`) comments, and dollar-quoted bodies
+/// (`$$ … $$`, `$tag$ … $tag$`).
+fn statement_spans(sql: &str) -> Vec<(usize, usize)> {
     let b = sql.as_bytes();
     let n = b.len();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -203,7 +241,16 @@ pub(crate) fn statement_range(sql: &str, cursor: usize) -> std::ops::Range<usize
         }
     }
     ranges.push((start, n));
+    ranges
+}
 
+/// Byte range of the single SQL statement containing byte offset `cursor`,
+/// trimmed (split as `statement_spans` does). Falls back to the whole
+/// (trimmed) input when the picked statement is empty. A range rather than the text, so an error the server
+/// reports in it can be put back on the editor text.
+pub(crate) fn statement_range(sql: &str, cursor: usize) -> std::ops::Range<usize> {
+    let n = sql.len();
+    let ranges = statement_spans(sql);
     let cur = cursor.min(n);
     let (s, e) = ranges
         .iter()
@@ -372,6 +419,38 @@ mod tests {
     use super::*;
     use gpui_component::table::ColumnSort;
     use zdb_db::SslMode;
+
+    #[test]
+    fn format_keeps_the_blank_lines_between_statements() {
+        assert_eq!(format_sql("select 1"), "SELECT\n  1");
+        // Same line or the next one: still a blank line between them.
+        assert_eq!(
+            format_sql("select 1; select 2;"),
+            "SELECT\n  1;\n\nSELECT\n  2;"
+        );
+        assert_eq!(
+            format_sql("select 1;\nselect 2;"),
+            "SELECT\n  1;\n\nSELECT\n  2;"
+        );
+        // More blank lines than that stay as they were.
+        assert_eq!(
+            format_sql("select 1;\n\n\n\nselect 2;\n"),
+            "SELECT\n  1;\n\n\n\nSELECT\n  2;\n"
+        );
+        // A comment ending a statement's line stays on it; one above the
+        // next statement stays above it.
+        assert_eq!(
+            format_sql("select 1; -- one\n\n-- two\nselect 2"),
+            "SELECT\n  1; -- one\n\n-- two\nSELECT\n  2"
+        );
+        // A `;` inside a string or a function body doesn't split.
+        let f = format_sql(
+            "select ';'; create function f() returns int as $$ select 1; $$ language sql;",
+        );
+        assert!(f.starts_with("SELECT\n  ';';\n\nCREATE FUNCTION"), "{f}");
+        assert_eq!(f.matches("\n\n").count(), 1, "{f}");
+        assert_eq!(format_sql("  \n "), "");
+    }
 
     fn statement_at(sql: &str, cursor: usize) -> &str {
         &sql[statement_range(sql, cursor)]
