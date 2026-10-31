@@ -50,7 +50,8 @@ crates/
                Child modules see Workspace's private fields (defined in the
                parent module) — methods moved out of mod.rs are `pub(super)`
                so siblings/tests can call them. No visibility bumps beyond that.
-               Also terminal.rs (PTY + theme palette + shell resolution; see the
+               Also terminal.rs (PTY + theme palette + shell resolution) and
+               terminal_view.rs (grid painting, selection, mouse, clipboard; see the
                terminal notes), main.rs (entry, WSL X11 guard, keybindings, theme).
 ```
 
@@ -131,7 +132,8 @@ That was the whole "it starts a terminal first / has no icon" symptom.
   uploads `zdb.app.zip`. Upload-artifact does NOT preserve the exec bit or bundle
   layout, so the inner `ditto` zip is required, not cosmetic.
 - Distributing it: ad-hoc signing ≠ notarized, so a downloaded copy needs
-  `xattr -dr com.apple.quarantine /Applications/zdb.app` once (documented in README).
+  `xattr -dr com.apple.quarantine /Applications/zdb.app` once (Gatekeeper otherwise says
+  "damaged"). Deliberately NOT in the README (the user's call: keep it short).
 
 ## Releases + build info
 
@@ -140,7 +142,7 @@ That was the whole "it starts a terminal first / has no icon" symptom.
   web form's text box is ONE line, so multi-line notes go via the CLI:
   `gh workflow run release.yml -f version=0.6.0 -f notes="$(cat notes.md)"`.
   Flow: `prepare` bumps `[workspace.package] version` + `cargo update --workspace`
-  (rewrites only the member entries of Cargo.lock — libc stays pinned), commits
+  (rewrites only the member entries of Cargo.lock), commits
   "Release vX" as github-actions[bot] onto a temp `release/vX` branch → `build.yml`
   runs as a reusable workflow (`workflow_call`, inputs `ref` + `version`) on that
   commit, incl. the fmt / macOS-test gates → `publish` fast-forwards master to it
@@ -196,17 +198,26 @@ The WSL host can run Windows exes directly:
 
 - Background-command "exit 0" from `… | tee | tail` is the tail's exit — always
   grep the log for `error:` to confirm a build actually passed.
-- **libc is held at 0.2.189 in Cargo.lock** (`cargo update -p libc --precise 0.2.189`):
-  0.2.190+ dropped `libc::ENOATTR`, which `xattr` 0.2.3 (gpui 0.2.2 → gpui_http_client →
-  zed-async-tar) needs on Linux. A blanket `cargo update` re-breaks the build — re-pin after it.
-  Goes away once gpui leaves 0.2.2.
-- **UI stack deliberately held** at gpui 0.2.2 / gpui-component 0.5.1 / gpui-terminal 0.1.0
-  (user's call; every other dep is on its latest). gpui-component 0.8 moved to `gpui-pre`
-  0.3.x, and no terminal crate targets that — upgrading means vendoring + porting
-  gpui-terminal (Zed's own terminal is in-tree `terminal` + `terminal_view` crates on
-  alacritty_terminal, not reusable). A trial build against 0.8.1 hit ~40 API errors (Input
-  split into `gpui_base`, `CompletionProvider` signature, `Table::stripe`, `ScrollbarShow`,
-  `Application::new`, `Enter { shift }`). Don't bump these without asking.
+- **UI stack**: `gpui-pre` 0.3.10 (renamed to `gpui` in Cargo.toml; Zed's pre-release gpui,
+  which gpui-component pins exactly) + `gpui-pre-platform` (`gpui_platform::application()`;
+  platform backends are separate crates now, Linux renders through wgpu) + gpui-component
+  0.8.1. Things that changed under us and fail SILENTLY or only at runtime:
+  - **`set_value` no longer emits `InputEvent::Change`.** Use `replace_all` wherever a
+    subscriber must hear it (session save, error marks, tree filter, shell setting, Format,
+    header sort, the filter boxes' ×); it keeps undo history, so NOT for the cell inputs,
+    where undo would bring back another cell's value.
+  - **Input split into three states**: `InputState`/`Input` (one line), `TextareaState`/
+    `Textarea`, `EditorState`/`Editor`. Only `EditorState` has LSP (`lsp_mut()`) and diagnostics,
+    so WHERE / ORDER BY / LIMIT are one-line editors (`grid.rs::one_line_editor`,
+    `submit_on_enter`); Tab there would indent, so `render_filter_bar` `capture_action`s
+    `IndentInline`/`OutdentInline` into field steps. `Editor` has no `prefix`; layout tests read
+    `input_bounds()`, which excludes padding and border.
+  - Stock `secondary` got much lighter and the default Button draws a border:
+    `colors.rs::change_theme` (ALWAYS use it, not `Theme::change`) keeps the old chrome and
+    zebra rows; pane / toolbar Buttons are `.ghost()`.
+  - **The test scheduler rejects wakeups from other threads** (it aborts the test process).
+    UI tests use `DbHandle::idle()`, or `unserved()` + `refuse_all()` to answer on the test's
+    own thread; never `DbHandle::spawn()`, and no reader thread that hits EOF.
 - Driving the app on WSL X11: stop it with `pkill -x zdb` — `pkill -f target/debug/zdb`
   matches (and kills) the shell running the command. `import -window` silently crops a
   window that extends past the screen (bottom-panel UI "missing"): `xdotool windowmove`
@@ -247,7 +258,7 @@ The WSL host can run Windows exes directly:
     definite width pins the right edge. Also gave `content` + its main wrapper
     `min_w(0)`+`overflow_hidden` so the table can't inflate the column.
 - **NEVER put a newline in a multi-line input's placeholder** — it CRASHES the app on Windows
-  only (the Settings dialog did). gpui-component 0.5.1 lays out an empty multi-line input's
+  only (the Settings dialog did; hit on gpui-component 0.5.1, keep obeying it). It lays out an empty multi-line input's
   placeholder line by line but shapes each line with ONE run as long as the whole
   placeholder; DirectWrite's `layout_line` slices `&text[offset..offset + run.len]` → byte
   index out of range. Linux's text system tolerates it, so it never shows up here.
@@ -290,9 +301,7 @@ The WSL host can run Windows exes directly:
   `tabs::editor_split_at` clamps panes to 60px; double-click = half again).
   `view.rs::layout_tests` sweeps window heights (×1.37px steps, bottom panel on/off) and
   checks every box; the test platform's scale is 2.0, and the sweep DOES reproduce the old
-  collapse (verified by swapping the old `v_resizable` code back in). Elements that can't
-  take a `debug_selector` (the `Input`) are measured with the `#[cfg(test)]`
-  `layout_probe::probe` canvas (it sits inside the input's 1px border).
+  collapse (verified by swapping the old `v_resizable` code back in). Elements that can't take a `debug_selector` (the `Editor`) are measured with `input_bounds()` of its state.
 - App icon: regen with `python3 scripts/gen-icon.py` (black rounded square + white DB
   cylinder, no letter) → `resources/zdb.ico`, embedded via build.rs. build.rs has
   `rerun-if-changed` on the .ico so it re-embeds. Windows Explorer may still show the
@@ -329,16 +338,16 @@ The WSL host can run Windows exes directly:
   `overflow_hidden` (the "can't scroll right on wide tables" bug). FIX: `min_w(px(0.))`
   + `overflow_hidden` on the WHOLE chain down to the Table — `render_center`'s root,
   `render_tab_body`'s root, the `results` v_flex, and the div wrapping
-  `Table::new(...)`. One missing link re-breaks it. Same clamp is what keeps the
+  `DataTable::new(...)`. One missing link re-breaks it. Same clamp is what keeps the
   title-bar controls on-screen (see the title-bar notes above). Not unit-testable
   (layout lives in gpui's render); verify by running with a 25-column table and
   wheel-scrolling — vertical scroll is unaffected by the clamp.
   The clamp alone still LOOKED broken on Windows: gpui-component defaults to
-  `ScrollbarShow::Scrolling`, so the bar appears only *while* scrolling and fades
+  `ScrollbarMode::Scrolling`, so the bar appears only *while* scrolling and fades
   after 2s — and horizontal scroll is shift+wheel (gpui's Windows `WM_MOUSEWHEEL`
   handler maps shift→`delta.x`) or a tilt wheel, neither of which anyone tries
   without a visible bar. `main.rs` therefore sets
-  `Theme::global_mut(cx).scrollbar_show = ScrollbarShow::Always` right after
+  `Theme::global_mut(cx).scrollbar_mode = ScrollbarMode::Always` right after
   `Theme::change` (`Theme::change` only rewrites colors, so the setting survives
   the settings modal's live light/dark switch).
 - `text_color` on an icon: `Icon::empty().path("icons/<name>.svg").text_color(rgba(..))`
@@ -439,7 +448,7 @@ The WSL host can run Windows exes directly:
   - Verifying with xdotool: `xdotool getwindowgeometry` reports the FRAME origin — the WM
     adds ~(38,59) here. Use `xwininfo -id <win>`'s "Absolute upper-left X/Y" or every
     synthetic click lands ~60px low (looks like "the handle doesn't work").
-- **Multi-line / huge cell values** (`grid.rs::display_text`, `view.rs::render_value_editor`).
+- **Multi-line / huge cell values** (`grid.rs::display_text`, `view.rs::value_pane`).
   Rows are a fixed 32px, so a value with newlines used to WRAP inside the row: a 3-line
   value showed only its middle line and a 20-line one bled over its neighbours. `td_text`
   is now `whitespace_nowrap` + `overflow_hidden` + `text_ellipsis`, and `display_text`
@@ -448,13 +457,26 @@ The WSL host can run Windows exes directly:
   export/copy read the rows too, so nothing is ever truncated for editing or saving.
   - **Editing a multi-line value in the inline input PANICS gpui**: `text_system.rs`
     asserts "text argument should not contain newlines" when it shapes a single line.
-    So `Workspace` has a SECOND editor, `cell_multi` (`InputState::multi_line(true)`),
+    So `Workspace` has a SECOND editor, `cell_multi` (a `TextareaState`),
     and `Tab.editing_multi` says which one holds the value. `begin_edit` picks by
-    `text.contains('\n')`, `commit_cell_edit` reads back from the same one.
-  - That editor renders as a 160px strip under the grid (`render_value_editor`), NOT in
-    the cell: the cell is one row tall and `render_cell` is `overflow_hidden`, so an
-    expanded in-cell editor would just be clipped. In the grid the cell only shows the
-    `c.active` highlight while its value is being edited below.
+    `edit.rs::wants_value_pane` (a newline, or longer than the grid displays);
+    `commit_cell_edit` reads back from the same one.
+  - That editor is the **value pane** under the tab's content (`view.rs::value_split`):
+    flex weights + a drag handle like the editor split (`Tab.value_split`, default
+    `grid::VALUE_SPLIT`; double-click resets), NOT in the cell (one row tall,
+    `overflow_hidden`). It was a fixed 160px strip with `Input::h_full()`, which hit the
+    percentage-height trap: on screen the input collapsed to one blank line, with the
+    footer collapsed at 1.25 scale. `layout_tests::value_pane_fills_its_share` guards the
+    weights, but its 2.0-scale platform does NOT reproduce that collapse (swapping the old
+    sizing back in still passes) — check this one on screen.
+  - **Any cell can go there**: Shift+Enter (`GridEditPane`, on `"Grid"` and `"GridEdit"`)
+    or the ↗ button inside the inline input (`grid.rs::expand_button`) →
+    `expand_cell_edit` moves the edit over with what's typed and the cursor's column. It's
+    the only way to give a value its first line break. `cell_input`'s Blur handler skips
+    `editing_multi`, or that move would stage the edit.
+  - The pane takes height from the grid, so `reveal_value_row` scrolls the edited row back
+    into view (on open and on a divider drag). The header shows column, row, size (empty =
+    "NULL", also the placeholder: an empty value saves as NULL).
   - Enter inserts a newline there, so commit is the Save button or **Ctrl/Cmd+Enter** —
     and `run_active_tab` returns early (committing instead) when `editing_multi` is set,
     because that chord is also `RunQuery` and re-running reloaded the rows mid-edit.
@@ -780,10 +802,11 @@ The WSL host can run Windows exes directly:
   - **Terminal**: the pane/tab/apply chords are shell keys there, so their handlers
     `cx.propagate()` when the terminal has focus — an unhandled action lets the
     keystroke through to the terminal's `on_key_down`. `tab`/`shift-tab`/`escape` are
-    bound to `NoAction` in the `"Terminal"` context (its wrapper div): `NoAction` masks
-    every lower binding, so they reach the shell (completion, vi) instead of moving focus.
-    Paste = `TerminalPaste` on `"Terminal"` (Ctrl+Shift+V, Cmd+V / Cmd+Shift+V); plain
-    Ctrl+V stays a shell key (PSReadLine pastes on it itself).
+    bound to `NoAction` in the `"Terminal"` context (`TerminalView`'s root): `NoAction`
+    masks every lower binding, so they reach the shell (completion, vi) instead of moving
+    focus. Clipboard keys are per OS in `bind_nav_keys`, as a menu shows an action's
+    LAST-bound keys (it said "Win+C" with `cmd-c` bound after `ctrl-shift-c`). Plain
+    Ctrl+C / Ctrl+V stay shell keys (PSReadLine pastes on Ctrl+V itself).
   - **Dialogs own mouse + keyboard** (`modal.rs`): one `Modal` at a time (opening one
     replaces another); the backdrop `occlude()`s the panes (a press on it closes) and
     starts BELOW the title bar so the window stays movable/closable; the panel tracks a
@@ -798,18 +821,32 @@ The WSL host can run Windows exes directly:
     is activated + focused (`xdotool windowactivate/windowfocus`); the whole feature
     was checked that way with `import -window` screenshots.
 
-- **Embedded terminal** (`src/terminal.rs` + `mod.rs` `open/toggle/close_terminal`,
-  `view.rs::terminal_pane`). `gpui-terminal` 0.1.0 (held with the UI stack) over
-  `portable-pty`. It lives in the BOTTOM panel (log | messages | terminal; beside it the log
+- **Embedded terminal** (`src/terminal.rs` + `src/terminal_view.rs` + `mod.rs`
+  `open/toggle/close_terminal`, `view.rs::terminal_pane`). OUR view over
+  `alacritty_terminal` + `portable-pty` (gpui-terminal, which pinned gpui 0.2.2, was dropped:
+  its palette and key encoding now live in `terminal.rs` / `terminal_view.rs`). It lives in the BOTTOM panel (log | messages | terminal; beside it the log
   and messages shrink to `SIDE_W`, the terminal takes the rest, and the panel may grow to
   1000px), toggled from the status bar / Ctrl+` / palette. Hidden = still running; the
   header's × kills it. Things that cost time / aren't obvious:
-  - **Theme**: the crate's view hardcodes a dark `bg(0x1e1e1e)` on its root div, but its
-    renderer paints the palette's background over the whole bounds, so a `ColorPalette`
-    built from the theme (`TerminalStyle::from_theme`: bg = `theme.sidebar` like the other
-    bottom panes, fg, `caret`, mono font) is enough. ANSI colors are One Dark / One Light;
-    the light set maps white→grey and bright white→near-black (real whites vanish on a light
-    ground). `set_theme` calls `Terminal::restyle` (`update_config`) for the live switch.
+  - Behaviour copies Zed: drag / double / triple click =
+    `SelectionType::{Simple,Semantic,Lines}`, Shift+click extends, a drag past the top /
+    bottom scrolls (`Geometry::drag_scroll`, on pointer moves only), Ctrl+Shift+C or
+    Ctrl+Insert / Cmd+C copy and KEEP the selection, input drops it and scrolls to the
+    prompt, right click = Copy / Paste / Select All, X11 / Wayland primary selection +
+    middle-click paste (Linux), OSC 52 writes the clipboard. A program with mouse tracking
+    gets the mouse (SGR or legacy encoding, `mouse_report`) unless Shift is held; in the
+    alternate screen the wheel sends arrows (`less`).
+  - Move + up listeners are registered window-wide with `window.on_mouse_event` in the
+    canvas's paint (a drag continues outside the terminal); hover reports check the canvas's
+    hitbox so a dialog over it occludes them. `lay_out` runs BEFORE `term.lock()` in paint:
+    `resize` borrows the `RefCell`d `Term` too. `key_down` handles the menu's Esc itself: the
+    menu is a child of the `"Terminal"` context, whose `escape` → `NoAction` keeps it from the
+    menu's own binding, and unclaimed keys bubble to the view (they'd reach the shell).
+  - **Theme**: a `ColorPalette` from the theme (`TerminalStyle::from_theme`: bg =
+    `theme.sidebar` like the other bottom panes, fg, `caret`, `theme.selection`, mono font).
+    ANSI colors are One Dark / One Light; the light set maps white→grey and bright
+    white→near-black (real whites vanish on a light ground). `set_theme` calls
+    `Terminal::restyle` for the live switch.
   - **Shell**: `Settings.terminal_shell` = a command line (`terminal::split_command`: quotes
     group, no backslash escapes — Windows paths); empty = `default_shell()`: `pwsh.exe` if on
     PATH else `powershell.exe` (Windows), `$SHELL -l` (macOS: a Finder-launched app has a
@@ -824,23 +861,27 @@ The WSL host can run Windows exes directly:
     pipe does NOT hit EOF when the shell exits (only when the console is closed), so the
     crate's own Exit event never fires there. `Drop for Terminal` kills the child
     (`clone_killer`) — closing the panel or the app doesn't orphan a shell.
-  - **Paste**: the PTY writer can be taken once, so it's wrapped in a shared `SharedWriter`
-    given to the view AND kept for `Terminal::paste` (newlines → CR).
+  - **Paste** (`paste_bytes`): wrapped in `ESC[200~ … ESC[201~` when the program enabled
+    bracketed paste (any ESC stripped from the text so it can't end the paste and run as
+    keys), else newlines → CR. bash's readline then shows the pasted text in inverse until
+    the next key: that's readline, not a bug. The PTY writer can be taken once, so it's a
+    shared `SharedWriter` (the view types into it, `CursorReport` answers through it).
   - **Sizing**: the view's root is `size_full`; it sits in an absolutely inset box (definite
     size) rather than relying on percentage heights in flex (see the editor-split note).
   - **Blank terminal on Windows = the ConPTY cursor handshake.** portable-pty opens ConPTY
     with `PSEUDOCONSOLE_INHERIT_CURSOR` (hardcoded), so conhost first sends `ESC[6n` and
     draws NOTHING until the terminal answers. alacritty makes the answer, as
-    `Event::PtyWrite`, but gpui-terminal's event proxy drops every `PtyWrite`. So the
+    `Event::PtyWrite`, but our `Events` listener drops every `PtyWrite`. So the
     reader is wrapped in `terminal::CursorReport` (Windows only), which answers each
     `ESC[6n` with `ESC[1;1R` straight into the PTY input. Only that startup query reaches
     us there (conhost answers its programs' queries itself); on Unix a program's query
     wants the real position, which only the view knows, so it isn't answered there.
     Symptom: the header shows `powershell.exe`, `powershell.exe` + `conhost.exe` are
     running, the pane stays empty with the cursor top-left.
-  - **Crate limits** (TODOs in gpui-terminal 0.1.0, not fixable without vendoring): no
-    scrollback / wheel scroll, no mouse selection or copy, block cursor painted over the
-    glyph.
+  - **Known gaps**: `keystroke_bytes` covers only common keys (no modified arrows / F-keys);
+    `Events` drops `PtyWrite`, so programs' cursor / device-attribute queries go unanswered
+    (see `CursorReport`; answering them for real would replace it, untestable off Windows);
+    glyphs paint one per cell (no ligatures or combining marks).
 
 - **Schema tree = the `gpui_component::tree` widget** (Zed-project-panel style: virtualized
   `uniform_list`, selection highlight, arrow-key nav, per-depth indent guides). Hierarchy:
@@ -848,7 +889,7 @@ The WSL host can run Windows exes directly:
   per-schema SEQUENCES/FUNCTIONS groups. Model stays `workspace/mod.rs` `SchemaNode`/`RelNode`
   (lazy `relations`/`detail` via `DbHandle::{relations,relation_detail,schema_objects}`);
   render is `view.rs::render_sidebar` + the `schema_tree_row` free fn (returns a `ListItem`).
-  Key mechanics (all source-verified against gpui-component 0.5.1 `tree.rs`):
+  Key mechanics (source-verified against gpui-component `tree.rs` at 0.5.1):
   - **Expansion source of truth = `Workspace.expanded_ids`** (`HashSet<SharedString>` of node
     ids, `'\u{1}'`-joined: `db`, `sch␁s`, `rel␁s␁t`, `cols␁s␁t`, `col␁s␁t␁c`, `load␁<parent>`…).
     `build_tree` (pure fn) rebuilds `Vec<TreeItem>` + `NodeMeta` map from model+expanded+filter;
@@ -905,28 +946,24 @@ The WSL host can run Windows exes directly:
   ANALYZE actually executes the query.
 
 - **SQL editor extras**: `Format` button/palette → `sqlformat` crate (`util::format_sql`,
-  2-space, uppercased keywords) rewrites the editor via `InputState::set_value` (needs
+  2-space, uppercased keywords) rewrites the editor via `EditorState::replace_all` (needs
   `&mut Window`). It formats ONE STATEMENT AT A TIME (split by `util::statement_spans`, the
   same scanner `statement_range` uses) and re-joins them keeping the original count of blank
   lines between statements, minimum one (the user's ask) — `sqlformat` on the whole text
   puts statements on consecutive lines. A `--` comment on the line a statement ends on is
   kept on that line. Run / Ctrl+Enter runs the **statement under the cursor**, not the whole
   editor: `util::statement_range(sql, cursor_byte_offset)` splits on top-level `;` honoring
-  `'`/`"` quotes, `--`/`/* */` comments, and `$tag$` dollar-quoting (`InputState::cursor()`
-  gives the byte offset). **Syntax highlight is NOT automatic**: `code_editor("sql")` alone
-  does nothing — gpui-component gates every grammar except JSON behind its all-or-nothing
-  `tree-sitter-languages` feature (28 C grammar crates), and an unknown language silently
-  falls back to the JSON grammar (no error, no highlights). We register just SQL ourselves:
-  direct dep `tree-sitter-sequel` + `main.rs::register_sql_language()` (called right after
-  `gpui_component::init`) puts it in `LanguageRegistry::singleton()`; registered names win
-  over the fallback. Don't enable the `tree-sitter-languages` feature.
+  `'`/`"` quotes, `--`/`/* */` comments, and `$tag$` dollar-quoting (`EditorState::cursor()`
+  gives the byte offset). **Syntax highlight is a feature flag**: gpui-component's `tree-sitter-sql` feature
+  (Cargo.toml) provides the grammar for `EditorState::language("sql")`. Don't enable the
+  all-or-nothing `tree-sitter-languages` one.
 
 - **Schema-aware completion = the bundled `sqls` LSP server, driven in-process** (`src/lsp.rs`).
   NOT a homegrown completer and NOT a hand-rolled protocol server — it's a real LSP client to
   the real `sqls` (Go) subprocess. Key points:
   - gpui-component's `Input` has a built-in `CompletionProvider` trait (lsp_types-typed) + a
     completion popup. We implement `SqlCompletion` and set it on every SQL editor's
-    `InputState` via `state.lsp.completion_provider = Some(Rc::new(...))` (a **pub** field).
+    `EditorState` via `state.lsp_mut().completion_provider = Some(Rc::new(...))`.
   - `LspHandle` (mirrors `DbHandle`): spawns `sqls -config <tmpfile>` with a **blocking reader
     thread** (no tokio in zdb-app) that parses `Content-Length`-framed JSON-RPC and completes a
     `futures_channel::oneshot` per request; the provider `.await`s that in `cx.background_spawn`.
@@ -952,7 +989,7 @@ The WSL host can run Windows exes directly:
     `mattn/go-sqlite3`); we only speak Postgres. Official releases are x86-64 only, hence
     build-from-source (native Windows ARM64, the target). zdb finds `sqls[.exe]` next to its
     own exe, else on PATH; CI's Package step bundles `sqls.exe`.
-  - **Version trap**: gpui-component 0.5.1 pins `ropey = "=2.0.0-beta.1"` (its text engine —
+  - **Version trap**: gpui-component pins `ropey = "=2.0.0-beta.1"` (its text engine —
     already in the tree for every input). Do NOT add a direct `ropey` dep (it's a beta): name
     the type via the re-export `gpui_component::Rope` in the `CompletionProvider` impl.
     `lsp-types = "=0.97.0"` (stable) must match gpui-component's exactly. `background_spawn`
@@ -980,7 +1017,7 @@ The WSL host can run Windows exes directly:
   Postgres' 1-based character `position` (`DbError::Postgres`). Editor runs remember the
   statement + its byte offset (`Tab.editor_run`); the token at the position
   (`util::error_span`) gets a diagnostic (red squiggle, hover = message + DETAIL/HINT) —
-  code-editor inputs only (`InputState::diagnostics_mut`). Table tabs map the position onto
+  editors only (`EditorState::diagnostics_mut`). Table tabs map the position onto
   their generated SQL (`tabs.rs::TableSql`) and redden WHERE or ORDER BY. Diagnostics are
   byte offsets into the text they were made for: `grid::clear_marks` drops them on EVERY
   editor change (stale offsets past the end would hit the same gpui text-run panic), and

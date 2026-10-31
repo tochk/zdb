@@ -9,9 +9,11 @@ use gpui::{
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, WeakEntity,
 };
 use gpui_component::checkbox::Checkbox;
+use gpui_component::input::{IndentInline, OutdentInline};
 use gpui_component::list::ListItem;
 use gpui_component::menu::{ContextMenuExt, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_component::spinner::Spinner;
+use gpui_component::table::DataTable;
 use gpui_component::tree::{tree, TreeEntry};
 use gpui_component::{ActiveTheme, Selectable as _};
 
@@ -41,6 +43,7 @@ impl Workspace {
             .items_center()
             .child(
                 Button::new("connections")
+                    .ghost()
                     .tab_stop(false)
                     .icon(IconName::Globe)
                     .tooltip("Connections")
@@ -50,6 +53,7 @@ impl Workspace {
             )
             .child(
                 Button::new("settings")
+                    .ghost()
                     .tab_stop(false)
                     .icon(Icon::empty().path("icons/settings.svg"))
                     .tooltip("Settings")
@@ -57,6 +61,7 @@ impl Workspace {
             )
             .child(
                 Button::new("shortcuts")
+                    .ghost()
                     .tab_stop(false)
                     .icon(Icon::empty().path("icons/keyboard.svg"))
                     .tooltip("Keyboard shortcuts (F1)")
@@ -65,6 +70,7 @@ impl Workspace {
         if connected {
             actions = actions.child(
                 Button::new("refresh")
+                    .ghost()
                     .tab_stop(false)
                     .icon(Icon::empty().path("icons/refresh-cw.svg"))
                     .tooltip("Refresh schemas")
@@ -115,7 +121,7 @@ impl Workspace {
         let body: AnyElement = if connected {
             let weak = cx.weak_entity();
             div()
-                .flex_grow()
+                .flex_grow(1.)
                 .min_h(px(0.))
                 // Our own focus target + key context around the widget: its focus
                 // handle is private, so the keyboard reaches the tree through
@@ -297,6 +303,7 @@ impl Workspace {
             .child(chips)
             .child(
                 Button::new("tab-add")
+                    .ghost()
                     .tab_stop(false)
                     .icon(IconName::Plus)
                     .tooltip("New query")
@@ -306,6 +313,7 @@ impl Workspace {
             )
             .child(
                 Button::new("tab-scratch")
+                    .ghost()
                     .tab_stop(false)
                     .icon(IconName::File)
                     .tooltip("Scratch (Ctrl/Cmd+Shift+E)")
@@ -318,7 +326,7 @@ impl Workspace {
     /// The body of one tab: the action toolbar + (editor split | table grid).
     fn render_tab_body(
         tab: &Tab,
-        cell_multi: &Entity<InputState>,
+        cell_multi: &Entity<TextareaState>,
         settings: &Settings,
         window: &Window,
         c: Colors,
@@ -345,6 +353,7 @@ impl Workspace {
         // Run toggles to Stop while a query is in flight.
         let run_btn = if tab.running {
             Button::new("run")
+                .ghost()
                 .tab_stop(false)
                 .icon(
                     Icon::empty()
@@ -355,6 +364,7 @@ impl Workspace {
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)))
         } else {
             Button::new("run")
+                .ghost()
                 .tab_stop(false)
                 .icon(
                     Icon::empty()
@@ -392,6 +402,7 @@ impl Workspace {
             // Staged changes: review + apply them (one transaction), or drop them.
             .child(
                 Button::new("apply-changes")
+                    .ghost()
                     .tab_stop(false)
                     .icon(
                         Icon::empty()
@@ -406,6 +417,7 @@ impl Workspace {
             )
             .child(
                 Button::new("revert-changes")
+                    .ghost()
                     .tab_stop(false)
                     .icon(Icon::empty().path("icons/undo-2.svg"))
                     .tooltip("Revert changes")
@@ -417,6 +429,7 @@ impl Workspace {
             .child(divider())
             .child(
                 Button::new("add-row")
+                    .ghost()
                     .tab_stop(false)
                     .icon(IconName::Plus)
                     .tooltip("Add row")
@@ -427,6 +440,7 @@ impl Workspace {
             )
             .child(
                 Button::new("del-row")
+                    .ghost()
                     .tab_stop(false)
                     .icon(del_icon)
                     .tooltip(del_tip)
@@ -437,6 +451,7 @@ impl Workspace {
             )
             .child(
                 Button::new("reload")
+                    .ghost()
                     .tab_stop(false)
                     .icon(Icon::empty().path("icons/refresh-cw.svg"))
                     .tooltip("Refresh data")
@@ -452,6 +467,7 @@ impl Workspace {
         // disabled one dims.
         let action = |id: &'static str, icon: &'static str, tip: &'static str, enabled: bool| {
             Button::new(id)
+                .ghost()
                 .tab_stop(false)
                 .icon(Icon::empty().path(icon))
                 .tooltip(tip)
@@ -597,7 +613,7 @@ impl Workspace {
                         cx.stop_propagation();
                     }),
                 )
-                .child(Table::new(&tab.table).stripe(true).bordered(true))
+                .child(DataTable::new(&tab.table).stripe(true).bordered(true))
                 .into_any_element()
         };
         let loader = tab.loader();
@@ -616,6 +632,11 @@ impl Workspace {
         } else {
             Self::editor_split(tab, results, c, cx).into_any_element()
         };
+        let body = if tab.editing_multi {
+            Self::value_split(tab, body, cell_multi, c, cx).into_any_element()
+        } else {
+            body
+        };
 
         v_flex()
             .debug_selector(|| "tab-body".into())
@@ -625,7 +646,6 @@ impl Workspace {
             .bg(c.center)
             .child(toolbar)
             .child(body)
-            .children(Self::render_value_editor(tab, cell_multi, c, cx))
     }
 
     /// A Query / Scratch tab under its toolbar: the SQL editor over the
@@ -648,21 +668,11 @@ impl Workspace {
     ) -> impl IntoElement {
         let tab_id = tab.id;
         let split = tab.editor_split;
-        let editor = Input::new(&tab.editor)
-            .flex_grow()
+        let editor = Editor::new(&tab.editor)
+            .flex_grow(1.)
             .flex_basis(px(0.))
             .min_h(px(0.));
-        #[cfg(test)]
-        let editor = editor.prefix(layout_probe::probe("editor-input"));
-        let handle = div()
-            .id("editor-split-handle")
-            .flex_none()
-            .h(tabs::SPLIT_HANDLE_H)
-            .flex()
-            .items_center()
-            .cursor_row_resize()
-            .hover(|s| s.bg(c.hover))
-            .child(div().flex_1().h(px(1.)).bg(c.border))
+        let handle = split_handle("editor-split-handle", c)
             .on_drag(EditorSplitDrag(tab_id), |drag, _, _, cx| {
                 cx.stop_propagation();
                 cx.new(|_| drag.clone())
@@ -710,6 +720,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         Button::new("export")
+            .ghost()
             .tab_stop(false)
             .icon(Icon::empty().path("icons/download.svg"))
             .tooltip(format!(
@@ -1016,7 +1027,7 @@ impl Workspace {
                      icon: &'static str,
                      keyword: &'static str,
                      clause: Clause,
-                     input: &Entity<InputState>,
+                     input: &Entity<EditorState>,
                      clearable: bool,
                      cx: &mut Context<Self>| {
             let state = input.read(cx);
@@ -1038,7 +1049,7 @@ impl Workspace {
                     .tooltip("Clear")
                     .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                         input.update(cx, |i, cx| {
-                            i.set_value("", window, cx);
+                            i.replace_all("", window, cx);
                             i.focus(window, cx);
                         });
                         this.apply_where(tab_id, cx);
@@ -1072,7 +1083,18 @@ impl Workspace {
                     div()
                         .flex_1()
                         .min_w(px(0.))
-                        .child(Input::new(input).appearance(false).small()),
+                        // Tab moves between fields here, it doesn't indent.
+                        .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                            cx.stop_propagation();
+                            this.step_focus(true, window, cx);
+                        }))
+                        .capture_action(cx.listener(|this, _: &OutdentInline, window, cx| {
+                            cx.stop_propagation();
+                            this.step_focus(false, window, cx);
+                        }))
+                        // As tall as its text and padding, wider than the box: the row
+                        // centers it, which centers the text.
+                        .child(Editor::new(input).appearance(false).small().h(px(25.))),
                 )
                 .children(clear)
         };
@@ -1153,6 +1175,7 @@ impl Workspace {
         let step =
             |id: &'static str, icon: &'static str, tip: &'static str, to: PageMove, on: bool| {
                 Button::new(id)
+                    .ghost()
                     .tab_stop(false)
                     .icon(Icon::empty().path(icon))
                     .tooltip(tip)
@@ -1206,76 +1229,135 @@ impl Workspace {
             ))
     }
 
-    /// Full-value editor for a multi-line cell, docked under the grid.
-    ///
-    /// A cell is one row tall and the inline input is single-line (gpui's shaper
-    /// panics on a newline), so a value with line breaks is edited here — in full,
-    /// nothing truncated. Enter inserts a newline, so committing is Ctrl/Cmd+Enter
-    /// or Save; Esc discards like any other cell edit.
-    fn render_value_editor(
+    /// The tab's content over the value pane, sharing the height by
+    /// `Tab.value_split` with a handle to drag (double-click: back to the
+    /// default). Flex weights, no percentages — see `editor_split`.
+    fn value_split(
         tab: &Tab,
-        cell_multi: &Entity<InputState>,
+        body: AnyElement,
+        cell_multi: &Entity<TextareaState>,
         c: Colors,
         cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
-        if !tab.editing_multi {
-            return None;
-        }
-        let (_, col) = tab.editing?;
+    ) -> impl IntoElement {
+        let tab_id = tab.id;
+        let split = tab.value_split;
+        let handle = split_handle("value-split-handle", c)
+            .on_drag(ValueSplitDrag(tab_id), |drag, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| drag.clone())
+            })
+            .on_click(cx.listener(move |this, e: &ClickEvent, _, cx| {
+                if e.click_count() == 2 {
+                    if let Some(tab) = this.tab_mut(tab_id) {
+                        tab.value_split = grid::VALUE_SPLIT;
+                    }
+                    cx.notify();
+                }
+            }));
+        fill(v_flex())
+            .debug_selector(|| "value-split".into())
+            .overflow_hidden()
+            .on_drag_move(
+                cx.listener(move |this, e: &DragMoveEvent<ValueSplitDrag>, _, cx| {
+                    if e.drag(cx).0 == tab_id {
+                        let y = e.event.position.y - e.bounds.top();
+                        this.set_value_split(tab_id, y, e.bounds.size.height, cx);
+                    }
+                }),
+            )
+            .child(
+                weighted(v_flex(), split)
+                    .debug_selector(|| "value-above".into())
+                    .overflow_hidden()
+                    .child(body),
+            )
+            .child(handle)
+            .child(
+                weighted(v_flex(), 1. - split)
+                    .debug_selector(|| "value-pane".into())
+                    .overflow_hidden()
+                    .child(Self::value_pane(tab, cell_multi, c, cx)),
+            )
+    }
+
+    /// The value pane: a cell's value in full, for one that doesn't fit the
+    /// grid's one-line editor. Enter inserts a line break, so saving is
+    /// Ctrl/Cmd+Enter or Save; Esc leaves it like any other cell edit.
+    fn value_pane(
+        tab: &Tab,
+        cell_multi: &Entity<TextareaState>,
+        c: Colors,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (row, col) = tab.editing.unwrap_or_default();
         let name = tab
             .headers
             .get(col)
             .cloned()
             .unwrap_or_else(|| format!("column {}", col + 1));
-        Some(
-            v_flex()
-                .h(px(160.))
-                .flex_none()
-                .border_t_1()
-                .border_color(c.border)
-                .bg(c.panel)
-                .child(
-                    h_flex()
-                        .px_2()
-                        .py_1()
-                        .gap_2()
-                        .items_center()
-                        .bg(c.header)
-                        .child(
-                            div()
-                                .flex_grow()
-                                .text_xs()
-                                .text_color(c.fg_dim)
-                                .child(format!("{name} — multi-line value")),
-                        )
-                        .child(
-                            Button::new("value-cancel")
-                                .tab_stop(false)
-                                .label("Cancel")
-                                .small()
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.cancel_cell_edit(cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("value-save")
-                                .tab_stop(false)
-                                .label("Save")
-                                .primary()
-                                .small()
-                                .tooltip("Ctrl/Cmd+Enter")
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.commit_cell_edit(cx)
-                                })),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_grow()
-                        .p_1()
-                        .child(Input::new(cell_multi).h_full()),
-                ),
-        )
+        let value = cell_multi.read(cx).value();
+        let size = value_size(&value);
+        let mono = cx.theme().mono_font_family.clone();
+        let save_keys = if cfg!(target_os = "macos") {
+            "Cmd+Enter"
+        } else {
+            "Ctrl+Enter"
+        };
+        let header = h_flex()
+            .flex_none()
+            .h(px(32.))
+            .px_3()
+            .gap_2()
+            .items_center()
+            .border_b_1()
+            .border_color(c.border)
+            .text_xs()
+            .text_color(c.fg_dim)
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .font_family(mono.clone())
+                    .text_color(c.fg)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .child(format!("row {} · {size}", tab.first_row + row + 1)),
+            )
+            .child(div().flex_none().child(format!("{save_keys} to save")))
+            .child(
+                Button::new("value-cancel")
+                    .tab_stop(false)
+                    .label("Cancel")
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.cancel_cell_edit(cx);
+                        this.pending_grid_focus = true;
+                    })),
+            )
+            .child(
+                Button::new("value-save")
+                    .tab_stop(false)
+                    .label("Save")
+                    .primary()
+                    .xsmall()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.commit_cell_edit(cx);
+                        this.pending_grid_focus = true;
+                    })),
+            );
+        let input = Textarea::new(cell_multi)
+            .appearance(false)
+            .font_family(mono)
+            .flex_grow(1.)
+            .flex_basis(px(0.))
+            .min_h(px(0.));
+        fill(v_flex()).bg(c.center).child(header).child(input)
     }
 
     /// The EXPLAIN plan view: a header with a close button and a scrollable
@@ -1322,6 +1404,7 @@ impl Workspace {
                     )
                     .child(
                         Button::new("close-plan")
+                            .ghost()
                             .tab_stop(false)
                             .icon(Icon::empty().path("icons/close.svg").text_color(c.fg))
                             .tooltip("Close plan")
@@ -1400,7 +1483,7 @@ impl Workspace {
                 if terminal.is_some() {
                     d.w(SIDE_W).flex_none().border_r_1().border_color(c.border)
                 } else {
-                    d.flex_grow()
+                    d.flex_grow(1.)
                 }
             })
             .child(section_header("MESSAGES", c))
@@ -1469,9 +1552,6 @@ impl Workspace {
             .min_h(px(0.))
             .relative()
             .overflow_hidden()
-            // Tab / Esc are shell keys here (see `bind_nav_keys`).
-            .key_context("Terminal")
-            .on_action(cx.listener(|this, _: &TerminalPaste, _, cx| this.paste_into_terminal(cx)))
             .child(
                 div()
                     .absolute()
@@ -1585,7 +1665,7 @@ impl Workspace {
                     .child(div().w(px(380.)).child(Input::new(input)))
             };
             // Multi-line fields: label at the top, a hint under the input.
-            let lines = |text: &'static str, input: &Entity<InputState>, hint: &'static str| {
+            let lines = |text: &'static str, input: &Entity<TextareaState>, hint: &'static str| {
                 h_flex()
                     .gap_2()
                     .items_start()
@@ -1594,7 +1674,7 @@ impl Workspace {
                         v_flex()
                             .w(px(380.))
                             .gap(px(2.))
-                            .child(Input::new(input))
+                            .child(Textarea::new(input))
                             .child(div().text_xs().text_color(c.fg_dim).child(hint)),
                     )
             };
@@ -2379,12 +2459,12 @@ impl Render for Workspace {
             self.tree.pending_clear_filter = false;
             self.tree
                 .filter_input
-                .update(cx, |i, cx| i.set_value("", window, cx));
+                .update(cx, |i, cx| i.replace_all("", window, cx));
         }
-        self.flush_pending_focus(window);
+        self.flush_pending_focus(window, cx);
         self.sync_modal_focus(window, cx);
         if window.focused(cx).is_none() {
-            self.root_focus.focus(window);
+            self.root_focus.focus(window, cx);
         }
         // Keep the active tab's chip in view in the scrolling strip — only when
         // the active tab changes (so scrolling it by hand isn't undone), and a
@@ -2496,7 +2576,13 @@ impl Render for Workspace {
                 // Esc discards the inline cell edit (or stages it, per the
                 // setting). Clearing `editing` first means the blur that
                 // follows (the input unmounts) finds nothing to commit.
-                this.escape_cell_edit(cx);
+                if this.active_tab().is_some_and(|t| t.editing.is_some()) {
+                    this.escape_cell_edit(cx);
+                } else {
+                    // Not ours: a binding with no context outranks the rest, so
+                    // an open popup menu only sees the key if it's handed on.
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleTerminal, window, cx| {
                 if !this.modal_open() {
@@ -2676,6 +2762,9 @@ impl Workspace {
             .on_action(cx.listener(|this, _: &GridNextCell, _, cx| this.grid_tab(true, cx)))
             .on_action(cx.listener(|this, _: &GridPrevCell, _, cx| this.grid_tab(false, cx)))
             .on_action(cx.listener(|this, _: &GridEdit, window, cx| this.grid_edit(window, cx)))
+            .on_action(
+                cx.listener(|this, _: &GridEditPane, window, cx| this.grid_edit_pane(window, cx)),
+            )
             .on_action(cx.listener(|this, _: &GridCopyCell, _, cx| this.grid_copy_cell(cx)))
             .on_action(tree!(TreeUp, TreeMove::Up))
             .on_action(tree!(TreeDown, TreeMove::Down))
@@ -2717,6 +2806,45 @@ fn weighted<E: Styled>(mut e: E, weight: f32) -> E {
     style.flex_grow = Some(weight);
     style.flex_shrink = Some(1.);
     e.flex_basis(px(0.)).min_h(px(0.)).min_w(px(0.))
+}
+
+/// A split's divider: a thin line in a slightly taller grab zone.
+fn split_handle(id: &'static str, c: Colors) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .h(tabs::SPLIT_HANDLE_H)
+        .flex()
+        .items_center()
+        .cursor_row_resize()
+        .hover(|s| s.bg(c.hover))
+        .child(div().flex_1().h(px(1.)).bg(c.border))
+}
+
+/// "4 lines · 45 chars" for the value pane's header; an empty value saves as
+/// NULL, and says so.
+fn value_size(value: &str) -> String {
+    if value.is_empty() {
+        return "NULL".into();
+    }
+    let lines = value.split('\n').count();
+    let chars = value.chars().count();
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    format!(
+        "{lines} line{} · {chars} char{}",
+        plural(lines),
+        plural(chars)
+    )
+}
+
+/// Drag payload of the divider above the value pane (its tab id).
+#[derive(Clone)]
+struct ValueSplitDrag(u64);
+
+impl Render for ValueSplitDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
 }
 
 /// Drag payload of a Query tab's editor / results divider (its tab id).
@@ -2996,37 +3124,14 @@ pub(super) fn node_menu(
 /// Test-only `debug_selector` for elements that can't carry one (gpui-component's
 /// `Input`): a size-full canvas child that records its parent's bounds.
 #[cfg(test)]
-pub(super) mod layout_probe {
-    use gpui::{canvas, Bounds, IntoElement, Pixels, Styled};
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-
-    thread_local! {
-        static SEEN: RefCell<HashMap<&'static str, Bounds<Pixels>>> = RefCell::default();
-    }
-
-    pub(in crate::workspace) fn probe(key: &'static str) -> impl IntoElement {
-        canvas(
-            move |bounds, _, _| SEEN.with(|s| s.borrow_mut().insert(key, bounds)),
-            |_, _, _, _| {},
-        )
-        .absolute()
-        .size_full()
-    }
-
-    pub(in crate::workspace) fn bounds(key: &'static str) -> Option<Bounds<Pixels>> {
-        SEEN.with(|s| s.borrow().get(key).copied())
-    }
-}
-
 #[cfg(test)]
 mod layout_tests {
     use super::*;
     use crate::workspace::test_support::*;
     use gpui::{size, Bounds, Pixels, TestAppContext, VisualTestContext};
 
-    /// The editor's probe sits inside its 1px border, top and bottom.
-    const INPUT_BORDER: Pixels = px(2.);
+    /// What an editor's laid-out text area leaves of its box: padding and border.
+    const INPUT_INSET: Pixels = px(18.);
 
     /// Close enough: layout rounds to device pixels.
     fn near(a: Pixels, b: Pixels) -> bool {
@@ -3036,6 +3141,18 @@ mod layout_tests {
     fn laid_out(cx: &mut VisualTestContext, key: &'static str) -> Bounds<Pixels> {
         cx.debug_bounds(key)
             .unwrap_or_else(|| panic!("`{key}` wasn't drawn"))
+    }
+
+    /// Where the active tab's SQL editor laid itself out.
+    fn input_bounds(
+        handle: gpui::WindowHandle<Workspace>,
+        cx: &mut VisualTestContext,
+    ) -> Bounds<Pixels> {
+        handle
+            .update(cx, |ws, _, cx| {
+                ws.active_tab().unwrap().editor.read(cx).input_bounds()
+            })
+            .unwrap()
     }
 
     /// A Query tab is the editor over the results, half each, filling the whole
@@ -3075,7 +3192,7 @@ mod layout_tests {
                 let editor = laid_out(cx, "editor-pane");
                 let results = laid_out(cx, "results-pane");
                 let grid = laid_out(cx, "result-grid");
-                let input = layout_probe::bounds("editor-input").expect("editor drawn");
+                let input = input_bounds(handle, cx);
 
                 // The split takes everything under the toolbar…
                 assert!(
@@ -3095,7 +3212,7 @@ mod layout_tests {
                 );
                 // …and what's in each pane fills it.
                 assert!(
-                    near(input.size.height + INPUT_BORDER, editor.size.height),
+                    near(input.size.height + INPUT_INSET, editor.size.height),
                     "editor input collapsed: {at}"
                 );
                 assert!(
@@ -3104,6 +3221,71 @@ mod layout_tests {
                 );
             }
         }
+    }
+
+    /// The value pane under a cell edit, its input filling what's under the
+    /// header at every window size. (This platform's 2.0 scale does NOT reproduce
+    /// the percentage-height collapse the pane replaced, seen at 1.25 — that one
+    /// was checked on screen.)
+    #[gpui::test]
+    fn value_pane_fills_its_share(cx: &mut TestAppContext) {
+        let handle = new_workspace(cx);
+        let cx = &mut VisualTestContext::from_window(handle.into(), cx);
+        cx.simulate_resize(size(px(1536.), px(816.)));
+        handle
+            .update(cx, |ws, window, cx| {
+                let id = seed_query_tab(ws, window, cx);
+                seed_rows(ws, id, vec!["a", "b"], 50, cx);
+                editable_tab(ws, id, vec!["a", "b"]);
+                ws.tab_mut(id).unwrap().rows[0][0] = CellValue::Text("one\ntwo".into());
+                ws.begin_edit(id, 0, 0, window, cx);
+            })
+            .unwrap();
+        for bottom in [true, false] {
+            handle
+                .update(cx, |ws, _, cx| {
+                    ws.settings.show_query_log = bottom;
+                    ws.settings.show_messages = bottom;
+                    cx.notify();
+                })
+                .unwrap();
+            for i in 0..150 {
+                let height = px(560. + i as f32 * 1.37);
+                cx.simulate_resize(size(px(1536.), height));
+                cx.run_until_parked();
+                let at = format!("window height {height:?}, bottom panel {bottom}");
+
+                let body = laid_out(cx, "tab-body");
+                let split = laid_out(cx, "value-split");
+                let above = laid_out(cx, "value-above");
+                let pane = laid_out(cx, "value-pane");
+                let input = handle
+                    .update(cx, |ws, _, cx| ws.cell_multi.read(cx).input_bounds())
+                    .unwrap();
+
+                assert!(near(split.bottom(), body.bottom()), "split short: {at}");
+                assert!(near(pane.bottom(), split.bottom()), "pane short: {at}");
+                let room = split.size.height - tabs::SPLIT_HANDLE_H;
+                assert!(
+                    near(above.size.height, room * grid::VALUE_SPLIT),
+                    "wrong share above: {at}"
+                );
+                // Only the header and the input's own padding are left out.
+                assert!(
+                    input.size.height > pane.size.height - px(32.) - px(24.),
+                    "value input collapsed ({:?} of {:?}): {at}",
+                    input.size.height,
+                    pane.size.height
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn value_size_counts_lines_and_chars() {
+        assert_eq!(value_size(""), "NULL");
+        assert_eq!(value_size("a"), "1 line · 1 char");
+        assert_eq!(value_size("é\nb"), "2 lines · 3 chars");
     }
 
     /// Dragging the divider moves the split; the panes follow.
@@ -3123,9 +3305,9 @@ mod layout_tests {
         cx.run_until_parked();
         let editor = laid_out(cx, "editor-pane");
         let results = laid_out(cx, "results-pane");
-        let input = layout_probe::bounds("editor-input").unwrap();
+        let input = input_bounds(handle, cx);
         assert!(editor.size.height < results.size.height / 2.);
-        assert!(near(input.size.height + INPUT_BORDER, editor.size.height));
+        assert!(near(input.size.height + INPUT_INSET, editor.size.height));
         assert!(near(results.bottom(), split.bottom()));
     }
 }

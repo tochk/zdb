@@ -111,6 +111,7 @@ impl Workspace {
         // strip is open it saves the value instead of re-running the query (which
         // would reload the rows and drop the edit in progress).
         if self.active_tab().is_some_and(|t| t.editing_multi) {
+            self.pending_grid_focus = true;
             self.commit_cell_edit(cx);
             return;
         }
@@ -607,7 +608,7 @@ impl Workspace {
             return;
         }
         let pretty = util::format_sql(&sql);
-        editor.update(cx, |state, cx| state.set_value(pretty, window, cx));
+        editor.update(cx, |state, cx| state.replace_all(pretty, window, cx));
         cx.notify();
     }
 
@@ -739,7 +740,7 @@ impl Workspace {
         });
         // Focusing an input needs the window's `Root` (absent in headless tests).
         if window.root::<gpui_component::Root>().flatten().is_some() {
-            input.read(cx).focus_handle(cx).focus(window);
+            input.read(cx).focus_handle(cx).focus(window, cx);
         }
         cx.notify();
     }
@@ -778,7 +779,7 @@ impl Workspace {
             }
             let clause = sort_clause(&headers, next);
             if let Some(input) = self.tab(tab_id).map(|t| t.order_input.clone()) {
-                input.update(cx, |state, cx| state.set_value(clause, window, cx));
+                input.update(cx, |state, cx| state.replace_all(clause, window, cx));
             }
             let sql = self.table_query(tab_id, cx);
             log(format!("sort: {sql}"));
@@ -1244,7 +1245,7 @@ mod tests {
                 ws.go_to_error(id, window, cx);
                 assert_eq!(order.read(cx).cursor(), 1);
                 // Typing in the box forgets the spot.
-                order.update(cx, |i, cx| i.set_value("name", window, cx));
+                order.update(cx, |i, cx| i.replace_all("name", window, cx));
                 id
             })
             .unwrap();

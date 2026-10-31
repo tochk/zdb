@@ -142,8 +142,8 @@ impl Workspace {
             let h = state.horizontal_scroll_handle.clone();
             let v = state.vertical_scroll_handle.0.borrow().base_handle.clone();
             let (ho, vo) = (h.offset(), v.offset());
-            let x = clamp_offset(ho.x - px(dx), h.max_offset().width);
-            let y = clamp_offset(vo.y - px(dy), v.max_offset().height);
+            let x = clamp_offset(ho.x - px(dx), h.max_offset().x);
+            let y = clamp_offset(vo.y - px(dy), v.max_offset().y);
             if x != ho.x {
                 h.set_offset(point(x, ho.y));
             }

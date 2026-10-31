@@ -9,9 +9,10 @@ use gpui::{
     Window,
 };
 use gpui_component::{
-    input::{Input, InputEvent, InputState},
+    button::{Button, ButtonVariants as _},
+    input::{EditorState, Input, InputEvent},
     table::{Column, TableDelegate, TableState},
-    Sizable as _,
+    Icon, Sizable as _,
 };
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -243,8 +244,8 @@ impl TableDelegate for ResultDelegate {
         self.rows.len()
     }
 
-    fn column(&self, col_ix: usize, _: &App) -> &Column {
-        &self.columns[col_ix]
+    fn column(&self, col_ix: usize, _: &App) -> Column {
+        self.columns[col_ix].clone()
     }
 
     fn render_th(
@@ -353,8 +354,8 @@ impl TableDelegate for ResultDelegate {
             .then(cursor_ring);
 
         if editing && tab.editing_multi {
-            // A multi-line value is edited in the strip under the grid (see
-            // `render_value_editor`); the cell only marks itself as the target.
+            // A multi-line value is edited in the pane under the grid (see
+            // `value_pane`); the cell only marks itself as the target.
             return div()
                 .size_full()
                 .relative()
@@ -379,7 +380,12 @@ impl TableDelegate for ResultDelegate {
                 .bg(c.active)
                 .text_sm()
                 .child(sep_line(c))
-                .child(Input::new(&cell_input).appearance(false).small())
+                .child(
+                    Input::new(&cell_input)
+                        .appearance(false)
+                        .small()
+                        .suffix(expand_button(self.ws.clone(), tab_id)),
+                )
                 .into_any_element();
         }
 
@@ -458,6 +464,19 @@ fn col_sep(col_ix: usize, c: Colors) -> Option<gpui::Div> {
     (col_ix > 0).then(|| sep_line(c))
 }
 
+/// In the inline cell editor: moves the edit to the value pane.
+fn expand_button(ws: WeakEntity<Workspace>, tab_id: u64) -> impl IntoElement {
+    Button::new("cell-expand")
+        .tab_stop(false)
+        .ghost()
+        .xsmall()
+        .icon(Icon::empty().path("icons/maximize-2.svg"))
+        .tooltip("Edit in the value pane (Shift+Enter)")
+        .on_click(move |_, window, cx| {
+            let _ = ws.update(cx, |ws, cx| ws.expand_cell_edit(tab_id, window, cx));
+        })
+}
+
 fn sep_line(c: Colors) -> gpui::Div {
     div()
         .absolute()
@@ -505,7 +524,7 @@ fn td_text(cell: Option<CellValue>, c: Colors) -> gpui::Div {
 
 /// How many characters of a cell value the grid draws. Past this the text is far
 /// wider than any column, and shaping a whole document per cell is wasted work.
-const CELL_MAX_CHARS: usize = 300;
+pub(crate) const CELL_MAX_CHARS: usize = 300;
 
 /// Flattens a value for DISPLAY only — the inline editor loads the raw string
 /// from `tab.rows`, and export/copy use the raw rows too, so a newline survives
@@ -546,14 +565,14 @@ pub(crate) struct Tab {
     pub(crate) kind: TabKind,
     pub(crate) title: String,
     /// SQL editor (Query / Scratch tabs); allocated-but-hidden for Table tabs.
-    pub(crate) editor: Entity<InputState>,
+    pub(crate) editor: Entity<EditorState>,
     /// WHERE filter input (Table tabs).
-    pub(crate) where_input: Entity<InputState>,
+    pub(crate) where_input: Entity<EditorState>,
     /// ORDER BY input (Table tabs). Header clicks write into it, so the text is
     /// the single source of truth for the generated `ORDER BY`.
-    pub(crate) order_input: Entity<InputState>,
+    pub(crate) order_input: Entity<EditorState>,
     /// LIMIT input (Table tabs; empty = no limit). Also the page size.
-    pub(crate) limit_input: Entity<InputState>,
+    pub(crate) limit_input: Entity<EditorState>,
     /// Table tabs: which page of `limit` rows is shown (`OFFSET page * limit`).
     pub(crate) page: usize,
     /// Number (0-based) of the result's first row in the whole table — the
@@ -589,7 +608,7 @@ pub(crate) struct Tab {
     // Inline editing.
     pub(crate) editing: Option<(usize, usize)>,
     /// Whether the cell being edited holds a multi-line value, which is edited in
-    /// the `cell_multi` strip under the grid instead of inline (a single-line
+    /// the value pane under the grid instead of inline (a single-line
     /// input panics gpui's text shaper on a newline).
     pub(crate) editing_multi: bool,
     pub(crate) current_row: Option<usize>,
@@ -627,6 +646,9 @@ pub(crate) struct Tab {
     /// Query / Scratch tabs: the share of the pane under the toolbar that the
     /// editor gets; the results take the rest (dragged by the handle between).
     pub(crate) editor_split: f32,
+    /// What's above the value pane, as a share of the height the two have
+    /// (`VALUE_SPLIT` to begin with).
+    pub(crate) value_split: f32,
 
     /// The statement last run from the editor, and its byte offset in the
     /// editor text: where a failure's error position goes back as a mark.
@@ -695,6 +717,9 @@ pub(crate) enum ErrorAt {
 /// A new Query / Scratch tab's editor share of the pane: half, results below.
 pub(crate) const EDITOR_SPLIT: f32 = 0.5;
 
+/// A tab's share above the value pane when it first opens.
+pub(crate) const VALUE_SPLIT: f32 = 0.6;
+
 /// The loader over a tab's results while it runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Loader {
@@ -750,12 +775,24 @@ pub(crate) enum PageMove {
 /// Drop an editor's error marks. They are byte offsets into the text they
 /// were made for, so any edit invalidates them (and one past the new end would
 /// trip gpui's text layout).
-pub(crate) fn clear_marks(input: &Entity<InputState>, cx: &mut App) {
+pub(crate) fn clear_marks(input: &Entity<EditorState>, cx: &mut App) {
     input.update(cx, |state, _| {
         if let Some(marks) = state.diagnostics_mut() {
             marks.clear();
         }
     });
+}
+
+/// A WHERE / ORDER BY / LIMIT box. An editor rather than an `InputState`, as only
+/// an editor can have a completion provider; Enter submits, so it stays one line.
+pub(crate) fn one_line_editor(window: &mut Window, cx: &mut Context<EditorState>) -> EditorState {
+    EditorState::new(window, cx)
+        .line_number(false)
+        .folding(false)
+        .indent_guides(false)
+        .soft_wrap(false)
+        .submit_on_enter(true)
+        .scroll_beyond_last_line(None)
 }
 
 pub(crate) fn make_grid(
@@ -786,23 +823,23 @@ pub(crate) fn make_sql_editor(
     tab_id: u64,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) -> Entity<InputState> {
+) -> Entity<EditorState> {
     let ph = placeholder.to_string();
     cx.new(|cx| {
-        let mut state = InputState::new(window, cx)
-            .code_editor("sql")
+        let mut state = EditorState::new(window, cx)
+            .language("sql")
             .line_number(true)
             .placeholder(ph);
         // Schema-aware completion via the shared `sqls` handle (no-op until a
         // server is running).
-        state.lsp.completion_provider = Some(Rc::new(SqlCompletion::new(slot, tab_id)));
+        state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletion::new(slot, tab_id)));
         state
     })
 }
 
 impl Tab {
     /// A Table tab's WHERE / ORDER BY / LIMIT input.
-    pub(crate) fn clause_input(&self, clause: Clause) -> &Entity<InputState> {
+    pub(crate) fn clause_input(&self, clause: Clause) -> &Entity<EditorState> {
         match clause {
             Clause::Where => &self.where_input,
             Clause::OrderBy => &self.order_input,
@@ -826,10 +863,10 @@ impl Tab {
         id: u64,
         kind: TabKind,
         title: String,
-        editor: Entity<InputState>,
-        where_input: Entity<InputState>,
-        order_input: Entity<InputState>,
-        limit_input: Entity<InputState>,
+        editor: Entity<EditorState>,
+        where_input: Entity<EditorState>,
+        order_input: Entity<EditorState>,
+        limit_input: Entity<EditorState>,
         table: Entity<TableState<ResultDelegate>>,
         cx: &App,
     ) -> Self {
@@ -876,6 +913,7 @@ impl Tab {
             plan: None,
             plan_analyze: false,
             editor_split: EDITOR_SPLIT,
+            value_split: VALUE_SPLIT,
             editor_run: None,
             clause_error: None,
             run_error: None,
@@ -900,9 +938,9 @@ impl Tab {
             }
         })
         .detach();
-        let where_input = cx.new(|cx| InputState::new(window, cx));
-        let order_input = cx.new(|cx| InputState::new(window, cx));
-        let limit_input = cx.new(|cx| InputState::new(window, cx));
+        let where_input = cx.new(|cx| one_line_editor(window, cx));
+        let order_input = cx.new(|cx| one_line_editor(window, cx));
+        let limit_input = cx.new(|cx| one_line_editor(window, cx));
         let table = make_grid(weak, id, window, cx);
         Tab::base(
             id,
@@ -929,12 +967,12 @@ impl Tab {
     ) -> Self {
         let weak = cx.weak_entity();
         let editor = cx.new(|cx| {
-            let mut state = InputState::new(window, cx)
-                .code_editor("sql")
+            let mut state = EditorState::new(window, cx)
+                .language("sql")
                 .line_number(true)
                 .placeholder("Scratch query — auto-saved")
                 .default_value(session::store::load_scratch(key.as_deref()));
-            state.lsp.completion_provider = Some(Rc::new(SqlCompletion::new(slot, id)));
+            state.lsp_mut().completion_provider = Some(Rc::new(SqlCompletion::new(slot, id)));
             state
         });
         // Persist scratch text to disk on every change.
@@ -946,9 +984,9 @@ impl Tab {
             }
         })
         .detach();
-        let where_input = cx.new(|cx| InputState::new(window, cx));
-        let order_input = cx.new(|cx| InputState::new(window, cx));
-        let limit_input = cx.new(|cx| InputState::new(window, cx));
+        let where_input = cx.new(|cx| one_line_editor(window, cx));
+        let order_input = cx.new(|cx| one_line_editor(window, cx));
+        let limit_input = cx.new(|cx| one_line_editor(window, cx));
         let table = make_grid(weak, id, window, cx);
         Tab::base(
             id,
@@ -989,8 +1027,8 @@ impl Tab {
             );
             let example = example.to_string();
             cx.new(|cx| {
-                let mut state = InputState::new(window, cx).placeholder(example);
-                state.lsp.completion_provider = Some(Rc::new(completion));
+                let mut state = one_line_editor(window, cx).placeholder(example);
+                state.lsp_mut().completion_provider = Some(Rc::new(completion));
                 state
             })
         };
@@ -1003,7 +1041,7 @@ impl Tab {
         );
         let order_input = clause_input("order", "ORDER BY", "default: primary key", window, cx);
         let limit_input = cx.new(|cx| {
-            InputState::new(window, cx)
+            one_line_editor(window, cx)
                 .placeholder("none")
                 .default_value(super::ROW_LIMIT.to_string())
         });

@@ -18,9 +18,9 @@ use gpui::{
 use gpui_component::{
     button::{Button, ButtonVariants},
     h_flex,
-    input::{Input, InputEvent, InputState},
+    input::{Editor, EditorState, Input, InputEvent, InputState, Textarea, TextareaState},
     resizable::{h_resizable, resizable_panel, v_resizable},
-    table::{ColumnSort, Table},
+    table::ColumnSort,
     tree::{TreeItem, TreeState},
     v_flex, Disableable, Icon, IconName, Sizable,
 };
@@ -33,7 +33,7 @@ use zdb_db::{
 };
 
 mod autoscroll;
-mod colors;
+pub(crate) mod colors;
 mod conn;
 mod edit;
 mod export;
@@ -66,7 +66,9 @@ actions!(
         TogglePalette,
         ClosePalette,
         ToggleTerminal,
+        TerminalCopy,
         TerminalPaste,
+        TerminalSelectAll,
         ToggleConnections,
         ToggleScratch,
         ToggleSettings,
@@ -177,7 +179,7 @@ pub struct Workspace {
     /// Shared inline-cell editor (only the active tab edits a cell at a time).
     cell_input: Entity<InputState>,
     /// Full-value editor for cells whose text spans multiple lines.
-    cell_multi: Entity<InputState>,
+    cell_multi: Entity<TextareaState>,
 
     /// Running `sqls` LSP handle (schema-aware completion), filled on connect.
     /// Shared with every SQL editor's completion provider.
@@ -278,8 +280,8 @@ impl Workspace {
         // A value with newlines CANNOT go into the single-line `cell_input`: gpui's
         // text system panics ("text argument should not contain newlines") when it
         // shapes such a line. Multi-line values are edited in full in this second
-        // input, shown as a strip under the grid (`render_value_editor`).
-        let cell_multi = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+        // input, in the pane under the grid (`value_pane`). Empty saves as NULL.
+        let cell_multi = cx.new(|cx| TextareaState::new(window, cx).placeholder("NULL"));
 
         // Commit inline edits on Enter *and* on focus loss — clicking away from a
         // cell stages the edit exactly like pressing Enter (Esc is the only way to
@@ -290,7 +292,10 @@ impl Workspace {
             &cell_input,
             |this, _input, event: &InputEvent, cx| match event {
                 InputEvent::PressEnter { .. } => this.commit_and_advance(cx),
-                InputEvent::Blur => this.commit_cell_edit(cx),
+                // Not when the edit just moved on to the value pane.
+                InputEvent::Blur if !this.active_tab().is_some_and(|t| t.editing_multi) => {
+                    this.commit_cell_edit(cx)
+                }
                 _ => {}
             },
         )
@@ -300,7 +305,10 @@ impl Workspace {
         // Ctrl/Cmd+Enter (or the Save button / moving to another cell). It must NOT
         // commit on blur either: clicking its own Cancel button blurs it first.
         cx.subscribe(&cell_multi, |this, _input, event: &InputEvent, cx| {
-            if let InputEvent::PressEnter { secondary: true } = event {
+            if let InputEvent::PressEnter {
+                secondary: true, ..
+            } = event
+            {
                 this.pending_grid_focus |= this.active_tab().is_some_and(|t| t.editing.is_some());
                 this.commit_cell_edit(cx);
             }
@@ -507,10 +515,10 @@ impl Workspace {
         self.terminal_open = !self.terminal_open;
         let focus = term.view.read(cx).focus_handle().clone();
         if self.terminal_open {
-            focus.focus(window);
+            focus.focus(window, cx);
         } else if focus.is_focused(window) {
             // Its view unmounts: don't leave the keyboard on it.
-            self.root_focus.focus(window);
+            self.root_focus.focus(window, cx);
         }
         cx.notify();
     }
@@ -534,7 +542,8 @@ impl Workspace {
                         .ok();
                 })
                 .detach();
-                term.view.read(cx).focus_handle().focus(window);
+                let focus = term.view.read(cx).focus_handle().clone();
+                focus.focus(window, cx);
                 self.status = format!("Terminal: {}", term.command);
                 self.terminal = Some(term);
                 self.terminal_open = true;
@@ -565,20 +574,12 @@ impl Workspace {
     pub(super) fn close_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(term) = self.terminal.take() {
             if term.view.read(cx).focus_handle().is_focused(window) {
-                self.root_focus.focus(window);
+                self.root_focus.focus(window, cx);
             }
         }
         self.terminal_open = false;
         self.status = "Terminal closed".into();
         cx.notify();
-    }
-
-    /// Ctrl+Shift+V (Cmd+V) in the terminal: the clipboard's text as input.
-    pub(super) fn paste_into_terminal(&mut self, cx: &mut Context<Self>) {
-        let text = cx.read_from_clipboard().and_then(|item| item.text());
-        if let (Some(term), Some(text)) = (&self.terminal, text) {
-            term.paste(&text);
-        }
     }
 
     /// Settings' shell field changed. Takes effect for the next terminal.
@@ -623,7 +624,7 @@ impl Workspace {
     pub(super) fn flush_pending_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(shell) = self.pending_shell.take() {
             self.shell_input
-                .update(cx, |i, cx| i.set_value(shell, window, cx));
+                .update(cx, |i, cx| i.replace_all(shell, window, cx));
         }
     }
 }

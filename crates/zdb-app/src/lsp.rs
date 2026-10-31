@@ -30,8 +30,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use futures_channel::oneshot;
-use gpui::{AppContext as _, Context, Task, Window};
-use gpui_component::input::{CompletionProvider, InputState};
+use gpui::App;
+use gpui::{AppContext as _, Task, Window};
+use gpui_component::input::CompletionProvider;
 use gpui_component::{Rope, RopeExt};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
@@ -519,7 +520,7 @@ impl CompletionProvider for SqlCompletion {
         offset: usize,
         _trigger: CompletionContext,
         _window: &mut Window,
-        cx: &mut Context<InputState>,
+        cx: &mut App,
     ) -> Task<anyhow::Result<CompletionResponse>> {
         let empty = || -> Task<anyhow::Result<CompletionResponse>> {
             Task::ready(Ok(CompletionResponse::Array(vec![])))
@@ -581,12 +582,7 @@ impl CompletionProvider for SqlCompletion {
         })
     }
 
-    fn is_completion_trigger(
-        &self,
-        _offset: usize,
-        new_text: &str,
-        _cx: &mut Context<InputState>,
-    ) -> bool {
+    fn is_completion_trigger(&self, _offset: usize, new_text: &str, _cx: &mut App) -> bool {
         new_text
             .chars()
             .next_back()

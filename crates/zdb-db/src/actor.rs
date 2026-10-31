@@ -539,6 +539,22 @@ impl ConnState {
     }
 }
 
+/// The requests sent to a [`DbHandle::unserved`].
+#[doc(hidden)]
+pub struct Unserved(mpsc::UnboundedReceiver<Command>);
+
+impl Unserved {
+    /// Fail every connect sent so far, as an unreachable server does, and drop
+    /// the other requests.
+    pub fn refuse_all(&mut self) {
+        while let Ok(command) = self.0.try_recv() {
+            if let Command::Connect { reply, .. } = command {
+                let _ = reply.send(Err(DbError::Connect("refused".into())));
+            }
+        }
+    }
+}
+
 /// Cloneable handle to the database worker. Cheap to clone (wraps a sender).
 #[derive(Clone)]
 pub struct DbHandle {
@@ -551,6 +567,23 @@ pub type QueryStream = mpsc::UnboundedReceiver<QueryEvent>;
 
 impl DbHandle {
     /// Start the worker on a dedicated Tokio runtime thread.
+    /// A handle nothing serves: requests are accepted and never answered. For UI
+    /// tests, whose scheduler rejects wakeups from another thread like the worker's.
+    #[doc(hidden)]
+    pub fn idle() -> Self {
+        let (handle, unserved) = Self::unserved();
+        std::mem::forget(unserved);
+        handle
+    }
+
+    /// [`DbHandle::idle`], with the requests kept for a test to answer on its own
+    /// thread.
+    #[doc(hidden)]
+    pub fn unserved() -> (Self, Unserved) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (DbHandle { tx }, Unserved(rx))
+    }
+
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let worker_tx = tx.clone();
