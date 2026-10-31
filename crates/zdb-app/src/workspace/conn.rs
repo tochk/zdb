@@ -14,9 +14,9 @@ pub(super) struct ConnForm {
     pub(super) password: Entity<InputState>,
     pub(super) ssl: Entity<InputState>,
     /// Extra parameters for every connection of the pool, `key=value` a line.
-    pub(super) params: Entity<InputState>,
+    pub(super) params: Entity<TextareaState>,
     /// SQL run on every connection of the pool.
-    pub(super) init_sql: Entity<InputState>,
+    pub(super) init_sql: Entity<TextareaState>,
     /// The id of the saved connection being edited; `None` = adding one.
     pub(super) editing: Option<String>,
     /// Why the last save was refused: a missing field, a bad parameter line,
@@ -45,7 +45,11 @@ impl ConnForm {
         // run — a newline in the placeholder crashes the app there.
         let lines = |window: &mut Window, cx: &mut Context<Workspace>, ph: &str| {
             let ph = ph.to_string();
-            cx.new(|cx| InputState::new(window, cx).auto_grow(2, 6).placeholder(ph))
+            cx.new(|cx| {
+                TextareaState::new(window, cx)
+                    .auto_grow(2, 6)
+                    .placeholder(ph)
+            })
         };
         Self {
             name: input(window, cx, "name", ""),
@@ -101,6 +105,10 @@ impl ConnForm {
             (&self.db, e.dbname.clone()),
             (&self.password, String::new()),
             (&self.ssl, e.ssl_mode.clone()),
+        ] {
+            input.update(cx, |i, cx| i.set_value(value, window, cx));
+        }
+        for (input, value) in [
             (&self.params, e.params.join("\n")),
             (&self.init_sql, e.init_sql.clone()),
         ] {
@@ -168,7 +176,7 @@ impl Workspace {
     pub(super) fn set_theme(
         &mut self,
         theme: zdb_config::Theme,
-        window: &mut Window,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.settings.theme == theme {
@@ -179,7 +187,7 @@ impl Workspace {
             zdb_config::Theme::Light => gpui_component::ThemeMode::Light,
             zdb_config::Theme::Dark => gpui_component::ThemeMode::Dark,
         };
-        gpui_component::Theme::change(mode, Some(window), cx);
+        super::colors::change_theme(mode, cx);
         if let Some(term) = &self.terminal {
             term.restyle(crate::terminal::TerminalStyle::from_theme(cx), cx);
         }
@@ -290,7 +298,7 @@ impl Workspace {
         let dbname = read(&self.form.db);
         let port = read(&self.form.port).parse().unwrap_or(5432);
         let ssl = read(&self.form.ssl);
-        let init_sql = read(&self.form.init_sql);
+        let init_sql = self.form.init_sql.read(cx).value().trim().to_string();
         let params_text = self.form.params.read(cx).value().to_string();
         let password = self.form.password.read(cx).value().to_string();
 
@@ -582,6 +590,11 @@ mod tests {
         input.update(cx, |i, cx| i.set_value(text, window, cx));
     }
 
+    fn type_lines(input: &Entity<TextareaState>, text: &str, window: &mut Window, cx: &mut App) {
+        let text = text.to_string();
+        input.update(cx, |i, cx| i.set_value(text, window, cx));
+    }
+
     /// A broken parameter in settings.json stops the connect with a message
     /// instead of being dropped silently.
     #[gpui::test]
@@ -618,24 +631,24 @@ mod tests {
                 assert_eq!(ws.form.name.read(cx).value(), "a");
                 assert_eq!(ws.form.port.read(cx).value(), "1");
 
-                type_into(&ws.form.params, "keepalives=maybe", window, cx);
+                type_lines(&ws.form.params, "keepalives=maybe", window, cx);
                 ws.save_connection(cx);
                 assert!(ws.form.error.as_deref().unwrap().contains("line 1"));
                 assert!(ws.settings.connections[0].params.is_empty());
 
                 type_into(&ws.form.name, "b", window, cx);
-                type_into(&ws.form.params, "application_name=x", window, cx);
+                type_lines(&ws.form.params, "application_name=x", window, cx);
                 ws.save_connection(cx);
                 assert!(ws.form.error.as_deref().unwrap().contains("already exists"));
 
                 type_into(&ws.form.name, "a2", window, cx);
-                type_into(
+                type_lines(
                     &ws.form.params,
                     "application_name=x\n\nwork_mem=64MB",
                     window,
                     cx,
                 );
-                type_into(&ws.form.init_sql, " SET lock_timeout = '5s' ", window, cx);
+                type_lines(&ws.form.init_sql, " SET lock_timeout = '5s' ", window, cx);
                 ws.save_connection(cx);
                 assert_eq!(ws.form.error, None);
                 assert!(!ws.conn_adding, "back to the list");
@@ -679,7 +692,10 @@ mod tests {
 
     #[gpui::test]
     fn switching_saved_connections_survives_failures(cx: &mut TestAppContext) {
-        let window = new_workspace(cx);
+        cx.update(gpui_component::init);
+        let (db, mut unserved) = DbHandle::unserved();
+        let window =
+            cx.add_window(|window, cx| Workspace::new(db, Settings::default(), None, window, cx));
         window
             .update(cx, |ws, _w, cx| {
                 for name in ["a", "b"] {
@@ -691,18 +707,13 @@ mod tests {
                 ws.connect_saved(0, cx);
             })
             .unwrap();
-        // Let the in-flight connect results land (they arrive from the real
-        // DB thread, so poll rather than a single run_until_parked).
-        for _ in 0..300 {
+        // Let the in-flight connects go out (each reads the keychain first) and
+        // their failures land.
+        for _ in 0..2 {
             cx.run_until_parked();
-            let failed = window
-                .update(cx, |ws, _w, _cx| ws.status.starts_with("Connection failed"))
-                .unwrap();
-            if failed {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            unserved.refuse_all();
         }
+        cx.run_until_parked();
         window
             .update(cx, |ws, _w, cx| {
                 assert!(ws.conn.is_none());

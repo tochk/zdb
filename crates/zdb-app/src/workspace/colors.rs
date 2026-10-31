@@ -1,7 +1,7 @@
 //! Chrome colors pulled from the active gpui-component theme.
 
-use gpui::{App, Hsla};
-use gpui_component::ActiveTheme;
+use gpui::{rgb, rgba, App, Hsla};
+use gpui_component::{ActiveTheme, Theme, ThemeMode};
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) struct Colors {
@@ -24,6 +24,31 @@ pub(crate) struct Colors {
     /// Result-grid rule; same token the table widget uses for its row lines, so
     /// our column separators match them.
     pub(crate) grid: Hsla,
+}
+
+/// Switch the app's theme. The stock themes' `secondary` is too light for our
+/// chrome (it's the title bar, toolbars and panel headers, and the default
+/// button's fill): buttons would stand out as boxes, so it stays one step off the
+/// background.
+pub(crate) fn change_theme(mode: ThemeMode, cx: &mut App) {
+    Theme::change(mode, None, cx);
+    let (base, hover, active) = if mode.is_dark() {
+        (0x171717, 0x1a1a1a, 0x262626)
+    } else {
+        (0xf5f5f5, 0xf0f0f0, 0xe5e5e5)
+    };
+    Theme::update(cx, |theme| {
+        theme.secondary = rgb(base).into();
+        theme.secondary_hover = rgb(hover).into();
+        theme.secondary_active = rgb(active).into();
+        theme.button_secondary = rgb(base).into();
+        theme.button_secondary_hover = rgb(hover).into();
+        theme.button_secondary_active = rgb(active).into();
+        // Zebra rows: the stock dark theme no longer has them.
+        if mode.is_dark() {
+            theme.table_even = rgba(0x171717cc).into();
+        }
+    });
 }
 
 pub(crate) fn palette(cx: &App) -> Colors {
@@ -50,7 +75,6 @@ pub(crate) fn palette(cx: &App) -> Colors {
 mod tests {
     use super::*;
     use gpui::TestAppContext;
-    use gpui_component::{Theme, ThemeMode};
 
     #[gpui::test]
     fn theme_switch_changes_palette(cx: &mut TestAppContext) {

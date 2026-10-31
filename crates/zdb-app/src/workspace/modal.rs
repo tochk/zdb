@@ -77,7 +77,7 @@ impl Workspace {
             // focus the dialog itself was holding.
             if inside || window.focused(cx).is_none() {
                 if let Some(handle) = restore.and_then(|h| h.upgrade()) {
-                    handle.focus(window);
+                    handle.focus(window, cx);
                 }
             }
             return;
@@ -93,9 +93,12 @@ impl Workspace {
         if self.is_modal(Modal::Palette)
             && window.root::<gpui_component::Root>().flatten().is_some()
         {
-            self.palette_input.read(cx).focus_handle(cx).focus(window);
+            self.palette_input
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
         } else {
-            self.modal_focus.panel.focus(window);
+            self.modal_focus.panel.focus(window, cx);
         }
     }
 
@@ -109,25 +112,25 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let step = |window: &mut Window| {
+        let step = |window: &mut Window, cx: &mut Context<Self>| {
             if forward {
-                window.focus_next()
+                window.focus_next(cx)
             } else {
-                window.focus_prev()
+                window.focus_prev(cx)
             }
         };
         if self.modal_open() {
             for _ in 0..MAX_TAB_STEPS {
-                step(window);
+                step(window, cx);
                 if self.modal_focus.panel.contains_focused(window, cx) {
                     return;
                 }
             }
             // Nothing in it takes focus: keep the keyboard on the panel.
-            self.modal_focus.panel.focus(window);
+            self.modal_focus.panel.focus(window, cx);
             return;
         }
-        step(window);
+        step(window, cx);
         // Tabbing into the grid puts the cursor on a cell, so there's
         // something to see (and to move from).
         if let Some((id, true)) = self

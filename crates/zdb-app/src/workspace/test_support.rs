@@ -5,7 +5,7 @@ use gpui::TestAppContext;
 
 pub(super) fn new_workspace(cx: &mut TestAppContext) -> gpui::WindowHandle<Workspace> {
     cx.update(|cx| gpui_component::init(cx));
-    let db = DbHandle::spawn();
+    let db = DbHandle::idle();
     cx.add_window(|window, cx| Workspace::new(db, Settings::default(), None, window, cx))
 }
 

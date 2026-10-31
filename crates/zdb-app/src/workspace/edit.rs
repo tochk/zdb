@@ -3,6 +3,12 @@
 
 use super::*;
 
+/// A value the grid's one-line editor can't hold (a line break) or show in any
+/// useful way (longer than the grid displays): it's edited in the value pane.
+fn wants_value_pane(text: &str) -> bool {
+    text.contains('\n') || text.len() > super::grid::CELL_MAX_CHARS
+}
+
 impl Workspace {
     /// Put the cell cursor on `(row, col)` (result-column space, clamped to the
     /// result). The one place the cursor moves: it keeps `current_row` and the
@@ -108,21 +114,60 @@ impl Workspace {
                 _ => String::new(),
             });
             tab.editing = Some((row, col));
-            tab.editing_multi = text.contains('\n');
+            tab.editing_multi = wants_value_pane(&text);
             text
         };
-        // A multi-line value goes to the strip editor under the grid: the inline
-        // input is single-line, and gpui's text shaper PANICS on a newline
-        // ("text argument should not contain newlines"). Either way the editor
-        // gets the value in full — nothing is truncated for editing.
-        let input = if self.tab(tab_id).is_some_and(|t| t.editing_multi) {
-            self.cell_multi.clone()
+        // A multi-line value goes to the pane under the grid: the inline input is
+        // single-line, and gpui's text shaper PANICS on a newline ("text argument
+        // should not contain newlines"). Either way the editor gets the value in
+        // full — nothing is truncated for editing.
+        let handle = if self.tab(tab_id).is_some_and(|t| t.editing_multi) {
+            self.cell_multi
+                .update(cx, |inp, cx| inp.set_value(text, window, cx));
+            self.cell_multi.read(cx).focus_handle(cx)
         } else {
-            self.cell_input.clone()
+            self.cell_input
+                .update(cx, |inp, cx| inp.set_value(text, window, cx));
+            self.cell_input.read(cx).focus_handle(cx)
         };
-        input.update(cx, |inp, cx| inp.set_value(text, window, cx));
-        let handle = input.read(cx).focus_handle(cx);
-        handle.focus(window);
+        handle.focus(window, cx);
+        self.reveal_value_row(tab_id, cx);
+        cx.notify();
+    }
+
+    /// Keep the row being edited in the value pane in view: the pane takes its
+    /// height from the grid, which could leave the row hidden behind it. The
+    /// widget applies the scroll at its next layout, so against the new height.
+    pub(super) fn reveal_value_row(&mut self, tab_id: u64, cx: &mut Context<Self>) {
+        let Some(tab) = self.tab(tab_id).filter(|t| t.editing_multi) else {
+            return;
+        };
+        if let Some((row, _)) = tab.editing {
+            tab.table.update(cx, |ts, cx| ts.scroll_to_row(row, cx));
+        }
+    }
+
+    /// Move the cell being edited inline to the value pane, with what's typed
+    /// so far — the way to give a value its first line break.
+    pub(super) fn expand_cell_edit(
+        &mut self,
+        tab_id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        if tab.editing.is_none() || std::mem::replace(&mut tab.editing_multi, true) {
+            return;
+        }
+        let inline = self.cell_input.read(cx);
+        let (text, cursor) = (inline.value().to_string(), inline.cursor_position());
+        self.cell_multi.update(cx, |inp, cx| {
+            inp.set_value(text, window, cx);
+            inp.set_cursor_position(cursor, window, cx);
+        });
+        self.reveal_value_row(tab_id, cx);
         cx.notify();
     }
 

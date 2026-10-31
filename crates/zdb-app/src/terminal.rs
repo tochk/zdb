@@ -1,12 +1,14 @@
 //! Embedded terminal: the shell picked in Settings (else the platform's
-//! default, `default_shell`) in a PTY, wrapped in a `gpui_terminal::TerminalView`
-//! painted in the app's theme. Generic terminal — the user can run anything
-//! (e.g. `claude`, `psql`); no DB context is injected.
+//! default, `default_shell`) in a PTY, shown by `TerminalView` in the app's
+//! theme. Generic terminal — the user can run anything (e.g. `claude`, `psql`);
+//! no DB context is injected.
 
+use crate::terminal_view::TerminalView;
+use alacritty_terminal::term::color::Colors;
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb};
 use anyhow::{bail, Result};
 use futures_channel::oneshot;
-use gpui::{px, AppContext, Context, Edges, Entity, Hsla, Rgba, SharedString};
-use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
+use gpui::{AppContext, Context, Entity, Hsla, Rgba, SharedString};
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,9 +21,6 @@ pub struct Terminal {
     pub view: Entity<TerminalView>,
     /// The command line it runs, for the panel header.
     pub command: String,
-    /// The shell's input, shared with the view (which types into it) so a
-    /// paste can write to it too.
-    input: SharedWriter,
     killer: Box<dyn ChildKiller + Send + Sync>,
     _master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
 }
@@ -33,21 +32,9 @@ impl Drop for Terminal {
 }
 
 impl Terminal {
-    /// Paste `text` as typed input. Line breaks become the CR the Enter key
-    /// sends, so a pasted multi-line command reads as lines to the shell.
-    pub fn paste(&self, text: &str) {
-        let text = text.replace("\r\n", "\r").replace('\n', "\r");
-        let mut input = self.input.clone();
-        let _ = input.write_all(text.as_bytes());
-        let _ = input.flush();
-    }
-
     /// Repaint in another palette / font (the theme was switched).
     pub fn restyle(&self, style: TerminalStyle, cx: &mut gpui::App) {
-        self.view.update(cx, |view, cx| {
-            let config = style.apply(view.config().clone());
-            view.update_config(config, cx);
-        });
+        self.view.update(cx, |view, cx| view.set_style(style, cx));
     }
 }
 
@@ -99,7 +86,8 @@ impl<R: Read> Read for CursorReport<R> {
     }
 }
 
-/// The PTY's writer behind a shared lock (it can only be taken once).
+/// The PTY's writer behind a shared lock (it can only be taken once): the view
+/// types into it, `CursorReport` answers through it.
 #[derive(Clone)]
 struct SharedWriter(Arc<Mutex<Box<dyn Write + Send>>>);
 
@@ -120,9 +108,11 @@ fn poisoned() -> std::io::Error {
 /// How the terminal looks: colors from the app theme, the theme's code font.
 #[derive(Clone)]
 pub struct TerminalStyle {
-    pub colors: ColorPalette,
+    pub colors: Palette,
     pub font_family: SharedString,
     pub font_size: gpui::Pixels,
+    /// What's behind selected text.
+    pub selection: Hsla,
 }
 
 impl TerminalStyle {
@@ -131,70 +121,115 @@ impl TerminalStyle {
         use gpui_component::ActiveTheme;
         let t = cx.theme();
         Self {
-            colors: palette(t.mode.is_dark(), t.sidebar, t.foreground, t.caret),
+            colors: Palette::new(t.mode.is_dark(), t.sidebar, t.foreground, t.caret),
             font_family: t.mono_font_family.clone(),
             font_size: t.mono_font_size,
-        }
-    }
-
-    fn apply(&self, config: TerminalConfig) -> TerminalConfig {
-        TerminalConfig {
-            font_family: self.font_family.to_string(),
-            font_size: self.font_size,
-            colors: self.colors.clone(),
-            ..config
+            selection: t.selection,
         }
     }
 }
 
-/// A 16-color ANSI palette that reads on the theme's background: One Dark /
-/// One Light (Zed's defaults). In the light one "white" is a mid grey and
-/// "bright white" near-black — real whites would vanish on the light ground —
-/// and the yellows are darkened for the same reason.
-fn palette(dark: bool, bg: Hsla, fg: Hsla, cursor: Hsla) -> ColorPalette {
-    let ansi: [u32; 16] = if dark {
-        [
-            0x282c34, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xdcdfe4,
-            0x5c6370, 0xea858b, 0xaad581, 0xffd885, 0x85c1ff, 0xd398eb, 0x6ed5de, 0xfafafa,
-        ]
-    } else {
-        [
-            0x383a42, 0xca1243, 0x50a14f, 0xc18401, 0x4078f2, 0xa626a4, 0x0184bc, 0x7f848e,
-            0xa0a1a7, 0xe45649, 0x3d8b3c, 0x986801, 0x2a62d8, 0x8c1f8a, 0x0b6e99, 0x2b2d33,
-        ]
-    };
-    let rgb = |c: u32| ((c >> 16) as u8, (c >> 8) as u8, c as u8);
-    let [black, red, green, yellow, blue, magenta, cyan, white, b_black, b_red, b_green, b_yellow, b_blue, b_magenta, b_cyan, b_white] =
-        ansi.map(rgb);
-    let (bg, fg, cursor) = (hsla_rgb(bg), hsla_rgb(fg), hsla_rgb(cursor));
-    ColorPalette::builder()
-        .background(bg.0, bg.1, bg.2)
-        .foreground(fg.0, fg.1, fg.2)
-        .cursor(cursor.0, cursor.1, cursor.2)
-        .black(black.0, black.1, black.2)
-        .red(red.0, red.1, red.2)
-        .green(green.0, green.1, green.2)
-        .yellow(yellow.0, yellow.1, yellow.2)
-        .blue(blue.0, blue.1, blue.2)
-        .magenta(magenta.0, magenta.1, magenta.2)
-        .cyan(cyan.0, cyan.1, cyan.2)
-        .white(white.0, white.1, white.2)
-        .bright_black(b_black.0, b_black.1, b_black.2)
-        .bright_red(b_red.0, b_red.1, b_red.2)
-        .bright_green(b_green.0, b_green.1, b_green.2)
-        .bright_yellow(b_yellow.0, b_yellow.1, b_yellow.2)
-        .bright_blue(b_blue.0, b_blue.1, b_blue.2)
-        .bright_magenta(b_magenta.0, b_magenta.1, b_magenta.2)
-        .bright_cyan(b_cyan.0, b_cyan.1, b_cyan.2)
-        .bright_white(b_white.0, b_white.1, b_white.2)
-        .build()
+/// The terminal's colors. The 16 ANSI ones read on the theme's background: One
+/// Dark / One Light (Zed's defaults). In the light one "white" is a mid grey and
+/// "bright white" near-black — real whites would vanish on a light ground — and
+/// the yellows are darkened for the same reason.
+#[derive(Clone)]
+pub struct Palette {
+    pub background: Hsla,
+    pub foreground: Hsla,
+    pub cursor: Hsla,
+    ansi: [Hsla; 16],
 }
 
-/// A theme color as 8-bit RGB (alpha dropped).
-fn hsla_rgb(c: Hsla) -> (u8, u8, u8) {
-    let c = Rgba::from(c);
-    let byte = |v: f32| (v.clamp(0., 1.) * 255.).round() as u8;
-    (byte(c.r), byte(c.g), byte(c.b))
+impl Palette {
+    fn new(dark: bool, background: Hsla, foreground: Hsla, cursor: Hsla) -> Self {
+        let ansi: [u32; 16] = if dark {
+            [
+                0x282c34, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xdcdfe4,
+                0x5c6370, 0xea858b, 0xaad581, 0xffd885, 0x85c1ff, 0xd398eb, 0x6ed5de, 0xfafafa,
+            ]
+        } else {
+            [
+                0x383a42, 0xca1243, 0x50a14f, 0xc18401, 0x4078f2, 0xa626a4, 0x0184bc, 0x7f848e,
+                0xa0a1a7, 0xe45649, 0x3d8b3c, 0x986801, 0x2a62d8, 0x8c1f8a, 0x0b6e99, 0x2b2d33,
+            ]
+        };
+        Self {
+            background,
+            foreground,
+            cursor,
+            ansi: ansi.map(|c| gpui::rgb(c).into()),
+        }
+    }
+
+    /// A cell's color: what a program set with OSC 4 / 10 / 11 first, then ours.
+    pub fn resolve(&self, color: Color, colors: &Colors) -> Hsla {
+        match color {
+            Color::Spec(rgb) => rgb_hsla(rgb),
+            Color::Indexed(ix) => match colors[ix as usize] {
+                Some(rgb) => rgb_hsla(rgb),
+                None => self.indexed(ix),
+            },
+            Color::Named(named) => match colors[named] {
+                Some(rgb) => rgb_hsla(rgb),
+                None => self.named(named),
+            },
+        }
+    }
+
+    fn named(&self, named: NamedColor) -> Hsla {
+        let dim = |mut c: Hsla| {
+            c.l *= 0.7;
+            c
+        };
+        match named as usize {
+            ix @ 0..=15 => self.ansi[ix],
+            _ => match named {
+                NamedColor::Background => self.background,
+                NamedColor::Cursor => self.cursor,
+                NamedColor::DimForeground => dim(self.foreground),
+                NamedColor::DimBlack => dim(self.ansi[0]),
+                NamedColor::DimRed => dim(self.ansi[1]),
+                NamedColor::DimGreen => dim(self.ansi[2]),
+                NamedColor::DimYellow => dim(self.ansi[3]),
+                NamedColor::DimBlue => dim(self.ansi[4]),
+                NamedColor::DimMagenta => dim(self.ansi[5]),
+                NamedColor::DimCyan => dim(self.ansi[6]),
+                NamedColor::DimWhite => dim(self.ansi[7]),
+                _ => self.foreground,
+            },
+        }
+    }
+
+    /// The 256-color table: ANSI, then a 6×6×6 cube, then 24 greys.
+    fn indexed(&self, ix: u8) -> Hsla {
+        let level = |n: u8| if n == 0 { 0 } else { 55 + n * 40 };
+        match ix {
+            0..=15 => self.ansi[ix as usize],
+            16..=231 => {
+                let n = ix - 16;
+                rgb_hsla(Rgb {
+                    r: level(n / 36),
+                    g: level(n / 6 % 6),
+                    b: level(n % 6),
+                })
+            }
+            232..=255 => {
+                let v = 8 + (ix - 232) * 10;
+                rgb_hsla(Rgb { r: v, g: v, b: v })
+            }
+        }
+    }
+}
+
+fn rgb_hsla(c: Rgb) -> Hsla {
+    Rgba {
+        r: f32::from(c.r) / 255.,
+        g: f32::from(c.g) / 255.,
+        b: f32::from(c.b) / 255.,
+        a: 1.,
+    }
+    .into()
 }
 
 /// Spawn `command` (a command line; empty = `default_shell()`) in a new PTY
@@ -260,20 +295,12 @@ pub fn spawn<V: 'static>(
         }
     };
 
-    let config = style.apply(TerminalConfig {
-        line_height_multiplier: 1.2,
-        padding: Edges::all(px(6.0)),
-        ..Default::default()
-    });
-    let view_input = input.clone();
-    let view =
-        cx.new(|cx| TerminalView::new(view_input, reader, config, cx).with_resize_callback(resize));
+    let view = cx.new(|cx| TerminalView::new(input, reader, resize, style, cx));
 
     Ok((
         Terminal {
             view,
             command,
-            input,
             killer,
             _master: master,
         },
@@ -473,14 +500,38 @@ mod tests {
     }
 
     #[test]
-    fn theme_colors_carry_over() {
-        let bg = gpui::rgb(0x102030);
-        let p = palette(true, bg.into(), gpui::white(), gpui::white());
-        let back = hsla_rgb(p.background());
-        assert!(back.0.abs_diff(0x10) <= 1 && back.1.abs_diff(0x20) <= 1);
-        assert!(back.2.abs_diff(0x30) <= 1);
+    fn colors_resolve() {
+        let bg: Hsla = gpui::rgb(0x102030).into();
+        let dark = Palette::new(true, bg, gpui::white(), gpui::white());
+        let colors = Colors::default();
+        assert_eq!(
+            dark.resolve(Color::Named(NamedColor::Background), &colors),
+            bg
+        );
+        let spec = Rgb { r: 1, g: 2, b: 3 };
+        assert_eq!(dark.resolve(Color::Spec(spec), &colors), rgb_hsla(spec));
+        // The cube's corners and the grey ramp's ends.
+        let at = |ix| dark.resolve(Color::Indexed(ix), &colors);
+        assert_eq!(at(16), rgb_hsla(Rgb { r: 0, g: 0, b: 0 }));
+        assert_eq!(
+            at(231),
+            rgb_hsla(Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            })
+        );
+        assert_eq!(at(232), rgb_hsla(Rgb { r: 8, g: 8, b: 8 }));
+        assert_eq!(
+            at(255),
+            rgb_hsla(Rgb {
+                r: 238,
+                g: 238,
+                b: 238
+            })
+        );
         // Light and dark differ where it matters for legibility.
-        let light = palette(false, gpui::white(), gpui::black(), gpui::black());
-        assert_ne!(light.ansi_colors()[7], p.ansi_colors()[7]);
+        let light = Palette::new(false, gpui::white(), gpui::black(), gpui::black());
+        assert_ne!(light.ansi[7], dark.ansi[7]);
     }
 }

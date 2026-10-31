@@ -56,6 +56,7 @@ actions!(
         GridNextCell,
         GridPrevCell,
         GridEdit,
+        GridEditPane,
         GridCopyCell,
         TreeUp,
         TreeDown,
@@ -116,10 +117,6 @@ pub fn bind_nav_keys(cx: &mut App) {
         KeyBinding::new("tab", NoAction, Some("Terminal")),
         KeyBinding::new("shift-tab", NoAction, Some("Terminal")),
         KeyBinding::new("escape", NoAction, Some("Terminal")),
-        // Paste: Ctrl+V itself is a shell key (PowerShell pastes on it itself).
-        KeyBinding::new("ctrl-shift-v", TerminalPaste, Some("Terminal")),
-        KeyBinding::new("cmd-shift-v", TerminalPaste, Some("Terminal")),
-        KeyBinding::new("cmd-v", TerminalPaste, Some("Terminal")),
         // Grid: the keys the Table widget binds itself. Its `escape` would
         // clear the row highlight out from under the cursor.
         KeyBinding::new("up", GridUp, TABLE),
@@ -140,6 +137,8 @@ pub fn bind_nav_keys(cx: &mut App) {
         // doesn't walk the cells; the arrows do that.
         KeyBinding::new("enter", GridEdit, GRID),
         KeyBinding::new("f2", GridEdit, GRID),
+        KeyBinding::new("shift-enter", GridEditPane, GRID),
+        KeyBinding::new("shift-enter", GridEditPane, GRID_EDIT),
         KeyBinding::new("ctrl-c", GridCopyCell, GRID),
         KeyBinding::new("cmd-c", GridCopyCell, GRID),
         // While the inline input is open: it declines `tab` (single-line), so
@@ -177,6 +176,26 @@ pub fn bind_nav_keys(cx: &mut App) {
         KeyBinding::new("/", TreeFocusFilter, TREE_VIM),
         KeyBinding::new("down", FilterToTree, Some("TreeFilter")),
     ];
+    // Zed's clipboard keys in the terminal, per OS because a menu shows an
+    // action's last-bound keys. Ctrl+C / Ctrl+V themselves are shell keys
+    // (interrupt; PowerShell pastes on it itself).
+    const TERMINAL: Option<&str> = Some("Terminal");
+    if cfg!(target_os = "macos") {
+        keys.extend([
+            KeyBinding::new("cmd-c", TerminalCopy, TERMINAL),
+            KeyBinding::new("cmd-shift-v", TerminalPaste, TERMINAL),
+            KeyBinding::new("cmd-v", TerminalPaste, TERMINAL),
+            KeyBinding::new("cmd-a", TerminalSelectAll, TERMINAL),
+        ]);
+    } else {
+        keys.extend([
+            KeyBinding::new("ctrl-insert", TerminalCopy, TERMINAL),
+            KeyBinding::new("ctrl-shift-c", TerminalCopy, TERMINAL),
+            KeyBinding::new("shift-insert", TerminalPaste, TERMINAL),
+            KeyBinding::new("ctrl-shift-v", TerminalPaste, TERMINAL),
+            KeyBinding::new("ctrl-shift-a", TerminalSelectAll, TERMINAL),
+        ]);
+    }
     // Arrows + Enter in the tree, twice: `"SchemaTree"` is our wrapper (focused
     // from the keyboard), `"Tree"` the widget inside it (focused by a click),
     // whose own arrow bindings would otherwise win there.
@@ -207,7 +226,9 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
             ("Settings", "Ctrl+,"),
             ("Connections", "Ctrl+Shift+O"),
             ("Terminal", "Ctrl+`"),
+            ("Copy in the terminal", "Ctrl+Shift+C"),
             ("Paste in the terminal", "Ctrl+Shift+V"),
+            ("Select all in the terminal", "Ctrl+Shift+A"),
             ("Close dialog / cancel", "Esc"),
         ],
     ),
@@ -248,7 +269,8 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
             ("Save and move down", "Enter"),
             ("Save and move sideways", "Tab / Shift+Tab"),
             ("Discard edit", "Esc"),
-            ("Save multi-line value", "Ctrl+Enter"),
+            ("Edit in the value pane", "Shift+Enter"),
+            ("Save in the value pane", "Ctrl+Enter"),
         ],
     ),
     (
@@ -457,7 +479,7 @@ impl Workspace {
         if self.conn.is_none() {
             return;
         }
-        self.tree.focus.focus(window);
+        self.tree.focus.focus(window, cx);
         if self.tree.state.read(cx).selected_index().is_none() {
             self.tree_move(TreeMove::First, cx);
         }
@@ -476,19 +498,19 @@ impl Workspace {
         if cursor.is_none() {
             self.set_cursor(id, 0, 0, cx);
         }
-        handle.focus(window);
+        handle.focus(window, cx);
         cx.notify();
     }
 
     /// Give the grid focus on the next render — for the paths that end a cell
     /// edit without a `&mut Window` at hand (the input's own events). The input
     /// unmounts with the edit, and focus would otherwise fall off the grid.
-    pub(super) fn flush_pending_focus(&mut self, window: &mut Window) {
+    pub(super) fn flush_pending_focus(&mut self, window: &mut Window, cx: &mut App) {
         if !std::mem::take(&mut self.pending_grid_focus) {
             return;
         }
         if let Some(tab) = self.active_tab().filter(|t| t.plan.is_none()) {
-            tab.grid_focus.focus(window);
+            tab.grid_focus.focus(window, cx);
         }
     }
 
@@ -671,7 +693,10 @@ impl Workspace {
     /// highlighted item, as Enter does; otherwise the key goes on to indent or
     /// to the next field.
     pub(super) fn accept_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let enter = gpui_component::input::Enter { secondary: false };
+        let enter = gpui_component::input::Enter {
+            secondary: false,
+            shift: false,
+        };
         if !self.completion_menu_action(Box::new(enter), window, cx) {
             cx.propagate();
         }
@@ -696,7 +721,7 @@ impl Workspace {
         });
         let handled = focused.is_some_and(|input| {
             input.update(cx, |state, cx| {
-                state.handle_action_for_context_menu(action, window, cx)
+                state.route_overlay_action(action, window, cx)
             })
         });
         // The menu marks the event to propagate even when it handles it; the
@@ -713,6 +738,17 @@ impl Workspace {
             return;
         };
         self.begin_edit(id, row, col, window, cx);
+    }
+
+    /// Shift+Enter: edit the cell in the value pane — the cursor's cell, or the
+    /// one being edited inline, which moves there with what's typed so far.
+    pub(super) fn grid_edit_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_tab().is_some_and(|t| t.editing.is_none()) {
+            self.grid_edit(window, cx);
+        }
+        if let Some(id) = self.active_id() {
+            self.expand_cell_edit(id, window, cx);
+        }
     }
 
     /// Copy the cursor cell's raw value (never the truncated display text).
@@ -860,7 +896,7 @@ impl Workspace {
         self.tree.filter.clear();
         self.tree
             .filter_input
-            .update(cx, |i, cx| i.set_value("", window, cx));
+            .update(cx, |i, cx| i.replace_all("", window, cx));
         self.sync_tree(cx);
     }
 
@@ -901,7 +937,7 @@ impl Workspace {
             cx.notify();
         })
         .detach();
-        menu.focus_handle(cx).focus(window);
+        menu.focus_handle(cx).focus(window, cx);
         self.tree.menu = Some((menu, at));
         cx.notify();
     }
@@ -1042,6 +1078,70 @@ mod tests {
                 // Out-of-range requests are clamped, never stored.
                 ws.set_cursor(id, 99, 99, cx);
                 assert_eq!(ws.tab(id).unwrap().cursor, Some((2, 1)));
+            })
+            .unwrap();
+    }
+
+    /// What the one-line editor can't hold or show opens in the value pane.
+    #[gpui::test]
+    fn big_values_open_in_the_value_pane(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_grid(ws, window, cx);
+                let long = "x".repeat(grid::CELL_MAX_CHARS + 1);
+                for (col, text) in [(0, "two\nlines".to_string()), (1, long)] {
+                    ws.tab_mut(id).unwrap().rows[0][col] = CellValue::Text(text.clone());
+                    ws.begin_edit(id, 0, col, window, cx);
+                    assert!(ws.tab(id).unwrap().editing_multi, "{text}");
+                    assert_eq!(ws.cell_multi.read(cx).value().as_ref(), text);
+                    ws.cancel_cell_edit(cx);
+                }
+                ws.begin_edit(id, 1, 0, window, cx);
+                assert!(!ws.tab(id).unwrap().editing_multi);
+            })
+            .unwrap();
+    }
+
+    /// Shift+Enter moves an inline edit to the pane, what's typed included; the
+    /// inline input losing focus there doesn't stage it.
+    #[gpui::test]
+    fn shift_enter_moves_an_edit_to_the_value_pane(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                let id = seed_grid(ws, window, cx);
+                ws.set_cursor(id, 0, 1, cx);
+                ws.grid_edit(window, cx);
+                ws.cell_input
+                    .update(cx, |i, cx| i.set_value("typed", window, cx));
+                ws.grid_edit_pane(window, cx);
+                let tab = ws.tab(id).unwrap();
+                assert!(tab.editing_multi);
+                assert_eq!(tab.editing, Some((0, 1)));
+                assert_eq!(ws.cell_multi.read(cx).value().as_ref(), "typed");
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, window, cx| {
+                let id = ws.active_id().unwrap();
+                assert_eq!(ws.tab(id).unwrap().editing, Some((0, 1)));
+                assert!(ws.tab(id).unwrap().pending.is_empty());
+                ws.cell_multi
+                    .update(cx, |i, cx| i.set_value("typed\nmore", window, cx));
+                ws.commit_cell_edit(cx);
+                let tab = ws.tab(id).unwrap();
+                assert_eq!(tab.editing, None);
+                assert_eq!(tab.pending.len(), 1);
+                assert_eq!(tab.rows[0][1], CellValue::Text("typed\nmore".into()));
+
+                // From the grid, with no edit going: the cursor's cell.
+                ws.set_cursor(id, 1, 0, cx);
+                ws.grid_edit_pane(window, cx);
+                let tab = ws.tab(id).unwrap();
+                assert!(tab.editing_multi);
+                assert_eq!(tab.editing, Some((1, 0)));
             })
             .unwrap();
     }
