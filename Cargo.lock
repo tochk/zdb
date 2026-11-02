@@ -8930,7 +8930,7 @@ dependencies = [
 
 [[package]]
 name = "zdb-app"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -8950,7 +8950,7 @@ dependencies = [
 
 [[package]]
 name = "zdb-config"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -8962,7 +8962,7 @@ dependencies = [
 
 [[package]]
 name = "zdb-db"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "futures-util",
