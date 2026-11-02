@@ -805,8 +805,16 @@ The WSL host can run Windows exes directly:
     bound to `NoAction` in the `"Terminal"` context (`TerminalView`'s root): `NoAction`
     masks every lower binding, so they reach the shell (completion, vi) instead of moving
     focus. Clipboard keys are per OS in `bind_nav_keys`, as a menu shows an action's
-    LAST-bound keys (it said "Win+C" with `cmd-c` bound after `ctrl-shift-c`). Plain
-    Ctrl+C / Ctrl+V stay shell keys (PSReadLine pastes on Ctrl+V itself).
+    LAST-bound keys (it said "Win+C" with `cmd-c` bound after `ctrl-shift-c`). Off macOS
+    Ctrl+C = `TerminalCopyOrInterrupt` (the user's call, Windows Terminal's rule): with a
+    selection it copies and DROPS it (so the next Ctrl+C interrupts), without one the handler
+    `cx.propagate()`s and `key_down` sends ^C. Ctrl+V pastes (no longer reaches the shell:
+    bash's quoted-insert, vim's block select). Ctrl+Shift+C stays a plain copy (no interrupt).
+    Both are a Settings checkbox (`Settings.terminal_ctrl_clipboard`, default on, hidden on
+    macOS): their bindings ask for `"Terminal && ctrl_clipboard"`, a context identifier
+    `TerminalView` adds only while it's on (`set_ctrl_clipboard`, live). Off, they're plain
+    shell keys again — e.g. PowerShell's own Ctrl+V paste, which keeps a multi-line paste as
+    one block (untested whether PSReadLine asks for bracketed paste).
   - **Dialogs own mouse + keyboard** (`modal.rs`): one `Modal` at a time (opening one
     replaces another); the backdrop `occlude()`s the panes (a press on it closes) and
     starts BELOW the title bar so the window stays movable/closable; the panel tracks a
@@ -831,7 +839,7 @@ The WSL host can run Windows exes directly:
   - Behaviour copies Zed: drag / double / triple click =
     `SelectionType::{Simple,Semantic,Lines}`, Shift+click extends, a drag past the top /
     bottom scrolls (`Geometry::drag_scroll`, on pointer moves only), Ctrl+Shift+C or
-    Ctrl+Insert / Cmd+C copy and KEEP the selection, input drops it and scrolls to the
+    Ctrl+Insert / Cmd+C copy and KEEP the selection (Ctrl+C: see the keyboard notes), input drops it and scrolls to the
     prompt, right click = Copy / Paste / Select All, X11 / Wayland primary selection +
     middle-click paste (Linux), OSC 52 writes the clipboard. A program with mouse tracking
     gets the mouse (SGR or legacy encoding, `mouse_report`) unless Shift is held; in the

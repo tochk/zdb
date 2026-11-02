@@ -1940,6 +1940,18 @@ impl Workspace {
                 self.render_pool_size(c, cx).into_any_element(),
             ))
             .child(self.render_shell_setting(c, cx))
+            // macOS copies and pastes with Cmd; Ctrl+C / Ctrl+V are the shell's.
+            .when(!cfg!(target_os = "macos"), |d| {
+                d.child(setting_row(
+                    "Ctrl+C / Ctrl+V copy and paste in the terminal (off: they go to the shell)",
+                    Checkbox::new("terminal-ctrl-clipboard")
+                        .checked(self.settings.terminal_ctrl_clipboard)
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.set_terminal_ctrl_clipboard(*on, cx)
+                        }))
+                        .into_any_element(),
+                ))
+            })
             .child(setting_row(
                 "Keyboard shortcuts",
                 Button::new("show-shortcuts")

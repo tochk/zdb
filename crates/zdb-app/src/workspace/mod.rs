@@ -67,6 +67,7 @@ actions!(
         ClosePalette,
         ToggleTerminal,
         TerminalCopy,
+        TerminalCopyOrInterrupt,
         TerminalPaste,
         TerminalSelectAll,
         ToggleConnections,
@@ -542,6 +543,9 @@ impl Workspace {
                         .ok();
                 })
                 .detach();
+                let ctrl_clipboard = self.settings.terminal_ctrl_clipboard;
+                term.view
+                    .update(cx, |view, cx| view.set_ctrl_clipboard(ctrl_clipboard, cx));
                 let focus = term.view.read(cx).focus_handle().clone();
                 focus.focus(window, cx);
                 self.status = format!("Terminal: {}", term.command);

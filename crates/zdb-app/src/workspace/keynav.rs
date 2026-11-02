@@ -176,10 +176,13 @@ pub fn bind_nav_keys(cx: &mut App) {
         KeyBinding::new("/", TreeFocusFilter, TREE_VIM),
         KeyBinding::new("down", FilterToTree, Some("TreeFilter")),
     ];
-    // Zed's clipboard keys in the terminal, per OS because a menu shows an
-    // action's last-bound keys. Ctrl+C / Ctrl+V themselves are shell keys
-    // (interrupt; PowerShell pastes on it itself).
+    // Clipboard keys in the terminal, per OS because a menu shows an action's
+    // last-bound keys. Off macOS Ctrl+C copies when there's a selection and is
+    // the shell's interrupt otherwise (Windows Terminal's rule), Ctrl+V pastes;
+    // Zed's Ctrl+Shift / Insert chords work too. Settings can hand Ctrl+C /
+    // Ctrl+V back to the shell: the view drops `ctrl_clipboard` from its context.
     const TERMINAL: Option<&str> = Some("Terminal");
+    const CTRL_CLIPBOARD: Option<&str> = Some("Terminal && ctrl_clipboard");
     if cfg!(target_os = "macos") {
         keys.extend([
             KeyBinding::new("cmd-c", TerminalCopy, TERMINAL),
@@ -191,8 +194,10 @@ pub fn bind_nav_keys(cx: &mut App) {
         keys.extend([
             KeyBinding::new("ctrl-insert", TerminalCopy, TERMINAL),
             KeyBinding::new("ctrl-shift-c", TerminalCopy, TERMINAL),
+            KeyBinding::new("ctrl-c", TerminalCopyOrInterrupt, CTRL_CLIPBOARD),
             KeyBinding::new("shift-insert", TerminalPaste, TERMINAL),
             KeyBinding::new("ctrl-shift-v", TerminalPaste, TERMINAL),
+            KeyBinding::new("ctrl-v", TerminalPaste, CTRL_CLIPBOARD),
             KeyBinding::new("ctrl-shift-a", TerminalSelectAll, TERMINAL),
         ]);
     }
@@ -226,8 +231,11 @@ pub(super) const SHORTCUTS: &[ShortcutSection] = &[
             ("Settings", "Ctrl+,"),
             ("Connections", "Ctrl+Shift+O"),
             ("Terminal", "Ctrl+`"),
-            ("Copy in the terminal", "Ctrl+Shift+C"),
-            ("Paste in the terminal", "Ctrl+Shift+V"),
+            (
+                "Copy in the terminal",
+                "Ctrl+C with a selection / Ctrl+Shift+C",
+            ),
+            ("Paste in the terminal", "Ctrl+V / Ctrl+Shift+V"),
             ("Select all in the terminal", "Ctrl+Shift+A"),
             ("Close dialog / cancel", "Esc"),
         ],
@@ -558,6 +566,16 @@ impl Workspace {
     pub(super) fn set_vim_navigation(&mut self, on: bool, cx: &mut Context<Self>) {
         self.settings.vim_navigation = on;
         self.save_settings();
+        cx.notify();
+    }
+
+    pub(super) fn set_terminal_ctrl_clipboard(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.settings.terminal_ctrl_clipboard = on;
+        self.save_settings();
+        if let Some(term) = &self.terminal {
+            term.view
+                .update(cx, |view, cx| view.set_ctrl_clipboard(on, cx));
+        }
         cx.notify();
     }
 

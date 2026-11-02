@@ -7,7 +7,7 @@
 //! paints its grid.
 
 use crate::terminal::TerminalStyle;
-use crate::workspace::{TerminalCopy, TerminalPaste, TerminalSelectAll};
+use crate::workspace::{TerminalCopy, TerminalCopyOrInterrupt, TerminalPaste, TerminalSelectAll};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
@@ -136,6 +136,8 @@ pub struct TerminalView {
     /// Wheel movement short of a whole line.
     scroll_rest: f32,
     menu: Option<(Entity<PopupMenu>, Point<Pixels>)>,
+    /// Ctrl+C / Ctrl+V copy and paste (Settings); off, they're the shell's.
+    ctrl_clipboard: bool,
     _reader: Task<()>,
 }
 
@@ -189,12 +191,20 @@ impl TerminalView {
             reported_cell: None,
             scroll_rest: 0.,
             menu: None,
+            ctrl_clipboard: true,
             _reader: reader,
         }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus
+    }
+
+    /// Whether Ctrl+C / Ctrl+V copy and paste (their bindings ask for the
+    /// `ctrl_clipboard` key context this sets) or go to the shell.
+    pub fn set_ctrl_clipboard(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.ctrl_clipboard = on;
+        cx.notify();
     }
 
     /// Repaint in another palette / font (the theme was switched).
@@ -259,6 +269,19 @@ impl TerminalView {
         if let Some(text) = self.selected_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+    }
+
+    /// Ctrl+C: copy the selection and drop it, as Windows Terminal does, so the
+    /// next Ctrl+C interrupts. False when nothing is selected: the key is the
+    /// shell's then.
+    fn copy_or_interrupt(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.selected_text().is_none() {
+            return false;
+        }
+        self.copy(cx);
+        self.term.borrow_mut().selection = None;
+        cx.notify();
+        true
     }
 
     fn paste(&mut self, cx: &mut Context<Self>) {
@@ -463,11 +486,19 @@ impl TerminalView {
 
     fn open_menu(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         let nothing_selected = self.selected_text().is_none();
+        let ctrl_copy = self.ctrl_clipboard && !cfg!(target_os = "macos");
         let focus = self.focus.clone();
         let menu = PopupMenu::build(window, cx, |menu, _, _| {
             // Dismissing hands focus back to the terminal.
+            // The action whose keys the menu should show: Cmd+C, Ctrl+C (when
+            // that copies), else Ctrl+Shift+C.
+            let copy: Box<dyn gpui::Action> = if ctrl_copy {
+                Box::new(TerminalCopyOrInterrupt)
+            } else {
+                Box::new(TerminalCopy)
+            };
             menu.action_context(focus)
-                .menu_with_disabled("Copy", Box::new(TerminalCopy), nothing_selected)
+                .menu_with_disabled("Copy", copy, nothing_selected)
                 .menu("Paste", Box::new(TerminalPaste))
                 .separator()
                 .menu("Select All", Box::new(TerminalSelectAll))
@@ -515,10 +546,20 @@ impl Render for TerminalView {
             .size_full()
             .track_focus(&self.focus)
             // Tab / Esc are shell keys here (see `bind_nav_keys`).
-            .key_context("Terminal")
+            .key_context(if self.ctrl_clipboard {
+                "Terminal ctrl_clipboard"
+            } else {
+                "Terminal"
+            })
             .cursor_text()
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(|this, _: &TerminalCopy, _, cx| this.copy(cx)))
+            .on_action(cx.listener(|this, _: &TerminalCopyOrInterrupt, _, cx| {
+                // Unhandled, the keystroke goes on to `key_down`: ^C.
+                if !this.copy_or_interrupt(cx) {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &TerminalPaste, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &TerminalSelectAll, _, cx| this.select_all(cx)))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
@@ -1070,6 +1111,63 @@ mod tests {
         });
         let copied = cx.read_from_clipboard().and_then(|item| item.text());
         assert_eq!(copied.as_deref(), Some("copy"));
+    }
+
+    /// The real keys: Ctrl+C copies a selection (and drops it), interrupts
+    /// without one; Ctrl+V pastes.
+    #[cfg(not(target_os = "macos"))]
+    #[gpui::test]
+    fn ctrl_c_copies_a_selection_else_interrupts(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::workspace::bind_nav_keys(cx);
+        });
+        let sink = Sink::default();
+        let input = sink.clone();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let style = TerminalStyle::from_theme(cx);
+            TerminalView::new(input, Silent, |_, _| {}, style, cx)
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.process(b"copy me");
+            view.focus.focus(window, cx);
+        });
+        // Keys reach the view once a frame has built its dispatch tree. That
+        // frame also fits the grid to the window, which drops a selection, so
+        // select after it.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        view.update(cx, |view, _| {
+            view.begin_selection(cell(0, 0), Side::Left, 1, false);
+            view.extend_selection(cell(0, 3), Side::Right, 0);
+        });
+
+        cx.simulate_keystrokes("ctrl-c");
+        let copied = cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("copy"));
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "no interrupt with a selection"
+        );
+        view.update(cx, |view, _| assert_eq!(view.selected_text(), None));
+
+        cx.simulate_keystrokes("ctrl-c");
+        assert_eq!(*sink.0.lock().unwrap(), [3]);
+
+        sink.0.lock().unwrap().clear();
+        cx.write_to_clipboard(ClipboardItem::new_string("pasted".into()));
+        cx.simulate_keystrokes("ctrl-v");
+        assert_eq!(*sink.0.lock().unwrap(), b"pasted");
+
+        // Turned off in Settings: both are the shell's, selection or not.
+        sink.0.lock().unwrap().clear();
+        view.update(cx, |view, cx| view.set_ctrl_clipboard(false, cx));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        view.update(cx, |view, _| {
+            view.begin_selection(cell(0, 0), Side::Left, 1, false);
+            view.extend_selection(cell(0, 3), Side::Right, 0);
+        });
+        cx.simulate_keystrokes("ctrl-c ctrl-v");
+        assert_eq!(*sink.0.lock().unwrap(), [3, 0x16]);
     }
 
     #[gpui::test]
