@@ -21,8 +21,9 @@ use gpui_component::{ActiveTheme, Selectable as _};
 const TX_AMBER: u32 = 0xf59e0bff;
 /// Blue of the "N changes staged" toolbar badge (the edited cells' hue).
 const PENDING_BLUE: u32 = 0x3b82f6ff;
-/// Height of the status bar along the window's bottom edge.
-const STATUS_BAR_H: gpui::Pixels = px(26.);
+/// Height of the status bar along the window's bottom edge: Zed's, 22px buttons
+/// with 4px above and below.
+const STATUS_BAR_H: gpui::Pixels = px(30.);
 /// Width of the query log while Messages shares the bottom panel with it.
 const LOG_W: gpui::Pixels = px(520.);
 /// The query log's / Messages' width beside the terminal.
@@ -1580,7 +1581,7 @@ impl Workspace {
         let toggle = |id: &'static str, icon: &'static str, tip: &'static str, on: bool| {
             Button::new(id)
                 .ghost()
-                .xsmall()
+                .small()
                 .tab_stop(false)
                 .icon(Icon::empty().path(icon).when(on, |i| i.text_color(blue)))
                 .tooltip(tip)
@@ -1592,7 +1593,7 @@ impl Workspace {
             .w(window.viewport_size().width)
             .h(STATUS_BAR_H)
             .flex_shrink_0()
-            .px_1()
+            .px_1p5()
             .gap_1()
             .items_center()
             .bg(c.header)

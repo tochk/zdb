@@ -786,13 +786,20 @@ pub(crate) fn clear_marks(input: &Entity<EditorState>, cx: &mut App) {
 /// A WHERE / ORDER BY / LIMIT box. An editor rather than an `InputState`, as only
 /// an editor can have a completion provider; Enter submits, so it stays one line.
 pub(crate) fn one_line_editor(window: &mut Window, cx: &mut Context<EditorState>) -> EditorState {
-    EditorState::new(window, cx)
+    let mut state = EditorState::new(window, cx)
         .line_number(false)
         .folding(false)
         .indent_guides(false)
         .soft_wrap(false)
         .submit_on_enter(true)
-        .scroll_beyond_last_line(None)
+        // `None` is the default room below the last line (half the box), which
+        // let the wheel scroll the one line out of sight.
+        .scroll_beyond_last_line(Some(0))
+        .scroll_bounce(false);
+    // No scrollbar: the theme shows them always (see `main.rs`), and a box one
+    // line tall has nothing to scroll to.
+    state.set_scrollbar_renderer(Some(Rc::new(|_, _, _| gpui::Empty.into_any_element())));
+    state
 }
 
 pub(crate) fn make_grid(
