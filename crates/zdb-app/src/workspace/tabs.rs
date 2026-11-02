@@ -59,7 +59,7 @@ impl Workspace {
         // Focusing a gpui-component input touches the window's `Root` layer, which
         // only exists under a real app (not in headless `#[gpui::test]` windows).
         if window.root::<gpui_component::Root>().flatten().is_some() {
-            focus.read(cx).focus_handle(cx).focus(window);
+            focus.read(cx).focus_handle(cx).focus(window, cx);
         }
     }
 
@@ -253,6 +253,26 @@ impl Workspace {
         let split = editor_split_at(y, height);
         if (tab.editor_split - split).abs() > f32::EPSILON {
             tab.editor_split = split;
+            cx.notify();
+        }
+    }
+
+    /// The divider above the value pane was dragged to `y` within a split
+    /// `height` tall.
+    pub(super) fn set_value_split(
+        &mut self,
+        tab_id: u64,
+        y: Pixels,
+        height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return;
+        };
+        let split = editor_split_at(y, height);
+        if (tab.value_split - split).abs() > f32::EPSILON {
+            tab.value_split = split;
+            self.reveal_value_row(tab_id, cx);
             cx.notify();
         }
     }

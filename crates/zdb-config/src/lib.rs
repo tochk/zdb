@@ -48,6 +48,10 @@ pub struct Settings {
     /// The embedded terminal's shell: a command line (program, then any
     /// arguments; quote a path with spaces). Empty = the platform default.
     pub terminal_shell: String,
+    /// In the terminal (Windows / Linux), Ctrl+C copies a selection and Ctrl+V
+    /// pastes. Off: both go to the shell as they are (interrupt; the shell's own
+    /// Ctrl+V, e.g. PowerShell's paste).
+    pub terminal_ctrl_clipboard: bool,
 }
 
 /// `Settings::pool_size` range the UI allows.
@@ -70,6 +74,7 @@ impl Default for Settings {
             export_format: ExportFormat::default(),
             confirm_apply: true,
             terminal_shell: String::new(),
+            terminal_ctrl_clipboard: true,
         }
     }
 }
@@ -284,6 +289,7 @@ mod tests {
             export_format: ExportFormat::Inserts,
             confirm_apply: false,
             terminal_shell: r#""C:\Program Files\Git\bin\bash.exe" -l"#.into(),
+            terminal_ctrl_clipboard: false,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         assert!(json.contains(r#""export_format": "inserts""#));
@@ -295,6 +301,7 @@ mod tests {
         assert_eq!(back.window.unwrap().width, 1200.);
         assert!(back.esc_saves_edit && back.vim_navigation);
         assert!(!back.restore_tabs);
+        assert!(!back.terminal_ctrl_clipboard);
         assert_eq!(back.pool_size, 7);
         assert_eq!(back.connections[0].id, "abc");
         assert_eq!(back.connections[0].params, ["application_name=x"]);
@@ -334,8 +341,9 @@ mod tests {
         assert_eq!(s.window, None);
         // …and so must ones written before the keyboard toggles: both default off.
         assert!(!s.esc_saves_edit && !s.vim_navigation);
-        // Tab restore is on unless the file says otherwise.
-        assert!(s.restore_tabs);
+        // Tab restore and the terminal's Ctrl+C / Ctrl+V are on unless the file
+        // says otherwise.
+        assert!(s.restore_tabs && s.terminal_ctrl_clipboard);
         assert_eq!(s.pool_size, 4);
         // Both bottom panels showing; cancelling from the loader asks first.
         assert!(s.show_query_log && s.show_messages);

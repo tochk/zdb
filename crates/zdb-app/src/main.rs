@@ -7,12 +7,12 @@ mod assets;
 mod build_info;
 mod lsp;
 mod terminal;
+mod terminal_view;
 mod workspace;
 
 use assets::Assets;
 use gpui::{
-    point, px, size, AppContext, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds,
-    WindowOptions,
+    point, px, size, AppContext, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions,
 };
 use gpui_component::TitleBar;
 use workspace::{
@@ -60,22 +60,21 @@ fn main() {
     // manager opens with the saved list for the user to pick.
     let auto = config_from_env();
 
-    let app = Application::new().with_assets(Assets);
+    let app = gpui_platform::application().with_assets(Assets);
     app.run(move |cx| {
         // Must run before using any gpui-component features.
         gpui_component::init(cx);
-        register_sql_language();
         // White scheme by default; `theme: "dark"` in settings.json switches it.
-        gpui_component::Theme::change(theme_mode(theme), None, cx);
+        workspace::colors::change_theme(theme_mode(theme), cx);
         // Scrollbars stay VISIBLE. gpui-component defaults to
-        // `ScrollbarShow::Scrolling` — the bar only appears *while* scrolling and
+        // `ScrollbarMode::Scrolling` — the bar only appears *while* scrolling and
         // fades after 2s, so a wide result grid gives no hint that its off-screen
         // columns are reachable at all (horizontal scroll is shift+wheel or a tilt
         // wheel; without a bar there's nothing to discover or drag). `Always` is
         // the data-grid convention. `Theme::change` (the settings modal's live
         // light/dark switch) only touches colors, so this survives a theme swap.
-        gpui_component::Theme::global_mut(cx).scrollbar_show =
-            gpui_component::scroll::ScrollbarShow::Always;
+        gpui_component::Theme::global_mut(cx).scrollbar_mode =
+            gpui_component::scroll::ScrollbarMode::Always;
 
         cx.bind_keys([
             KeyBinding::new("ctrl-enter", RunQuery, None),
@@ -170,26 +169,6 @@ fn config_from_env() -> Option<ConnectionConfig> {
     Some(cfg)
 }
 
-/// Register the SQL tree-sitter grammar with gpui-component's language
-/// registry so `code_editor("sql")` highlights. Without this, gpui-component
-/// only knows JSON (its other grammars sit behind the heavyweight
-/// `tree-sitter-languages` feature) and `"sql"` silently falls back to the
-/// JSON grammar — no highlighting. Registered names win over that fallback.
-fn register_sql_language() {
-    use gpui_component::highlighter::{LanguageConfig, LanguageRegistry};
-    LanguageRegistry::singleton().register(
-        "sql",
-        &LanguageConfig::new(
-            "sql",
-            tree_sitter_sequel::LANGUAGE.into(),
-            vec![],
-            tree_sitter_sequel::HIGHLIGHTS_QUERY,
-            "",
-            "",
-        ),
-    );
-}
-
 fn theme_mode(t: zdb_config::Theme) -> gpui_component::ThemeMode {
     match t {
         zdb_config::Theme::Light => gpui_component::ThemeMode::Light,
@@ -207,14 +186,11 @@ fn is_wsl() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Single test on the process-wide registry singleton (no cross-test
     // ordering to worry about).
     #[test]
     fn sql_language_registers() {
         use gpui_component::highlighter::LanguageRegistry;
-        register_sql_language();
         let cfg = LanguageRegistry::singleton()
             .language("sql")
             .expect("sql must be registered");

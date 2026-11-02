@@ -634,7 +634,7 @@ impl Workspace {
             return;
         }
         self.open_table_tab(schema, table, window, cx);
-        self.tree.focus.focus(window);
+        self.tree.focus.focus(window, cx);
     }
 
     /// Enter on the tree: open the selected relation in a tab and hand the

@@ -10,17 +10,18 @@ repository = "https://github.com/tochk/zdb"
 rust-version = "1.90"
 
 [workspace.dependencies]
-# UI stack (pinned per plan — verified on crates.io)
-gpui = "0.2.2"
-gpui-component = "0.5.1"
-gpui-terminal = "0.1"
+# UI stack
+# gpui-component 0.8 is on Zed's pre-release gpui, published as `gpui-pre`, and pins
+# it exactly. Same `gpui` name in code.
+gpui = { package = "gpui-pre", version = "=0.3.10" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.10", features = ["font-kit", "wayland", "x11"] }
+# `tree-sitter-sql` is the one grammar we need; the `tree-sitter-languages` feature
+# would pull in all of them.
+gpui-component = { version = "0.8.1", features = ["tree-sitter-sql"] }
+# The embedded terminal's emulator (`terminal_view.rs`).
+alacritty_terminal = "0.25.1"
+flume = "0.12"
 portable-pty = "0.9"
-# SQL grammar for the editor's syntax highlighting. gpui-component gates all
-# non-JSON grammars behind its all-or-nothing `tree-sitter-languages` feature
-# (28 C grammar crates); we instead register just SQL ourselves (main.rs).
-# Semver-compatible with gpui-component's own requirement, so the tree holds
-# one copy.
-tree-sitter-sequel = "0.3.11"
 
 # Data layer
 tokio = { version = "1.54", features = ["rt-multi-thread", "macros", "sync", "time"] }
