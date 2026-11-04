@@ -217,6 +217,9 @@ pub struct Workspace {
     /// Whether the connection manager is showing the add form.
     conn_adding: bool,
     form: ConnForm,
+    /// An SSH server's new host key the trust dialog asks about, and the
+    /// config to connect with once it is trusted.
+    host_key: Option<(zdb_db::HostKey, ConnectionConfig)>,
 
     /// Latest window geometry seen in `render`, and whether a debounced write of
     /// it is already scheduled (resizing renders every frame — one write wins).
@@ -386,6 +389,7 @@ impl Workspace {
             passwords: HashMap::new(),
             conn_adding: false,
             form,
+            host_key: None,
             pending_geom: None,
             geom_flush: false,
             autoscroll: None,

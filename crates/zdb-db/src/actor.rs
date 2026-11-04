@@ -35,12 +35,14 @@
 use crate::introspect::{
     self, ColumnInfo, RelationDetail, RelationInfo, SchemaInfo, SchemaObjects,
 };
+use crate::ssh::Tunnel;
 use crate::tls::make_connector;
 use crate::{
     edit, query, ConnId, ConnSetup, ConnectionConfig, DbError, DescribedResult, EditTarget,
     QueryEvent, RowEdit,
 };
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -163,7 +165,7 @@ struct Queued {
 enum Command {
     Connect {
         cfg: Box<ConnectionConfig>,
-        reply: oneshot::Sender<Result<ConnId, DbError>>,
+        reply: oneshot::Sender<Result<Connected, DbError>>,
     },
     Job {
         session: Session,
@@ -269,6 +271,8 @@ struct ConnState {
     /// request, which must not wait on a fresh TLS setup (loading the OS trust
     /// store for the verifying modes is slow on some systems).
     connector: MakeRustlsConnect,
+    /// The SSH tunnel every connection goes through, if the config has one.
+    tunnel: Option<Arc<Tunnel>>,
     /// Most connections open at once.
     size: usize,
     /// Connections open now: idle, busy, pinned or being dialed.
@@ -284,11 +288,17 @@ struct ConnState {
 }
 
 impl ConnState {
-    fn new(cfg: ConnectionConfig, connector: MakeRustlsConnect, first: Client) -> Self {
+    fn new(
+        cfg: ConnectionConfig,
+        connector: MakeRustlsConnect,
+        tunnel: Option<Arc<Tunnel>>,
+        first: Client,
+    ) -> Self {
         Self {
             cfg: Arc::new(cfg),
             gen: 0,
             connector,
+            tunnel,
             size: DEFAULT_POOL_SIZE,
             open: 1,
             dialing: 0,
@@ -381,9 +391,9 @@ impl ConnState {
             self.open += 1;
             self.dialing += 1;
             let (cfg, connector, tx) = (self.cfg.clone(), self.connector.clone(), tx.clone());
-            let gen = self.gen;
+            let (gen, tunnel) = (self.gen, self.tunnel.clone());
             tokio::spawn(async move {
-                let result = dial(&cfg, &connector).await;
+                let result = dial(&cfg, &connector, tunnel.as_deref()).await;
                 let _ = tx.send(Command::Dialed { conn, gen, result });
             });
         }
@@ -547,12 +557,26 @@ impl Unserved {
     /// Fail every connect sent so far, as an unreachable server does, and drop
     /// the other requests.
     pub fn refuse_all(&mut self) {
+        self.fail_all(DbError::Connect("refused".into()));
+    }
+
+    /// Fail every connect sent so far with `err`, and drop the other requests.
+    pub fn fail_all(&mut self, err: DbError) {
         while let Ok(command) = self.0.try_recv() {
             if let Command::Connect { reply, .. } = command {
-                let _ = reply.send(Err(DbError::Connect("refused".into())));
+                let _ = reply.send(Err(err.clone()));
             }
         }
     }
+}
+
+/// An open connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Connected {
+    pub id: ConnId,
+    /// Where another client on this machine reaches the database, when not
+    /// at the configured host and port: the SSH tunnel's local end.
+    pub local: Option<SocketAddr>,
 }
 
 /// Cloneable handle to the database worker. Cheap to clone (wraps a sender).
@@ -604,6 +628,12 @@ impl DbHandle {
     /// checks the credentials), returning its id. Awaitable from the GPUI
     /// executor.
     pub async fn connect(&self, cfg: ConnectionConfig) -> Result<ConnId, DbError> {
+        self.open(cfg).await.map(|c| c.id)
+    }
+
+    /// [`DbHandle::connect`], also telling where the database can be reached
+    /// locally (through an SSH tunnel, when `cfg` has one).
+    pub async fn open(&self, cfg: ConnectionConfig) -> Result<Connected, DbError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Command::Connect {
@@ -1052,14 +1082,21 @@ async fn worker(tx: mpsc::UnboundedSender<Command>, mut rx: mpsc::UnboundedRecei
             Command::Connect { cfg, reply } => {
                 let opened = async {
                     let connector = make_connector(&cfg)?;
-                    let first = dial(&cfg, &connector).await?;
-                    Ok::<_, DbError>((connector, first))
+                    let tunnel = match &cfg.ssh {
+                        Some(ssh) => Some(Arc::new(
+                            Tunnel::open(ssh.clone(), cfg.host.clone(), cfg.port).await?,
+                        )),
+                        None => None,
+                    };
+                    let first = dial(&cfg, &connector, tunnel.as_deref()).await?;
+                    Ok::<_, DbError>((connector, tunnel, first))
                 };
-                let result = opened.await.map(|(connector, first)| {
+                let result = opened.await.map(|(connector, tunnel, first)| {
                     let id = next_id;
                     next_id += 1;
-                    conns.insert(id, ConnState::new(*cfg, connector, first));
-                    id
+                    let local = tunnel.as_ref().map(|t| t.addr);
+                    conns.insert(id, ConnState::new(*cfg, connector, tunnel, first));
+                    Connected { id, local }
                 });
                 let _ = reply.send(result);
                 None
@@ -1095,8 +1132,9 @@ async fn worker(tx: mpsc::UnboundedSender<Command>, mut rx: mpsc::UnboundedRecei
                         cfg.setup = setup;
                         let (cfg, connector, tx) =
                             (Arc::new(cfg), state.connector.clone(), tx.clone());
+                        let tunnel = state.tunnel.clone();
                         tokio::spawn(async move {
-                            let result = dial(&cfg, &connector).await;
+                            let result = dial(&cfg, &connector, tunnel.as_deref()).await;
                             let _ = tx.send(Command::SetupDialed {
                                 conn,
                                 cfg,
@@ -1298,15 +1336,25 @@ async fn apply_batch(client: &Client, batch: &str) -> Result<(), DbError> {
     }
 }
 
-/// Open one Postgres connection, spawn its protocol driver, and run the
-/// setup's init SQL on it.
-async fn dial(cfg: &ConnectionConfig, connector: &MakeRustlsConnect) -> Result<Client, DbError> {
+/// Open one Postgres connection (through `tunnel`, if given), spawn its
+/// protocol driver, and run the setup's init SQL on it.
+async fn dial(
+    cfg: &ConnectionConfig,
+    connector: &MakeRustlsConnect,
+    tunnel: Option<&Tunnel>,
+) -> Result<Client, DbError> {
     let (client, connection) = cfg
-        .to_pg_config()
+        .to_pg_config_at(tunnel.map(|t| t.addr))
         .map_err(DbError::Connect)?
         .connect(connector.clone())
         .await
-        .map_err(|e| DbError::Connect(e.to_string()))?;
+        // A tunnel that couldn't carry the connection knows why; the
+        // client only saw its socket close.
+        .map_err(|e| {
+            tunnel
+                .and_then(Tunnel::failure)
+                .unwrap_or_else(|| DbError::Connect(e.to_string()))
+        })?;
     // The connection future drives the protocol and must be polled for the
     // client to work; it resolves when the connection closes.
     tokio::spawn(async move {

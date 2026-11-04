@@ -16,6 +16,7 @@ A fast, minimal PostgreSQL desktop client in Rust, built on
 ## Features
 
 - Schema tree, tabs saved per connection, passwords in the OS keychain
+- Connections through an SSH server (key, password or agent)
 - SQL editor with highlighting and schema-aware completion
 - Tables with WHERE / ORDER BY / LIMIT boxes and a pager
 - Inline editing: changes are staged, reviewed and applied in one transaction
