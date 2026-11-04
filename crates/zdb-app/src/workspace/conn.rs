@@ -2,6 +2,10 @@
 //! modal + theme switch, and starting the `sqls` completion server.
 
 use super::*;
+use std::net::SocketAddr;
+use zdb_config::secret::ssh_account;
+use zdb_config::{SshAuthKind, SshEntry};
+use zdb_db::{DbError, HostKey, SslMode};
 
 /// The connection form, adding a connection or editing a saved one: its
 /// inputs, which entry it edits, and how the last save went.
@@ -17,6 +21,19 @@ pub(super) struct ConnForm {
     pub(super) params: Entity<TextareaState>,
     /// SQL run on every connection of the pool.
     pub(super) init_sql: Entity<TextareaState>,
+    /// Reach the database through an SSH server, the `ssh_*` fields.
+    pub(super) ssh: bool,
+    pub(super) ssh_host: Entity<InputState>,
+    pub(super) ssh_port: Entity<InputState>,
+    pub(super) ssh_user: Entity<InputState>,
+    pub(super) ssh_auth: SshAuthKind,
+    /// The private key file; empty = the default ones.
+    pub(super) ssh_key: Entity<InputState>,
+    /// The SSH password, or the key's passphrase.
+    pub(super) ssh_secret: Entity<InputState>,
+    /// A key file picked with Browse, for `render` to put in `ssh_key` (that
+    /// needs the window).
+    pub(super) pending_key: Option<String>,
     /// The id of the saved connection being edited; `None` = adding one.
     pub(super) editing: Option<String>,
     /// Why the last save was refused: a missing field, a bad parameter line,
@@ -70,6 +87,14 @@ impl ConnForm {
             ),
             params: lines(window, cx, "statement_timeout=30s"),
             init_sql: lines(window, cx, "SET search_path TO app, public;"),
+            ssh: false,
+            ssh_host: input(window, cx, "ssh.example.com", ""),
+            ssh_port: input(window, cx, "22", "22"),
+            ssh_user: input(window, cx, "user", ""),
+            ssh_auth: SshAuthKind::default(),
+            ssh_key: input(window, cx, "empty: ~/.ssh/id_ed25519, id_ecdsa, id_rsa", ""),
+            ssh_secret: cx.new(|cx| InputState::new(window, cx).masked(true)),
+            pending_key: None,
             editing: None,
             error: None,
             applying: false,
@@ -95,8 +120,17 @@ impl ConnForm {
             ssl_mode: "prefer".into(),
             params: Vec::new(),
             init_sql: String::new(),
+            ssh: None,
         };
         let e = entry.unwrap_or(&blank);
+        let blank_ssh = SshEntry {
+            host: String::new(),
+            port: 22,
+            user: String::new(),
+            auth: SshAuthKind::default(),
+            key_file: String::new(),
+        };
+        let ssh = e.ssh.as_ref().unwrap_or(&blank_ssh);
         for (input, value) in [
             (&self.name, e.name.clone()),
             (&self.host, e.host.clone()),
@@ -105,6 +139,11 @@ impl ConnForm {
             (&self.db, e.dbname.clone()),
             (&self.password, String::new()),
             (&self.ssl, e.ssl_mode.clone()),
+            (&self.ssh_host, ssh.host.clone()),
+            (&self.ssh_port, ssh.port.to_string()),
+            (&self.ssh_user, ssh.user.clone()),
+            (&self.ssh_key, ssh.key_file.clone()),
+            (&self.ssh_secret, String::new()),
         ] {
             input.update(cx, |i, cx| i.set_value(value, window, cx));
         }
@@ -121,6 +160,17 @@ impl ConnForm {
         };
         self.password
             .update(cx, |i, cx| i.set_placeholder(ph, window, cx));
+        // Likewise the SSH secret, which a key may not have at all.
+        let ph = if e.ssh.is_some() {
+            "unchanged — type to replace"
+        } else {
+            ""
+        };
+        self.ssh_secret
+            .update(cx, |i, cx| i.set_placeholder(ph, window, cx));
+        self.ssh = e.ssh.is_some();
+        self.ssh_auth = ssh.auth;
+        self.pending_key = None;
         self.editing = entry.map(|e| e.id.clone());
         self.error = None;
         self.applying = false;
@@ -144,6 +194,34 @@ fn conn_id_for(connections: &[ConnectionEntry], name: &str) -> String {
         .find(|c| c.name == name && !c.id.is_empty())
         .map(|c| c.id.clone())
         .unwrap_or_else(zdb_config::new_conn_id)
+}
+
+/// The config `sqls` connects with: at the SSH tunnel's local end, when there
+/// is one. Its TLS can't be told the database's real name there, so
+/// verify-full checks the certificate chain only (verify-ca).
+fn lsp_config(cfg: &ConnectionConfig, local: Option<SocketAddr>) -> ConnectionConfig {
+    let mut cfg = cfg.clone();
+    if let Some(addr) = local {
+        cfg.host = addr.ip().to_string();
+        cfg.port = addr.port();
+        cfg.ssh = None;
+        if cfg.ssl_mode == SslMode::VerifyFull {
+            cfg.ssl_mode = SslMode::VerifyCa;
+        }
+    }
+    cfg
+}
+
+/// Record a host key the user trusted. Not under test: tests must never
+/// write the dev machine's config dir.
+fn record_host_key(file: &std::path::Path, key: &HostKey) -> Result<(), String> {
+    #[cfg(not(test))]
+    return zdb_db::trust_host_key(file, key);
+    #[cfg(test)]
+    {
+        let _ = (file, key);
+        Ok(())
+    }
 }
 
 impl Workspace {
@@ -268,7 +346,8 @@ impl Workspace {
         // click handler freezes the render loop (the app "hangs" on select).
         // `start_connect` resolves the stored password off the UI thread.
         let pw = self.passwords.get(&entry.name).cloned();
-        match entry_to_config(&entry, pw) {
+        let ssh_secret = self.passwords.get(&ssh_account(&entry.name)).cloned();
+        match entry_to_config(&entry, pw, ssh_secret) {
             Ok(cfg) => {
                 let key = (!entry.id.is_empty()).then(|| entry.id.clone());
                 self.switch_connection(cfg, key, cx);
@@ -301,6 +380,7 @@ impl Workspace {
         let init_sql = self.form.init_sql.read(cx).value().trim().to_string();
         let params_text = self.form.params.read(cx).value().to_string();
         let password = self.form.password.read(cx).value().to_string();
+        let ssh_secret = self.form.ssh_secret.read(cx).value().to_string();
 
         let fail = |this: &mut Self, msg: String, cx: &mut Context<Self>| {
             this.form.error = Some(msg);
@@ -313,6 +393,29 @@ impl Workspace {
             Ok(setup) => setup,
             Err(e) => return fail(self, format!("Parameters, {e}"), cx),
         };
+        let ssh = if self.form.ssh {
+            let (host, user) = (read(&self.form.ssh_host), read(&self.form.ssh_user));
+            if host.is_empty() || user.is_empty() {
+                return fail(self, "Fill the SSH host and user".into(), cx);
+            }
+            let auth = self.form.ssh_auth;
+            Some(SshEntry {
+                host,
+                port: read(&self.form.ssh_port).parse().unwrap_or(22),
+                user,
+                auth,
+                key_file: match auth {
+                    SshAuthKind::Key => read(&self.form.ssh_key),
+                    _ => String::new(),
+                },
+            })
+        } else {
+            None
+        };
+        let ssh_secret = ssh
+            .as_ref()
+            .filter(|s| s.auth != SshAuthKind::Agent && !ssh_secret.is_empty())
+            .map(|_| ssh_secret);
         let editing = self.form.editing.clone();
         if let Some(id) = &editing {
             if self
@@ -341,6 +444,7 @@ impl Workspace {
             ssl_mode: if ssl.is_empty() { "prefer".into() } else { ssl },
             params: param_lines(&params_text),
             init_sql,
+            ssh,
         };
         let pw = (!password.is_empty()).then_some(password);
 
@@ -352,8 +456,8 @@ impl Workspace {
                 .cloned()
         }) else {
             // Adding.
-            self.store_entry(None, &entry, pw.clone(), cx);
-            let mut cfg = entry_config(&entry, pw);
+            self.store_entry(None, &entry, pw.clone(), ssh_secret.clone(), cx);
+            let mut cfg = entry_config(&entry, pw, ssh_secret);
             cfg.setup = setup;
             self.switch_connection(cfg, Some(entry.id.clone()), cx);
             return;
@@ -369,25 +473,32 @@ impl Workspace {
                 e.dbname.clone(),
                 e.user.clone(),
                 e.ssl_mode.clone(),
+                e.ssh.clone(),
             )
         };
-        let moved = target(&old) != target(&entry) || pw.is_some();
+        let moved = target(&old) != target(&entry) || pw.is_some() || ssh_secret.is_some();
         let new_setup = old.params != entry.params || old.init_sql != entry.init_sql;
         match live {
             Some(_) if moved => {
-                let renamed = self.store_entry(Some(&old.name), &entry, pw.clone(), cx);
+                let renamed =
+                    self.store_entry(Some(&old.name), &entry, pw.clone(), ssh_secret.clone(), cx);
                 let mut cfg = entry_config(
                     &entry,
                     pw.or_else(|| self.passwords.get(&entry.name).cloned()),
+                    ssh_secret.or_else(|| self.passwords.get(&ssh_account(&entry.name)).cloned()),
                 );
                 cfg.setup = setup;
                 let key = Some(entry.id.clone());
-                match renamed.filter(|_| cfg.password.is_none()) {
-                    // The password is on its way to the new name in the
-                    // keychain: connect with it once it has been read.
+                match renamed {
+                    // The passwords are on their way to the new name in the
+                    // keychain: connect with them once they have been read.
                     Some(moving) => {
                         cx.spawn(async move |this, cx| {
-                            cfg.password = moving.await;
+                            let [pw, ssh_secret] = moving.await;
+                            cfg.password = cfg.password.or(pw);
+                            if let Some(ssh) = &mut cfg.ssh {
+                                ssh.secret = ssh.secret.take().or(ssh_secret);
+                            }
                             let _ =
                                 this.update(cx, |this, cx| this.switch_connection(cfg, key, cx));
                         })
@@ -407,7 +518,7 @@ impl Workspace {
                         this.form.applying = false;
                         match res {
                             Ok(()) => {
-                                this.finish_edit(&old.name, &entry, pw, Some(applied), cx);
+                                this.finish_edit(&old.name, &entry, None, Some(applied), cx);
                                 this.status = format!(
                                     "Saved {}; its connections now use the new setup",
                                     entry.name
@@ -420,24 +531,28 @@ impl Workspace {
             }
             _ => {
                 let setup = live.map(|_| setup);
-                self.finish_edit(&old.name, &entry, pw, setup, cx);
+                self.finish_edit(&old.name, &entry, Some([pw, ssh_secret]), setup, cx);
                 self.status = format!("Saved {}", entry.name);
             }
         }
         cx.notify();
     }
 
-    /// Store an edited entry and go back to the list. A live connection's
-    /// config follows a rename and the new `setup`, if one is given.
+    /// Store an edited entry (with the database password and SSH secret
+    /// typed, if any) and go back to the list. A live connection's config
+    /// follows a rename and the new `setup`, if one is given.
     fn finish_edit(
         &mut self,
         old_name: &str,
         entry: &ConnectionEntry,
-        pw: Option<String>,
+        typed: Option<[Option<String>; 2]>,
         setup: Option<ConnSetup>,
         cx: &mut Context<Self>,
     ) {
-        self.store_entry(Some(old_name), entry, pw, cx);
+        let [pw, ssh_secret] = typed.unwrap_or_default();
+        if let Some(moving) = self.store_entry(Some(old_name), entry, pw, ssh_secret, cx) {
+            moving.detach();
+        }
         if self.conn_key.as_deref() == Some(entry.id.as_str()) {
             if let Some(cfg) = &mut self.cfg {
                 cfg.name = entry.name.clone();
@@ -450,22 +565,29 @@ impl Workspace {
     }
 
     /// Write `entry` to the settings — in place of the one with its id, so
-    /// the list keeps its order — and a typed password to the keychain (off
-    /// the UI thread). A rename without a new password moves the saved one to
-    /// the new name; the returned task yields it once read.
+    /// the list keeps its order — and typed secrets to the keychain (off the
+    /// UI thread): the database password under the connection's name, the
+    /// SSH password / key passphrase under `ssh_account(name)`. A rename moves
+    /// the saved ones that weren't retyped to the new name; the returned task
+    /// yields both (typed or moved) once done. An SSH secret no longer used
+    /// (SSH turned off, or the agent logs in) is deleted.
     fn store_entry(
         &mut self,
         old_name: Option<&str>,
         entry: &ConnectionEntry,
         pw: Option<String>,
+        ssh_secret: Option<String>,
         cx: &mut Context<Self>,
-    ) -> Option<gpui::Task<Option<String>>> {
-        match self
+    ) -> Option<gpui::Task<[Option<String>; 2]>> {
+        let uses_secret =
+            |e: &ConnectionEntry| e.ssh.as_ref().is_some_and(|s| s.auth != SshAuthKind::Agent);
+        let slot = self
             .settings
             .connections
             .iter_mut()
-            .find(|c| c.id == entry.id)
-        {
+            .find(|c| c.id == entry.id);
+        let dropped_ssh = slot.as_ref().is_some_and(|old| uses_secret(old)) && !uses_secret(entry);
+        match slot {
             Some(slot) => *slot = entry.clone(),
             None => {
                 self.settings.connections.retain(|c| c.name != entry.name);
@@ -473,35 +595,69 @@ impl Workspace {
             }
         }
         self.save_settings();
+
         let name = entry.name.clone();
-        if let Some(pw) = pw {
-            self.passwords.insert(name.clone(), pw.clone());
-            cx.background_spawn(async move {
-                if zdb_config::secret::set_password(&name, &pw) {
-                    log(format!("password saved to keychain for '{name}'"));
-                }
-            })
-            .detach();
-            return None;
-        }
-        let old = old_name.filter(|old| *old != name)?.to_string();
-        if let Some(cached) = self.passwords.remove(&old) {
-            self.passwords.insert(name.clone(), cached);
-        }
-        Some(cx.background_spawn(async move {
-            let pw = zdb_config::secret::get_password(&old)?;
-            if zdb_config::secret::set_password(&name, &pw) {
-                zdb_config::secret::delete_password(&old);
+        let old = old_name.filter(|old| *old != name).map(str::to_string);
+        let accounts = |n: &str| [n.to_string(), ssh_account(n)];
+        let new = accounts(&name);
+        let old = old.as_deref().map(accounts);
+        let typed = [pw, ssh_secret];
+        // The session cache follows the same moves.
+        for i in 0..2 {
+            let cached = match &typed[i] {
+                Some(secret) => Some(secret.clone()),
+                None => old.as_ref().and_then(|old| self.passwords.remove(&old[i])),
+            };
+            if let Some(secret) = cached {
+                self.passwords.insert(new[i].clone(), secret);
             }
-            Some(pw)
-        }))
+        }
+        if dropped_ssh {
+            self.passwords.remove(&new[1]);
+        }
+        let renamed = old.is_some();
+        let task = cx.background_spawn(async move {
+            use zdb_config::secret::{delete_password, get_password, set_password};
+            let mut out: [Option<String>; 2] = [None, None];
+            for (i, typed) in typed.into_iter().enumerate() {
+                if i == 1 && dropped_ssh {
+                    delete_password(&new[1]);
+                    if let Some(old) = &old {
+                        delete_password(&old[1]);
+                    }
+                    continue;
+                }
+                out[i] = match typed {
+                    Some(secret) => {
+                        if set_password(&new[i], &secret) {
+                            log(format!("password saved to keychain for '{}'", new[i]));
+                        }
+                        Some(secret)
+                    }
+                    None => old.as_ref().and_then(|old| {
+                        let secret = get_password(&old[i])?;
+                        if set_password(&new[i], &secret) {
+                            delete_password(&old[i]);
+                        }
+                        Some(secret)
+                    }),
+                };
+            }
+            out
+        });
+        if renamed {
+            Some(task)
+        } else {
+            task.detach();
+            None
+        }
     }
 
     pub(super) fn start_connect(&mut self, cfg: ConnectionConfig, cx: &mut Context<Self>) {
         self.status = format!("Connecting to {}…", cfg.name);
         let db = self.db.clone();
         let key = self.conn_key.clone();
-        // Resolve a stored password off the UI thread: a macOS Keychain read can
+        // Resolve stored passwords off the UI thread: a macOS Keychain read can
         // block (and pop a system prompt), which would freeze the render loop and
         // make the app appear to hang. `background_spawn` runs it on a worker
         // thread; the connect future awaits the result.
@@ -509,32 +665,103 @@ impl Workspace {
             let name = cfg.name.clone();
             cx.background_spawn(async move { zdb_config::secret::get_password(&name) })
         });
+        let ssh_task = cfg
+            .ssh
+            .as_ref()
+            .filter(|ssh| ssh.wants_secret() && ssh.secret.is_none())
+            .map(|_| {
+                let account = ssh_account(&cfg.name);
+                cx.background_spawn(async move { zdb_config::secret::get_password(&account) })
+            });
         let fut = async move {
             let mut cfg = cfg;
             if let Some(task) = pw_task {
                 cfg.password = task.await;
             }
-            // A copy (with the resolved password) to configure the completion
-            // server after a successful connect.
-            let lsp_cfg = cfg.clone();
-            (db.connect(cfg).await, lsp_cfg)
+            if let (Some(task), Some(ssh)) = (ssh_task, &mut cfg.ssh) {
+                ssh.secret = task.await;
+            }
+            // Kept, with the resolved passwords: it configures the completion
+            // server, or is connected again once a new SSH host key is trusted.
+            (db.open(cfg.clone()).await, cfg)
         };
-        self.spawn_db(cx, fut, move |this, (result, lsp_cfg), cx| match result {
-            Ok(conn) => {
+        self.spawn_db(cx, fut, move |this, (result, cfg), cx| match result {
+            Ok(connected) => {
+                let conn = connected.id;
                 log(format!("connected (conn={conn})"));
                 this.conn = Some(conn);
                 this.db.set_pool_size(conn, this.settings.pool_size);
                 // Not if the user has moved on to another connection meanwhile.
                 this.pending_restore = !this.session_ready && this.conn_key == key;
                 this.status = "Connected. Loading schemas…".into();
-                this.start_lsp(&lsp_cfg);
+                this.start_lsp(&lsp_config(&cfg, connected.local));
                 this.load_schemas(cx);
             }
             Err(e) => {
                 log(format!("connect failed: {e}"));
                 this.status = format!("Connection failed: {e}");
+                // Ask whether to trust it — unless the user has moved on.
+                if let DbError::UnknownHostKey(host_key) = e {
+                    if this.conn.is_none() && this.conn_key == key {
+                        this.host_key = Some((host_key, cfg));
+                        this.modal = Some(Modal::TrustHostKey);
+                    }
+                }
             }
         });
+    }
+
+    /// The host-key dialog's "Trust": record the SSH server's key in zdb's
+    /// known_hosts file, then connect again.
+    pub(super) fn trust_host_key(&mut self, cx: &mut Context<Self>) {
+        let Some((host_key, cfg)) = self.host_key.take() else {
+            return;
+        };
+        self.close_modal(cx);
+        let Some(file) = zdb_config::known_hosts_path() else {
+            self.status = "No config directory to record the host key in".into();
+            return;
+        };
+        let key = self.conn_key.clone();
+        let fut = cx.background_spawn(async move { record_host_key(&file, &host_key) });
+        self.spawn_db(cx, fut, move |this, written, cx| match written {
+            Ok(()) if this.conn.is_none() && this.conn_key == key => this.start_connect(cfg, cx),
+            Ok(()) => {}
+            Err(e) => this.status = format!("Couldn't record the host key: {e}"),
+        });
+    }
+
+    /// The connection form's Browse: pick the SSH private key file.
+    pub(super) fn browse_ssh_key(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Use key".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = picked.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.form.pending_key = Some(path.to_string_lossy().into_owned());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A key file picked with Browse goes into the form's field.
+    pub(super) fn flush_pending_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self.form.pending_key.take() {
+            self.form
+                .ssh_key
+                .update(cx, |i, cx| i.set_value(path, window, cx));
+        }
     }
 
     /// (Re)start the bundled `sqls` server for the just-connected database, so
@@ -582,6 +809,7 @@ mod tests {
             ssl_mode: "disable".into(),
             params: Vec::new(),
             init_sql: String::new(),
+            ssh: None,
         }
     }
 
@@ -665,6 +893,141 @@ mod tests {
             })
             .unwrap();
         cx.run_until_parked();
+    }
+
+    /// SSH fields: required host and user, the key file kept for key logins
+    /// only, and a rename taking the cached SSH secret along.
+    #[gpui::test]
+    fn editing_ssh_settings(cx: &mut TestAppContext) {
+        let window = new_workspace(cx);
+        window
+            .update(cx, |ws, window, cx| {
+                ws.settings.connections = vec![saved("id-a", "a")];
+                ws.passwords.insert(ssh_account("a"), "s3cret".into());
+                ws.show_edit_form(0, window, cx);
+                assert!(!ws.form.ssh, "no SSH on a connection without it");
+
+                ws.form.ssh = true;
+                ws.save_connection(cx);
+                assert!(ws.form.error.as_deref().unwrap().contains("SSH host"));
+                assert!(ws.settings.connections[0].ssh.is_none());
+
+                type_into(&ws.form.ssh_host, " bastion ", window, cx);
+                type_into(&ws.form.ssh_port, "2222", window, cx);
+                type_into(&ws.form.ssh_user, "ops", window, cx);
+                type_into(&ws.form.ssh_key, "~/.ssh/work", window, cx);
+                ws.form.ssh_auth = SshAuthKind::Password;
+                type_into(&ws.form.name, "a2", window, cx);
+                ws.save_connection(cx);
+                assert_eq!(ws.form.error, None);
+                let ssh = ws.settings.connections[0].ssh.clone().unwrap();
+                assert_eq!(
+                    ssh,
+                    SshEntry {
+                        host: "bastion".into(),
+                        port: 2222,
+                        user: "ops".into(),
+                        auth: SshAuthKind::Password,
+                        key_file: String::new(),
+                    }
+                );
+                // The renamed connection's SSH secret is cached under its new name.
+                assert_eq!(ws.passwords.get(&ssh_account("a2")).unwrap(), "s3cret");
+                assert!(!ws.passwords.contains_key(&ssh_account("a")));
+
+                // Reopened: the fields come back, the secret doesn't.
+                ws.show_edit_form(0, window, cx);
+                assert!(ws.form.ssh);
+                assert_eq!(ws.form.ssh_auth, SshAuthKind::Password);
+                assert_eq!(ws.form.ssh_host.read(cx).value(), "bastion");
+                assert_eq!(ws.form.ssh_port.read(cx).value(), "2222");
+                assert_eq!(ws.form.ssh_secret.read(cx).value(), "");
+
+                ws.form.ssh_auth = SshAuthKind::Key;
+                type_into(&ws.form.ssh_key, "~/.ssh/work", window, cx);
+                ws.save_connection(cx);
+                let ssh = ws.settings.connections[0].ssh.clone().unwrap();
+                assert_eq!(ssh.key_file, "~/.ssh/work");
+
+                // What it connects with.
+                let cfg = entry_config(&ws.settings.connections[0], None, Some("pp".into()));
+                let ssh = cfg.ssh.unwrap();
+                assert_eq!(ssh.auth, zdb_db::SshAuth::Key("~/.ssh/work".into()));
+                assert_eq!(ssh.secret.as_deref(), Some("pp"));
+                assert_eq!((ssh.host.as_str(), ssh.port), ("bastion", 2222));
+            })
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn sqls_connects_at_the_tunnel() {
+        let mut cfg = ConnectionConfig::new("n", "db.internal", "d", "u");
+        cfg.ssl_mode = SslMode::VerifyFull;
+        assert_eq!(lsp_config(&cfg, None).host, "db.internal");
+        let local = lsp_config(&cfg, Some("127.0.0.1:40001".parse().unwrap()));
+        assert_eq!((local.host.as_str(), local.port), ("127.0.0.1", 40001));
+        // No host name to check the certificate against there.
+        assert_eq!(local.ssl_mode, SslMode::VerifyCa);
+        cfg.ssl_mode = SslMode::Require;
+        let local = lsp_config(&cfg, Some("127.0.0.1:40001".parse().unwrap()));
+        assert_eq!(local.ssl_mode, SslMode::Require);
+    }
+
+    /// A first connect to an SSH server asks whether to trust its key;
+    /// trusting connects again, cancelling leaves it.
+    #[gpui::test]
+    fn unknown_host_key_asks_to_trust_it(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (db, mut unserved) = DbHandle::unserved();
+        let window =
+            cx.add_window(|window, cx| Workspace::new(db, Settings::default(), None, window, cx));
+        let key = HostKey {
+            host: "bastion".into(),
+            port: 22,
+            algorithm: "ssh-ed25519".into(),
+            fingerprint: "SHA256:abc".into(),
+            openssh: "ssh-ed25519 AAAA".into(),
+        };
+        window
+            .update(cx, |ws, _w, cx| {
+                let mut entry = saved("id-a", "a");
+                entry.ssh = Some(SshEntry {
+                    host: "bastion".into(),
+                    port: 22,
+                    user: "ops".into(),
+                    auth: SshAuthKind::Agent,
+                    key_file: String::new(),
+                });
+                ws.settings.connections.push(entry);
+                ws.connect_saved(0, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.fail_all(DbError::UnknownHostKey(key.clone()));
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, cx| {
+                assert!(ws.is_modal(Modal::TrustHostKey));
+                assert_eq!(ws.host_key.as_ref().map(|(k, _)| k), Some(&key));
+                assert!(ws.status.contains("not a known host"), "{}", ws.status);
+                ws.trust_host_key(cx);
+                assert!(ws.modal.is_none() && ws.host_key.is_none());
+            })
+            .unwrap();
+        // Recorded (a no-op under test), then connecting again.
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, _cx| {
+                assert!(ws.status.starts_with("Connecting to a"), "{}", ws.status);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        unserved.fail_all(DbError::UnknownHostKey(key));
+        cx.run_until_parked();
+        window
+            .update(cx, |ws, _w, _cx| assert!(ws.is_modal(Modal::TrustHostKey)))
+            .unwrap();
     }
 
     #[test]

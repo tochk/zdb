@@ -820,6 +820,75 @@ impl Workspace {
         self.modal_layer(v_flex().mt(px(120.)).w(px(460.)).child(body), cx)
     }
 
+    /// "Trust this SSH server?" — its host key isn't in any known_hosts file
+    /// yet, as `ssh` asks on a first connect.
+    fn render_trust_host_key(
+        &self,
+        key: &zdb_db::HostKey,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let c = palette(cx);
+        let mono = cx.theme().mono_font_family.clone();
+        let server = match key.port {
+            22 => key.host.clone(),
+            port => format!("{}:{port}", key.host),
+        };
+        let file = zdb_config::known_hosts_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let body =
+            v_flex()
+                .p_4()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(c.fg)
+                        .child("Trust this SSH server?"),
+                )
+                .child(div().text_xs().text_color(c.fg_dim).child(format!(
+                    "{server} hasn't been connected to before. Check that its key fingerprint \
+                 is the one its administrator gives: if it isn't, someone may be \
+                 intercepting the connection."
+                )))
+                .child(
+                    v_flex()
+                        .p_2()
+                        .gap_1()
+                        .rounded_md()
+                        .bg(c.hover)
+                        .font_family(mono)
+                        .text_xs()
+                        .child(div().text_color(c.fg_dim).child(key.algorithm.clone()))
+                        .child(div().text_color(c.fg).child(key.fingerprint.clone())),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(c.fg_dim)
+                        .child(format!("Trusted keys are kept in {file}")),
+                )
+                .child(
+                    h_flex()
+                        .pt_1()
+                        .gap_2()
+                        .justify_end()
+                        .child(Button::new("distrust-host").label("Cancel").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.close_modal(cx)),
+                        ))
+                        .child(
+                            Button::new("trust-host")
+                                .label("Trust and connect")
+                                .primary()
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.trust_host_key(cx)
+                                })),
+                        ),
+                );
+        self.modal_layer(v_flex().mt(px(120.)).w(px(480.)).child(body), cx)
+    }
+
     /// "Apply N changes?" — a tab's staged changes as the statements they run
     /// (one transaction; its BEGIN / COMMIT aren't shown), for review first.
     fn render_confirm_apply(
@@ -1644,7 +1713,7 @@ impl Workspace {
             })
     }
 
-    fn render_conn_manager(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_conn_manager(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let c = palette(cx);
         let show_form = self.conn_adding || self.settings.connections.is_empty();
 
@@ -1689,7 +1758,98 @@ impl Workspace {
             let cancel = Button::new("cancel-conn")
                 .label("Cancel")
                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel_conn_form(cx)));
+            let hint = |text: &'static str| {
+                div()
+                    .pl(label_w + px(8.))
+                    .text_xs()
+                    .text_color(c.fg_dim)
+                    .child(text)
+            };
+            let auth = self.form.ssh_auth;
+            let auth_btn = |label: &'static str, kind: zdb_config::SshAuthKind| {
+                Button::new(SharedString::from(format!("ssh-auth-{label}")))
+                    .label(label)
+                    .when(auth == kind, |b| b.primary())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.form.ssh_auth = kind;
+                        cx.notify();
+                    }))
+            };
+            let ssh_on = Checkbox::new("ssh-on")
+                .label("Connect through an SSH server")
+                .checked(self.form.ssh)
+                .on_click(cx.listener(|this, on: &bool, _, cx| {
+                    this.form.ssh = *on;
+                    cx.notify();
+                }));
+            let ssh_fields = v_flex()
+                .gap_1()
+                .child(hint(
+                    "Host and port above are the database as the SSH server reaches it \
+                     (e.g. localhost).",
+                ))
+                .child(field("SSH host", &self.form.ssh_host))
+                .child(field("SSH port", &self.form.ssh_port))
+                .child(field("SSH user", &self.form.ssh_user))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(label("Log in with"))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .child(auth_btn("Key file", zdb_config::SshAuthKind::Key))
+                                .child(auth_btn("Password", zdb_config::SshAuthKind::Password))
+                                .child(auth_btn("Agent", zdb_config::SshAuthKind::Agent)),
+                        ),
+                )
+                .when(auth == zdb_config::SshAuthKind::Key, |d| {
+                    d.child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(label("Key file"))
+                            .child(
+                                h_flex()
+                                    .w(px(380.))
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .child(Input::new(&self.form.ssh_key)),
+                                    )
+                                    .child(
+                                        Button::new("ssh-key-browse")
+                                            .icon(Icon::empty().path("icons/folder-open.svg"))
+                                            .tooltip("Browse for the private key")
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    this.browse_ssh_key(cx)
+                                                },
+                                            )),
+                                    ),
+                            ),
+                    )
+                    .child(field("Passphrase", &self.form.ssh_secret))
+                    .child(hint("Leave the passphrase empty for a key without one."))
+                })
+                .when(auth == zdb_config::SshAuthKind::Password, |d| {
+                    d.child(field("SSH password", &self.form.ssh_secret))
+                })
+                .when(auth == zdb_config::SshAuthKind::Agent, |d| {
+                    d.child(hint(if cfg!(windows) {
+                        "Uses the keys of the OpenSSH Authentication Agent service, or Pageant."
+                    } else {
+                        "Uses the keys of the running ssh-agent (SSH_AUTH_SOCK)."
+                    }))
+                });
             v_flex()
+                // Taller than a small window with SSH on: it scrolls instead.
+                .id("conn-form")
+                .max_h(window.viewport_size().height - modal::TITLEBAR_H - px(52.))
+                .overflow_y_scroll()
                 .child(section_header(
                     if editing {
                         "EDIT CONNECTION"
@@ -1709,6 +1869,8 @@ impl Workspace {
                         .child(field("Database", &self.form.db))
                         .child(field("Password", &self.form.password))
                         .child(field("SSL mode", &self.form.ssl))
+                        .child(div().pl(label_w + px(8.)).py(px(4.)).child(ssh_on))
+                        .when(self.form.ssh, |d| d.child(ssh_fields))
                         .child(div().h(px(4.)))
                         .child(lines(
                             "Parameters",
@@ -1743,7 +1905,10 @@ impl Workspace {
             for (i, e) in self.settings.connections.iter().enumerate() {
                 let active =
                     self.conn.is_some() && self.cfg.as_ref().is_some_and(|cur| cur.name == e.name);
-                let subtitle = format!("{}@{}:{}/{}", e.user, e.host, e.port, e.dbname);
+                let mut subtitle = format!("{}@{}:{}/{}", e.user, e.host, e.port, e.dbname);
+                if let Some(ssh) = &e.ssh {
+                    subtitle.push_str(&format!(" via {}", ssh.host));
+                }
                 // The edit button is a SIBLING of the row's click area, not
                 // inside it: nested click handlers would both fire.
                 list = list.child(
@@ -2467,6 +2632,7 @@ impl Render for Workspace {
         }
         self.load_restored_tab(cx);
         self.flush_pending_shell(window, cx);
+        self.flush_pending_key(window, cx);
         // Filter cleared from a window-less context (connection switch).
         if self.tree.pending_clear_filter {
             self.tree.pending_clear_filter = false;
@@ -2664,6 +2830,10 @@ impl Render for Workspace {
                 self.modal = None;
             }
         }
+        // The host-key question is only good while its dialog is up.
+        if self.modal != Some(Modal::TrustHostKey) {
+            self.host_key = None;
+        }
         // Its changes are gone (tab closed, reverted, reloaded): nothing to apply.
         if let Some(Modal::ConfirmApply(id)) = self.modal {
             if self.tab(id).is_none_or(|t| t.pending.is_empty()) {
@@ -2671,7 +2841,9 @@ impl Render for Workspace {
             }
         }
         let dialog = match self.modal {
-            Some(Modal::Connections) => Some(self.render_conn_manager(cx).into_any_element()),
+            Some(Modal::Connections) => {
+                Some(self.render_conn_manager(window, cx).into_any_element())
+            }
             Some(Modal::Settings) => Some(self.render_settings(window, cx).into_any_element()),
             Some(Modal::Shortcuts) => Some(self.render_shortcuts(window, cx).into_any_element()),
             Some(Modal::Palette) => Some(self.render_palette(cx).into_any_element()),
@@ -2681,6 +2853,10 @@ impl Render for Workspace {
             Some(Modal::ConfirmApply(id)) => {
                 Some(self.render_confirm_apply(id, window, cx).into_any_element())
             }
+            Some(Modal::TrustHostKey) => self
+                .host_key
+                .as_ref()
+                .map(|(key, _)| self.render_trust_host_key(key, cx).into_any_element()),
             None => None,
         };
         root.children(dialog)

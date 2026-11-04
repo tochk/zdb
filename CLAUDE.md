@@ -262,6 +262,33 @@ The WSL host can run Windows exes directly:
   placeholder line by line but shapes each line with ONE run as long as the whole
   placeholder; DirectWrite's `layout_line` slices `&text[offset..offset + run.len]` → byte
   index out of range. Linux's text system tolerates it, so it never shows up here.
+- **SSH tunnels** (`zdb-db/src/ssh.rs`, russh with the `ring` backend — its default aws-lc
+  needs cmake + nasm on Windows). A connection with `ConnectionConfig.ssh` gets a `Tunnel`
+  (owned by its `ConnState`): one SSH session + a listener on a free 127.0.0.1 port, each
+  accepted socket carried over its own `direct-tcpip` channel. Everything dials that local
+  end — pool dials, CANCEL requests, and `sqls` (`DbHandle::open` returns `Connected.local`;
+  `conn.rs::lsp_config` points sqls there, verify-full → verify-ca as it has no real host
+  name). Postgres gets it as tokio-postgres `hostaddr` (`to_pg_config_at`): `host` stays the
+  real name, so TLS verify-full and the cancel token's TLS still check it. DON'T call
+  `Config::port` twice — it APPENDS (two ports for one host = config error).
+  - Host keys: looked up in `~/.ssh/known_hosts` (read only) + zdb's own
+    `<config>/zdb/known_hosts` (`zdb_config::known_hosts_files`). Unknown =
+    `DbError::UnknownHostKey(HostKey)` → `Modal::TrustHostKey` (fingerprint) → Trust writes
+    zdb's file (`zdb_db::trust_host_key`; a no-op under test) and connects again. A CHANGED
+    key is refused with the file + line. russh's `learn_known_hosts_path` starts a new file
+    with a blank line, hence our own writer.
+  - Auth: `SshAuth::{Key(path; empty = id_ed25519/id_ecdsa/id_rsa), Password (falls back to
+    keyboard-interactive), Agent (SSH_AUTH_SOCK; Windows: OpenSSH agent pipe, then Pageant)}`.
+    The password / key passphrase is in the keychain under `secret::ssh_account(name)`
+    (`"<name> (ssh)"`), resolved off the UI thread in `start_connect` like the DB password;
+    `store_entry` stores / renames / deletes both secrets in one background task.
+  - A dead session (network drop, sshd restart) is reopened by the next channel open; a
+    channel that doesn't open within 10s marks the session stale (a quietly dead socket isn't
+    `is_closed()` until keepalives run out). A failed dial reports the tunnel's reason
+    (`Tunnel::failure`), not the bare closed socket.
+  - Tests: `zdb-db/tests/ssh.rs`, gated on `ZDB_TEST_SSH_{HOST,PORT,USER,KEY}` + the Postgres
+    env. An unprivileged sshd works for it (own host key, `UsePAM no`, `StrictModes no`,
+    `AuthorizedKeysFile` in /tmp, high port; it can only log in as you, password auth fails).
 - **Connection form edits too** (`conn.rs::ConnForm`, pencil button per list row — a SIBLING
   of the row's connect click area). `ConnForm.editing` = the entry id; `fill` loads it (never
   the password: masked input, empty = keep the keychain's). Save updates the entry in place

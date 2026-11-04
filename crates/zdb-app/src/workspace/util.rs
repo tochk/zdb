@@ -1,8 +1,8 @@
 //! Small pure helpers: SQL string munging and connection-config mapping.
 
 use gpui_component::table::ColumnSort;
-use zdb_config::ConnectionEntry;
-use zdb_db::{ConnSetup, ConnectionConfig, RelationKind, SslMode};
+use zdb_config::{ConnectionEntry, SshAuthKind};
+use zdb_db::{ConnSetup, ConnectionConfig, RelationKind, SshAuth, SshConfig, SslMode};
 
 /// Pretty-print SQL: 2-space indent, uppercased keywords. Statements are
 /// formatted one at a time and keep the blank lines that were between them —
@@ -340,15 +340,21 @@ pub(crate) fn ssl_from_str(s: &str) -> SslMode {
 pub(crate) fn entry_to_config(
     entry: &ConnectionEntry,
     password: Option<String>,
+    ssh_secret: Option<String>,
 ) -> Result<ConnectionConfig, String> {
-    let mut cfg = entry_config(entry, password);
+    let mut cfg = entry_config(entry, password, ssh_secret);
     cfg.setup = ConnSetup::parse(&entry.params.join("\n"), &entry.init_sql)
         .map_err(|e| format!("{}: parameters, {e}", entry.name))?;
     Ok(cfg)
 }
 
-/// The config for a saved connection, without its pool setup.
-pub(crate) fn entry_config(entry: &ConnectionEntry, password: Option<String>) -> ConnectionConfig {
+/// The config for a saved connection, without its pool setup. `ssh_secret` is
+/// its SSH password or key passphrase.
+pub(crate) fn entry_config(
+    entry: &ConnectionEntry,
+    password: Option<String>,
+    ssh_secret: Option<String>,
+) -> ConnectionConfig {
     let mut cfg = ConnectionConfig::new(
         entry.name.clone(),
         entry.host.clone(),
@@ -358,6 +364,18 @@ pub(crate) fn entry_config(entry: &ConnectionEntry, password: Option<String>) ->
     cfg.port = entry.port;
     cfg.ssl_mode = ssl_from_str(&entry.ssl_mode);
     cfg.password = password;
+    cfg.ssh = entry.ssh.as_ref().map(|ssh| SshConfig {
+        host: ssh.host.clone(),
+        port: ssh.port,
+        user: ssh.user.clone(),
+        auth: match ssh.auth {
+            SshAuthKind::Key => SshAuth::Key(ssh.key_file.trim().into()),
+            SshAuthKind::Password => SshAuth::Password,
+            SshAuthKind::Agent => SshAuth::Agent,
+        },
+        secret: ssh_secret,
+        known_hosts: zdb_config::known_hosts_files(),
+    });
     cfg
 }
 

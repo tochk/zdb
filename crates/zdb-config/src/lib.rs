@@ -113,6 +113,37 @@ pub struct ConnectionEntry {
     /// SQL (typically `SET`s) run on every connection of its pool.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub init_sql: String,
+    /// Reach the database through this SSH server; `host`/`port` are then the
+    /// database as that server sees it. `None` = directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshEntry>,
+}
+
+/// The SSH server a saved connection goes through. Its password or key
+/// passphrase is in the keychain (`secret::ssh_account`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshEntry {
+    pub host: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub user: String,
+    #[serde(default)]
+    pub auth: SshAuthKind,
+    /// The private key for `key` (`~` = home); empty = the default ones.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key_file: String,
+}
+
+/// How a saved SSH server is logged in to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SshAuthKind {
+    /// A private key file, with its passphrase if it has one.
+    #[default]
+    Key,
+    Password,
+    /// The keys of a running SSH agent.
+    Agent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +180,10 @@ pub fn new_conn_id() -> String {
 
 fn default_port() -> u16 {
     5432
+}
+
+fn default_ssh_port() -> u16 {
+    22
 }
 
 fn default_ssl() -> String {
@@ -227,6 +262,19 @@ pub fn save_window_state(state: WindowState) {
     let _ = settings.save();
 }
 
+/// The known_hosts file zdb records SSH host keys the user trusted in
+/// (`<config dir>/zdb/known_hosts`).
+pub fn known_hosts_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("", "", "zdb").map(|d| d.config_dir().join("known_hosts"))
+}
+
+/// Where an SSH server's host key is looked up: the user's own
+/// `~/.ssh/known_hosts` (only read), then zdb's.
+pub fn known_hosts_files() -> Vec<PathBuf> {
+    let user = directories::BaseDirs::new().map(|d| d.home_dir().join(".ssh").join("known_hosts"));
+    user.into_iter().chain(known_hosts_path()).collect()
+}
+
 /// Path of the auto-saved scratch query file (`<config dir>/zdb/scratch.sql`).
 pub fn scratch_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "zdb").map(|d| d.config_dir().join("scratch.sql"))
@@ -266,6 +314,13 @@ mod tests {
                 ssl_mode: "require".into(),
                 params: vec!["application_name=x".into()],
                 init_sql: "SET search_path TO app".into(),
+                ssh: Some(SshEntry {
+                    host: "bastion".into(),
+                    port: 2222,
+                    user: "ops".into(),
+                    auth: SshAuthKind::Agent,
+                    key_file: String::new(),
+                }),
             }],
             theme: Theme::Light,
             keymap: vec![KeyBindingEntry {
@@ -306,6 +361,10 @@ mod tests {
         assert_eq!(back.connections[0].id, "abc");
         assert_eq!(back.connections[0].params, ["application_name=x"]);
         assert_eq!(back.connections[0].init_sql, "SET search_path TO app");
+        let ssh = back.connections[0].ssh.as_ref().unwrap();
+        assert_eq!((ssh.host.as_str(), ssh.port), ("bastion", 2222));
+        assert_eq!(ssh.auth, SshAuthKind::Agent);
+        assert!(json.contains(r#""auth": "agent""#));
         assert!(!back.show_query_log && back.show_messages);
         assert!(!back.confirm_query_cancel);
         assert_eq!(back.export_format, ExportFormat::Inserts);
@@ -364,8 +423,9 @@ mod tests {
         let s: Settings = serde_json::from_str(json).unwrap();
         assert_eq!(s.connections[0].port, 5432);
         assert_eq!(s.connections[0].ssl_mode, "prefer");
-        // No connection setup unless the file has one.
+        // No connection setup unless the file has one, and no SSH.
         assert!(s.connections[0].params.is_empty() && s.connections[0].init_sql.is_empty());
+        assert!(s.connections[0].ssh.is_none());
         assert_eq!(s.theme, Theme::Light); // default is white scheme
     }
 
@@ -381,5 +441,21 @@ mod tests {
         let loaded = Settings::load_from(&path).unwrap();
         assert_eq!(loaded.theme, Theme::Light);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ssh_defaults_fill_missing_fields() {
+        let json = r#"{ "connections": [
+            { "name": "x", "host": "db", "dbname": "d", "user": "u",
+              "ssh": { "host": "bastion", "user": "ops" } }
+        ] }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        let ssh = s.connections[0].ssh.as_ref().unwrap();
+        assert_eq!(ssh.port, 22);
+        assert_eq!(ssh.auth, SshAuthKind::Key);
+        assert!(ssh.key_file.is_empty());
+        // Written back without the empty key file.
+        let back = serde_json::to_string(&s).unwrap();
+        assert!(!back.contains("key_file"), "{back}");
     }
 }

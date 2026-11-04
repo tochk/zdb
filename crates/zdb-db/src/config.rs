@@ -4,7 +4,9 @@
 //! on-disk connection list. At runtime it is resolved from the OS keychain
 //! (Phase 3) or an environment variable; tests set it directly.
 
+use crate::SshConfig;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -64,6 +66,10 @@ pub struct ConnectionConfig {
     /// not part of the saved connection).
     #[serde(skip)]
     pub setup: ConnSetup,
+    /// Reach the database through this SSH server (`host`/`port` are then as
+    /// the SSH server sees them); `None` = directly.
+    #[serde(skip)]
+    pub ssh: Option<SshConfig>,
 }
 
 /// Set up every connection of a pool the same way: extra connection
@@ -241,6 +247,7 @@ impl ConnectionConfig {
             root_cert: None,
             password: None,
             setup: ConnSetup::default(),
+            ssh: None,
         }
     }
 
@@ -252,10 +259,23 @@ impl ConnectionConfig {
     /// reflects a lost connection and the worker's auto-reconnect kicks in.
     /// The setup's parameters go on top of those defaults.
     pub fn to_pg_config(&self) -> Result<tokio_postgres::Config, String> {
+        self.to_pg_config_at(None)
+    }
+
+    /// [`ConnectionConfig::to_pg_config`], dialing `via` (an SSH tunnel's
+    /// local end) instead of `host:port`. `host` stays the name TLS checks
+    /// the certificate against, and so does a cancel request.
+    pub(crate) fn to_pg_config_at(
+        &self,
+        via: Option<SocketAddr>,
+    ) -> Result<tokio_postgres::Config, String> {
         let mut cfg = tokio_postgres::Config::new();
-        cfg.host(&self.host)
-            .port(self.port)
-            .dbname(&self.dbname)
+        cfg.host(&self.host);
+        match via {
+            Some(addr) => cfg.hostaddr(addr.ip()).port(addr.port()),
+            None => cfg.port(self.port),
+        };
+        cfg.dbname(&self.dbname)
             .user(&self.user)
             .application_name("zdb")
             .connect_timeout(Duration::from_secs(10))
@@ -357,6 +377,28 @@ mod tests {
             .unwrap();
         assert_eq!(plain.get_application_name(), Some("zdb"));
         assert_eq!(plain.get_options(), None);
+    }
+
+    #[test]
+    fn a_tunnel_is_dialed_in_place_of_the_host() {
+        let mut cfg = ConnectionConfig::new("n", "db.internal", "db", "u");
+        cfg.port = 6432;
+        let direct = cfg.to_pg_config().unwrap();
+        assert_eq!(direct.get_ports(), [6432]);
+        assert!(direct.get_hostaddrs().is_empty());
+        let via = cfg
+            .to_pg_config_at(Some("127.0.0.1:40001".parse().unwrap()))
+            .unwrap();
+        // TLS still checks the database's own name.
+        assert!(matches!(
+            via.get_hosts(),
+            [tokio_postgres::config::Host::Tcp(h)] if h == "db.internal"
+        ));
+        assert_eq!(
+            via.get_hostaddrs(),
+            ["127.0.0.1".parse::<std::net::IpAddr>().unwrap()]
+        );
+        assert_eq!(via.get_ports(), [40001]);
     }
 
     #[test]

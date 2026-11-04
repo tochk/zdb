@@ -30,6 +30,12 @@ pub mod probe {
     }
 }
 
+/// The keychain name a connection's SSH password or key passphrase is stored
+/// under (its database password is under the connection's own name).
+pub fn ssh_account(name: &str) -> String {
+    format!("{name} (ssh)")
+}
+
 /// Store (or replace) the password for a connection. Returns whether it stuck.
 pub fn set_password(name: &str, password: &str) -> bool {
     keyring::Entry::new(SERVICE, name)

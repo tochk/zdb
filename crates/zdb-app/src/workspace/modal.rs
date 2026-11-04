@@ -27,6 +27,8 @@ pub(super) enum Modal {
     ConfirmCancel(u64),
     /// A tab's staged changes as statements, to review before they run.
     ConfirmApply(u64),
+    /// "Trust this SSH server?" — its host key is new (`Workspace::host_key`).
+    TrustHostKey,
 }
 
 /// Dialog focus bookkeeping (see the module docs).

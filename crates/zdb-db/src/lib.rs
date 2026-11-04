@@ -11,10 +11,11 @@ mod error;
 mod export;
 mod introspect;
 mod query;
+mod ssh;
 mod tls;
 mod types;
 
-pub use actor::{DbHandle, QueryStream, Session, Unserved, DEFAULT_POOL_SIZE};
+pub use actor::{Connected, DbHandle, QueryStream, Session, Unserved, DEFAULT_POOL_SIZE};
 pub use config::{ConnSetup, ConnectionConfig, SslMode};
 pub use edit::{build_batch, edit_statements, DescribedResult, EditTarget, RowEdit};
 pub use error::DbError;
@@ -23,4 +24,5 @@ pub use introspect::{
     ColumnInfo, ConstraintInfo, IndexInfo, RelationDetail, RelationInfo, RelationKind, SchemaInfo,
     SchemaObjects,
 };
+pub use ssh::{trust_host_key, HostKey, SshAuth, SshConfig};
 pub use types::{CellValue, ColumnMeta, ConnId, QueryEvent, Row};

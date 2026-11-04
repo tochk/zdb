@@ -6,7 +6,7 @@
 //! 1-based error position, which the editor uses to underline the offending
 //! token).
 
-use crate::ConnId;
+use crate::{ConnId, HostKey};
 use thiserror::Error;
 
 #[derive(Debug, Clone, Error)]
@@ -32,6 +32,15 @@ pub enum DbError {
 
     #[error("TLS configuration error: {0}")]
     Tls(String),
+
+    /// Reaching the database through its SSH server failed.
+    #[error("SSH: {0}")]
+    Ssh(String),
+
+    /// The SSH server's host key isn't recorded as trusted yet: the user
+    /// decides ([`crate::trust_host_key`]) and connects again.
+    #[error("SSH: {}:{} is not a known host ({} key {})", .0.host, .0.port, .0.algorithm, .0.fingerprint)]
+    UnknownHostKey(HostKey),
 
     #[error("no such connection: {0}")]
     NoConnection(ConnId),
