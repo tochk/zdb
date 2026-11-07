@@ -1,4 +1,4 @@
-# zdb
+# skimrow
 
 A fast, minimal PostgreSQL desktop client in Rust, built on
 [GPUI](https://www.gpui.rs/) (Zed's UI framework). Linux, Windows and macOS.
@@ -27,13 +27,13 @@ A fast, minimal PostgreSQL desktop client in Rust, built on
 ## Install
 
 Download the zip for your system from the
-[latest release](https://github.com/tochk/zdb/releases/latest). Keep `sqls` next to the app:
+[latest release](https://github.com/tochk/skimrow/releases/latest). Keep `sqls` next to the app:
 completion needs it.
 
 ## Build
 
 ```bash
-cargo run -p zdb-app
+cargo run -p skimrow-app
 ```
 
 Linux needs `pkg-config libx11-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev
@@ -44,7 +44,7 @@ binaries on Windows (MSVC + the Windows SDK). `make sqls` builds the completion 
 
 ```bash
 cargo test
-ZDB_TEST_HOST=127.0.0.1 ZDB_TEST_USER=zdb ZDB_TEST_DB=zdb ZDB_TEST_PASSWORD=zdb cargo test  # with Postgres
+SKIMROW_TEST_HOST=127.0.0.1 SKIMROW_TEST_USER=skimrow SKIMROW_TEST_DB=skimrow SKIMROW_TEST_PASSWORD=skimrow cargo test  # with Postgres
 make fmt
 make clippy
 ```

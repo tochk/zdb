@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Build the `sqls` SQL language server (github.com/sqls-server/sqls) from source
-# for the arches zdb ships. zdb bundles the matching binary next to `zdb[.exe]`
+# for the arches skimrow ships. skimrow bundles the matching binary next to `skimrow[.exe]`
 # and drives it as an LSP subprocess for SQL completion.
 #
 # We build from source (not the official release) because upstream ships an
-# x86-64-only binary, and zdb targets Windows-on-ARM64. sqls is pure Go, so with
+# x86-64-only binary, and skimrow targets Windows-on-ARM64. sqls is pure Go, so with
 # CGO off it cross-compiles to every arch — except two bundled drivers pull in C
-# (Oracle `godror`, `mattn/go-sqlite3`). zdb only speaks Postgres, so we drop
+# (Oracle `godror`, `mattn/go-sqlite3`). skimrow only speaks Postgres, so we drop
 # those two blank imports before building.
 #
 # Usage: scripts/build-sqls.sh [output_dir]   (default: dist/sqls)

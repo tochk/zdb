@@ -2,8 +2,8 @@
 """Generate the app icons — a white database cylinder on a black rounded square,
 no letter — for every platform:
 
-    crates/zdb-app/resources/zdb.ico    Windows (embedded by build.rs)
-    crates/zdb-app/resources/zdb.icns   macOS (copied into zdb.app by
+    crates/skimrow-app/resources/skimrow.ico    Windows (embedded by build.rs)
+    crates/skimrow-app/resources/skimrow.icns   macOS (copied into skimrow.app by
                                         scripts/package-macos.sh)
 
 Run: python3 scripts/gen-icon.py"""
@@ -48,14 +48,14 @@ for by in (top_y + 128, top_y + 256):
 # Top disc (drawn last so it sits above the body).
 d.ellipse([cx - rx, top_y - ry, cx + rx, top_y + ry], fill=face_top, outline=stroke, width=sw)
 
-RES = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "crates", "zdb-app", "resources"))
+RES = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "crates", "skimrow-app", "resources"))
 
 # --- Windows .ico ---------------------------------------------------------
 # Downscale master, then emit a multi-size .ico.
 master = img.resize((256, 256), Image.LANCZOS)
 sizes = [256, 64, 48, 32, 16]
 frames = [master.resize((s, s), Image.LANCZOS) for s in sizes]
-out = os.path.join(RES, "zdb.ico")
+out = os.path.join(RES, "skimrow.ico")
 frames[0].save(out, format="ICO", sizes=[(s, s) for s in sizes], append_images=frames[1:])
 print("wrote", out)
 
@@ -90,7 +90,7 @@ for kind, size in ICNS_TYPES:
     png = buf.getvalue()
     entries.append(kind + struct.pack(">I", len(png) + 8) + png)
 body = b"".join(entries)
-out = os.path.join(RES, "zdb.icns")
+out = os.path.join(RES, "skimrow.icns")
 with open(out, "wb") as f:
     f.write(b"icns" + struct.pack(">I", len(body) + 8) + body)
 print("wrote", out)

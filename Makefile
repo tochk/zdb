@@ -1,4 +1,4 @@
-# zdb — build / test / cross-package.
+# skimrow — build / test / cross-package.
 #
 # Dev is on WSL2 aarch64 Linux. Windows-on-ARM64 is the ship target and cross-
 # compiles here (llvm-mingw). macOS must be built ON a Mac (no macOS SDK here) —
@@ -30,16 +30,16 @@ all: build
 ## --- local dev (Linux) ---------------------------------------------------
 
 build: ## Debug build of the app
-	$(CARGO) build -p zdb-app
+	$(CARGO) build -p skimrow-app
 
 run: build dev-sqls ## Build + run the app (dev)
-	./target/debug/zdb
+	./target/debug/skimrow
 
 test: ## Run all tests
 	$(CARGO) test
 
 clippy: ## Lint
-	$(CARGO) clippy -p zdb-app -p zdb-db
+	$(CARGO) clippy -p skimrow-app -p skimrow-db
 
 fmt: ## Format every crate (rustfmt.toml)
 	$(CARGO) fmt --all
@@ -60,18 +60,18 @@ dist/sqls/sqls-linux-arm64:
 
 ## --- Windows (cross-compiled here) ----------------------------------------
 
-windows: ## Cross-build zdb.exe for Windows ARM64 (release)
-	$(WIN_ARM_ENV) $(CARGO) build -p zdb-app --release --target $(WIN_ARM)
+windows: ## Cross-build skimrow.exe for Windows ARM64 (release)
+	$(WIN_ARM_ENV) $(CARGO) build -p skimrow-app --release --target $(WIN_ARM)
 
-windows-x64: ## Cross-build zdb.exe for Windows x64 (release)
-	$(CARGO) build -p zdb-app --release --target $(WIN_X64)
+windows-x64: ## Cross-build skimrow.exe for Windows x64 (release)
+	$(CARGO) build -p skimrow-app --release --target $(WIN_X64)
 
 package-windows: windows sqls ## Build + bundle the Windows ARM64 zip (exe + sqls + shaders)
 	bash scripts/package-windows.sh $(WIN_ARM) arm64
 
 deploy-windows-test: package-windows ## Copy the unpacked Windows ARM64 build to $(ZDBTEST)
 	mkdir -p "$(ZDBTEST)"
-	cp -r dist/zdb-windows-arm64/. "$(ZDBTEST)/"
+	cp -r dist/skimrow-windows-arm64/. "$(ZDBTEST)/"
 	@echo "deployed to $(ZDBTEST)"
 
 ## --- macOS (must run ON a Mac; no SDK on the Linux dev box) ----------------
@@ -79,12 +79,12 @@ deploy-windows-test: package-windows ## Copy the unpacked Windows ARM64 build to
 macos: macos-arm ## Alias: native macOS build (Apple Silicon)
 
 macos-arm: ## Native release build for Apple Silicon (run on a Mac)
-	$(CARGO) build -p zdb-app --release --target aarch64-apple-darwin
+	$(CARGO) build -p skimrow-app --release --target aarch64-apple-darwin
 
 macos-x64: ## Native release build for Intel macOS (run on a Mac)
-	$(CARGO) build -p zdb-app --release --target x86_64-apple-darwin
+	$(CARGO) build -p skimrow-app --release --target x86_64-apple-darwin
 
-package-macos: sqls ## Assemble zdb.app for the host arch + bundle sqls (run on a Mac)
+package-macos: sqls ## Assemble skimrow.app for the host arch + bundle sqls (run on a Mac)
 	bash scripts/package-macos.sh
 
 ## -------------------------------------------------------------------------

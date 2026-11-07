@@ -1,8 +1,8 @@
-# CLAUDE.md — working notes for zdb
+# CLAUDE.md — working notes for skimrow
 
 Guidance for future Claude sessions working in this repo. Keep it current.
 
-## What zdb is
+## What skimrow is
 
 A fast, Zed-style desktop PostgreSQL client built in Rust on **gpui** (Zed's UI
 framework). Single active connection at a time; inline-editable result grids;
@@ -12,7 +12,7 @@ SQL editor; embedded terminal; command palette; light/dark theme.
 
 ```
 crates/
-  zdb-db/      data layer: async DbHandle (own Tokio runtime thread + channels),
+  skimrow-db/      data layer: async DbHandle (own Tokio runtime thread + channels),
                streaming query exec, schema introspection, inline-edit engine
                (edit.rs), query editability describe (actor.rs run_describe),
                rustls(ring) TLS. A ConnId owns a connection POOL (see "DB pool"
@@ -21,9 +21,9 @@ crates/
                once on a fresh one (safe — nothing reached the server;
                mid-stream failures never retry). 10s connect_timeout + 120s
                keepalive in config.rs.
-  zdb-config/  JSON settings (connections, theme, keymap) + OS-keychain passwords
+  skimrow-config/  JSON settings (connections, theme, keymap) + OS-keychain passwords
                (secret.rs, keyring; per-OS backend).
-  zdb-app/     gpui app (bin `zdb`): workspace/ (the UI — ONE `Workspace` gpui
+  skimrow-app/     gpui app (bin `skimrow`): workspace/ (the UI — ONE `Workspace` gpui
                entity, split by concern into child modules; each file holds an
                `impl Workspace` block + its own tests):
                  mod.rs     struct def + new(), actions!, palette/terminal/
@@ -56,30 +56,30 @@ crates/
 ```
 
 The UI talks to the DB only through `DbHandle` channels; it never touches Tokio
-(`zdb_db::QueryStream` names the query-event receiver so the UI needn't).
+(`skimrow_db::QueryStream` names the query-event receiver so the UI needn't).
 
 ## Build / run / test
 
 - Source the env every shell: `. "$HOME/.cargo/env"` (cargo not on PATH otherwise).
-- Build: `cargo build -p zdb-app`. Run: `./target/debug/zdb`.
+- Build: `cargo build -p skimrow-app`. Run: `./target/debug/skimrow`.
 - On WSL the app forces the X11 backend (gpui Wayland panics under WSLg) — handled
   in `main.rs::is_wsl`.
 - Tests: `cargo test`. Postgres integration tests are gated on env:
-  `ZDB_TEST_HOST=127.0.0.1 ZDB_TEST_USER=zdb ZDB_TEST_DB=zdb ZDB_TEST_PASSWORD=zdb cargo test`.
+  `SKIMROW_TEST_HOST=127.0.0.1 SKIMROW_TEST_USER=zdb SKIMROW_TEST_DB=zdb SKIMROW_TEST_PASSWORD=zdb cargo test`.
   A native Postgres 16 runs locally (no docker): `sudo pg_ctlcluster 16 main start`
-  (role/db/pw all `zdb`).
+  (role/db/pw all `zdb` — the pre-rename name, kept).
 - Format with `make fmt` (`cargo fmt --all`, config in `rustfmt.toml`); CI's `fmt` job
   runs `cargo fmt --all --check` and fails on anything unformatted.
 - gpui UI tests use `#[gpui::test]` and need gpui's `test-support` dev-feature
-  (already set in zdb-app `[dev-dependencies]`).
-- Run dev with a connection via env: `ZDB_HOST/USER/DB/PASSWORD`, `ZDB_SSL_DISABLE=1`
-  (`ZDB_NAME` labels it; default "dev").
-  `ZDB_LOG=1` prints milestones; `ZDB_SELFTEST=1` runs a demo query after connect.
+  (already set in skimrow-app `[dev-dependencies]`).
+- Run dev with a connection via env: `SKIMROW_HOST/USER/DB/PASSWORD`, `SKIMROW_SSL_DISABLE=1`
+  (`SKIMROW_NAME` labels it; default "dev").
+  `SKIMROW_LOG=1` prints milestones; `SKIMROW_SELFTEST=1` runs a demo query after connect.
 - **Drive the GUI on a virtual display, not the user's.** WSLg windows land on the user's
   desktop and `xdotool` moves THEIR mouse. Xvfb is installed: `Xvfb :99 -screen 0
-  2400x1600x24 &`, then run zdb with `DISPLAY=:99` (+ `env -u WAYLAND_DISPLAY`) and an
+  2400x1600x24 &`, then run skimrow with `DISPLAY=:99` (+ `env -u WAYLAND_DISPLAY`) and an
   isolated `XDG_CONFIG_HOME=/tmp/...` (a `settings.json` there sets theme / window size /
-  panels; seed `zdb/tabs/env.json` + `zdb/scratch/env.sql` to restore tabs). Screenshot with
+  panels; seed `skimrow/tabs/env.json` + `skimrow/scratch/env.sql` to restore tabs). Screenshot with
   `import -window <id>`. Rendering works (lavapipe). `GPUI_X11_SCALE_FACTOR=1.25` reproduces
   the user's Windows DPI — fractional-scale layout bugs show up here (see the editor-split
   note). README screenshots (`docs/screenshots/`) were taken this way at 1440×900 @1.25
@@ -97,42 +97,42 @@ Target is **Windows on ARM64** (the dev box is WSL2 aarch64; the host is ARM64).
   on the user's machine. (We used to work around this with a vendored/patched
   gpui + `debug-assertions = true` + a bundled `shaders/` folder; that whole
   path was removed — see BUILDING-WINDOWS.md.)
-- Resources: `crates/zdb-app/build.rs` (embed-resource) GENERATES `zdb.rc` into
-  `OUT_DIR` (absolute forward-slash paths to `resources/`): `zdb.ico` (app icon) +
+- Resources: `crates/skimrow-app/build.rs` (embed-resource) GENERATES `skimrow.rc` into
+  `OUT_DIR` (absolute forward-slash paths to `resources/`): `skimrow.ico` (app icon) +
   a `VERSIONINFO` block from the build info (Explorer → Properties → Details), and
-  `zdb.manifest` (Common-Controls v6 → fixes `TaskDialogIndirect`) ONLY when
+  `skimrow.manifest` (Common-Controls v6 → fixes `TaskDialogIndirect`) ONLY when
   cross-compiling — a native build gets gpui's manifest and a second one collides. GUI subsystem via `#![cfg_attr(target_os="windows", ...)]`.
   MSVC's `link.exe` also auto-embeds a default manifest which collides with ours
   → `/MANIFEST:NO` in `.cargo/config.toml` for the msvc targets.
-- CI's Package step drops `zdb.exe` + `sqls.exe` into the artifact; no extra
+- CI's Package step drops `skimrow.exe` + `sqls.exe` into the artifact; no extra
   runtime files needed.
 
 ## macOS builds
 
-**Always ship the `.app` bundle, never the bare `zdb` executable.** Finder cannot
+**Always ship the `.app` bundle, never the bare `skimrow` executable.** Finder cannot
 launch a Unix executable — double-clicking one makes it open **Terminal** and run
 the app from there, and it shows the generic exec icon (no `CFBundleIconFile`).
 That was the whole "it starts a terminal first / has no icon" symptom.
 
-- `scripts/package-macos.sh [arch]` assembles `dist/zdb.app` (must run ON a Mac —
-  no macOS SDK on the Linux dev box). Env: `ZDB_SKIP_BUILD=1` reuses an existing
-  release binary (CI already built one into `target/release`), `ZDB_ZIP=1` also
-  writes `dist/zdb-macos-<arch>.zip` via `ditto`.
+- `scripts/package-macos.sh [arch]` assembles `dist/skimrow.app` (must run ON a Mac —
+  no macOS SDK on the Linux dev box). Env: `SKIMROW_SKIP_BUILD=1` reuses an existing
+  release binary (CI already built one into `target/release`), `SKIMROW_ZIP=1` also
+  writes `dist/skimrow-macos-<arch>.zip` via `ditto`.
 - The script ad-hoc **codesigns** the bundle (`codesign --force --deep --sign -`):
   Apple Silicon refuses unsigned code, and adding `sqls`/Info.plist invalidates the
   linker's own ad-hoc signature on the bare binary. It then `lsregister -f`s the
   path — macOS caches bundle icons **per path** and otherwise keeps showing the old
   or generic one (same class of trap as the Windows Explorer icon cache).
-- Icon: `scripts/gen-icon.py` emits BOTH `resources/zdb.ico` and `resources/zdb.icns`.
+- Icon: `scripts/gen-icon.py` emits BOTH `resources/skimrow.ico` and `resources/skimrow.icns`.
   The `.icns` is written by a small pure-Python packer (`icns` header + `type/len/PNG`
   entries) because Pillow's own ICNS *writer* shells out to macOS-only `iconutil`,
   and we generate here on Linux. Art is inset to 824/1024 (Apple's icon grid) or it
   looks oversized in the Dock.
 - CI (`build.yml` Package step) branches on `goos == darwin`: runs the script and
-  uploads `zdb.app.zip`. Upload-artifact does NOT preserve the exec bit or bundle
+  uploads `skimrow.app.zip`. Upload-artifact does NOT preserve the exec bit or bundle
   layout, so the inner `ditto` zip is required, not cosmetic.
 - Distributing it: ad-hoc signing ≠ notarized, so a downloaded copy needs
-  `xattr -dr com.apple.quarantine /Applications/zdb.app` once (Gatekeeper otherwise says
+  `xattr -dr com.apple.quarantine /Applications/skimrow.app` once (Gatekeeper otherwise says
   "damaged"). Deliberately NOT in the README (the user's call: keep it short).
 
 ## Releases + build info
@@ -155,13 +155,13 @@ That was the whole "it starts a terminal first / has no icon" symptom.
 - `build.yml`'s concurrency group is `${{ github.workflow }}-${{ github.ref }}`:
   under `workflow_call` that's the CALLER's name, so a push to master can't cancel a
   release's builds.
-- **Build info** (`crates/zdb-app/build.rs` → `ZDB_BUILD_*` rustc envs →
-  `src/build_info.rs`): version = `$ZDB_VERSION` (the release passes it; the bump
+- **Build info** (`crates/skimrow-app/build.rs` → `SKIMROW_BUILD_*` rustc envs →
+  `src/build_info.rs`): version = `$SKIMROW_VERSION` (the release passes it; the bump
   commit isn't tagged yet when it builds) else `git describe --tags --dirty` else the
   Cargo version; commit + dirty flag, commit date, build date (`SOURCE_DATE_EPOCH`
   honored), target, profile, `rustc -V`. Shown in Settings → ABOUT (commit links to
   GitHub via `CARGO_PKG_REPOSITORY`, Copy = the `--version` text) and by
-  `zdb --version`/`-V` (checked first thing in `main`; on Windows it
+  `skimrow --version`/`-V` (checked first thing in `main`; on Windows it
   `AttachConsole`s the parent console — GUI-subsystem exe). build.rs reruns only when
   git HEAD / the branch ref / tags / the index change, so "dirty" follows `git add`,
   not unsaved edits. CI checks out with `fetch-depth: 0` for describe. A local clone
@@ -174,7 +174,7 @@ That was the whole "it starts a terminal first / has no icon" symptom.
 The WSL host can run Windows exes directly:
 - Copy build to a Windows path: `cp ... /mnt/c/zdbtest/` (interop dislikes UNC cwd).
 - Run + capture stderr (panics show even for GUI subsystem):
-  `cmd.exe /c "C:\\zdbtest\\zdb.exe & echo EXITCODE=%errorlevel%"`.
+  `cmd.exe /c "C:\\zdbtest\\skimrow.exe & echo EXITCODE=%errorlevel%"`.
 - Screenshot a specific window (works when occluded) with PowerShell + Win32
   `PrintWindow(hwnd, hdc, 2)`. This is how UI changes are verified visually.
 - **DPI SCREENSHOT TRAP (cost hours once):** the host is 125% DPI; the window is
@@ -186,8 +186,8 @@ The WSL host can run Windows exes directly:
   top of the capture script so `GetWindowRect` returns full physical size and the
   bitmap covers the whole window. Don't debug "missing" right-edge UI until the
   capture is DPI-aware. (`/mnt/c/zdbtest/capdpi.ps1` is the DPI-aware version.)
-- Windows settings path: `%APPDATA%\zdb\config\settings.json` (directories crate
-  adds the `config` subdir). Keychain = Windows Credential Manager (service `zdb`).
+- Windows settings path: `%APPDATA%\skimrow\config\settings.json` (directories crate
+  adds the `config` subdir). Keychain = Windows Credential Manager (service `skimrow`).
 
 ## Commits
 
@@ -195,6 +195,16 @@ The WSL host can run Windows exes directly:
 - **NEVER add a `Co-Authored-By:` trailer** (no Claude co-author line, ever).
 
 ## Gotchas
+
+- **The app was called `zdb` until v0.8.0** (renamed to skimrow; the repo checkout dir and
+  the local Postgres role / `/mnt/c/zdbtest` kept the old name). Existing installs are carried
+  over: `main.rs` calls `skimrow_config::migrate_legacy_config()` once at startup, which
+  renames the old `ProjectDirs("zdb")` config dir to the new one ONLY while the new one
+  doesn't exist (Windows: `%APPDATA%\zdb\config` → `%APPDATA%\skimrow\config`, empty
+  `zdb` parent removed). Never call it from the path helpers — tests reach those and would
+  move the dev machine's real config. Keychain: `secret::get_password` falls back to service
+  `zdb` and moves the entry over; `delete_password` deletes under both (else a deleted
+  connection's old password would come back through the fallback).
 
 - Background-command "exit 0" from `… | tee | tail` is the tail's exit — always
   grep the log for `error:` to confirm a build actually passed.
@@ -218,12 +228,12 @@ The WSL host can run Windows exes directly:
   - **The test scheduler rejects wakeups from other threads** (it aborts the test process).
     UI tests use `DbHandle::idle()`, or `unserved()` + `refuse_all()` to answer on the test's
     own thread; never `DbHandle::spawn()`, and no reader thread that hits EOF.
-- Driving the app on WSL X11: stop it with `pkill -x zdb` — `pkill -f target/debug/zdb`
+- Driving the app on WSL X11: stop it with `pkill -x skimrow` — `pkill -f target/debug/skimrow`
   matches (and kills) the shell running the command. `import -window` silently crops a
   window that extends past the screen (bottom-panel UI "missing"): `xdotool windowmove`
   it on-screen first. Synthetic hover (tooltips, diagnostic popovers) only registers
   after a synthetic click in the window. Running the app writes the REAL
-  `~/.config/zdb` (env connection's tabs → `tabs/env.json`, scratch → `scratch/env.sql`,
+  `~/.config/skimrow` (env connection's tabs → `tabs/env.json`, scratch → `scratch/env.sql`,
   settings toggled in the UI) — clean up after testing.
 - **Custom (Zed-style) title bar** lives in `workspace.rs::render_titlebar` (not
   the gpui-component `TitleBar`). Window opens borderless via
@@ -262,7 +272,7 @@ The WSL host can run Windows exes directly:
   placeholder line by line but shapes each line with ONE run as long as the whole
   placeholder; DirectWrite's `layout_line` slices `&text[offset..offset + run.len]` → byte
   index out of range. Linux's text system tolerates it, so it never shows up here.
-- **SSH tunnels** (`zdb-db/src/ssh.rs`, russh with the `ring` backend — its default aws-lc
+- **SSH tunnels** (`skimrow-db/src/ssh.rs`, russh with the `ring` backend — its default aws-lc
   needs cmake + nasm on Windows). A connection with `ConnectionConfig.ssh` gets a `Tunnel`
   (owned by its `ConnState`): one SSH session + a listener on a free 127.0.0.1 port, each
   accepted socket carried over its own `direct-tcpip` channel. Everything dials that local
@@ -271,10 +281,10 @@ The WSL host can run Windows exes directly:
   name). Postgres gets it as tokio-postgres `hostaddr` (`to_pg_config_at`): `host` stays the
   real name, so TLS verify-full and the cancel token's TLS still check it. DON'T call
   `Config::port` twice — it APPENDS (two ports for one host = config error).
-  - Host keys: looked up in `~/.ssh/known_hosts` (read only) + zdb's own
-    `<config>/zdb/known_hosts` (`zdb_config::known_hosts_files`). Unknown =
+  - Host keys: looked up in `~/.ssh/known_hosts` (read only) + skimrow's own
+    `<config>/skimrow/known_hosts` (`skimrow_config::known_hosts_files`). Unknown =
     `DbError::UnknownHostKey(HostKey)` → `Modal::TrustHostKey` (fingerprint) → Trust writes
-    zdb's file (`zdb_db::trust_host_key`; a no-op under test) and connects again. A CHANGED
+    skimrow's file (`skimrow_db::trust_host_key`; a no-op under test) and connects again. A CHANGED
     key is refused with the file + line. russh's `learn_known_hosts_path` starts a new file
     with a blank line, hence our own writer.
   - Auth: `SshAuth::{Key(path; empty = id_ed25519/id_ecdsa/id_rsa), Password (falls back to
@@ -286,7 +296,7 @@ The WSL host can run Windows exes directly:
     channel that doesn't open within 10s marks the session stale (a quietly dead socket isn't
     `is_closed()` until keepalives run out). A failed dial reports the tunnel's reason
     (`Tunnel::failure`), not the bare closed socket.
-  - Tests: `zdb-db/tests/ssh.rs`, gated on `ZDB_TEST_SSH_{HOST,PORT,USER,KEY}` + the Postgres
+  - Tests: `skimrow-db/tests/ssh.rs`, gated on `SKIMROW_TEST_SSH_{HOST,PORT,USER,KEY}` + the Postgres
     env. An unprivileged sshd works for it (own host key, `UsePAM no`, `StrictModes no`,
     `AuthorizedKeysFile` in /tmp, high port; it can only log in as you, password auth fails).
 - **Connection form edits too** (`conn.rs::ConnForm`, pencil button per list row — a SIBLING
@@ -303,7 +313,7 @@ The WSL host can run Windows exes directly:
   via `weak.update(...)`. Edits accumulate in `pending: Vec<RowEdit>` (optimistically
   shown in the grid, + a blue "N changes staged" toolbar badge). **Apply** = the green ✓
   next to Run / Ctrl+S / the badge → `edit.rs::request_apply`: stages the cell being typed,
-  then opens `Modal::ConfirmApply(tab)` listing `pending_statements` (`zdb_db::edit_statements`
+  then opens `Modal::ConfirmApply(tab)` listing `pending_statements` (`skimrow_db::edit_statements`
   — the statements WITHOUT the `BEGIN`/`COMMIT`; the batch still runs in one transaction via
   `apply_edits`/`build_batch`). "Don't ask again" (`apply_dont_ask`, reset per opening) counts
   only with Apply and clears `Settings.confirm_apply` (also a Settings checkbox) — then Apply
@@ -330,13 +340,13 @@ The WSL host can run Windows exes directly:
   checks every box; the test platform's scale is 2.0, and the sweep DOES reproduce the old
   collapse (verified by swapping the old `v_resizable` code back in). Elements that can't take a `debug_selector` (the `Editor`) are measured with `input_bounds()` of its state.
 - App icon: regen with `python3 scripts/gen-icon.py` (black rounded square + white DB
-  cylinder, no letter) → `resources/zdb.ico`, embedded via build.rs. build.rs has
+  cylinder, no letter) → `resources/skimrow.ico`, embedded via build.rs. build.rs has
   `rerun-if-changed` on the .ico so it re-embeds. Windows Explorer may still show the
   OLD icon from its per-path icon cache even when the taskbar/window icon is correct —
   that's host-side staleness (clear with `ie4uinit.exe -show` / delete iconcache), not
   a build problem.
-- **Window geometry is persisted** (`Settings.window: Option<WindowState>` in zdb-config;
-  `zdb_config::save_window_state` re-reads the file before writing so it never clobbers
+- **Window geometry is persisted** (`Settings.window: Option<WindowState>` in skimrow-config;
+  `skimrow_config::save_window_state` re-reads the file before writing so it never clobbers
   other settings). `main.rs` turns it into `WindowOptions.window_bounds`
   (`Maximized` when the flag is set — gpui stores the RESTORE bounds in that variant),
   dropping bounds that intersect no current display (unplugged monitor → off-screen window).
@@ -349,7 +359,7 @@ The WSL host can run Windows exes directly:
   otherwise stomp the dev machine's real settings.json).
   Verifying on WSL X11: `xdotool windowsize/windowmove` DO work, but synthetic
   `xdotool click`/`key alt+F4` are ignored by the app — don't try to test close paths by
-  clicking here; resize + read `~/.config/zdb/settings.json` instead.
+  clicking here; resize + read `~/.config/skimrow/settings.json` instead.
 - Resizable panels: gpui-component seeds any `resizable_panel()` WITHOUT an explicit
   `.size()` to `PANEL_MIN_SIZE` (state.rs `sync_panels_count`), then ratio-scales to
   the container. A group where the first panel had no size squeezed the last panel
@@ -384,7 +394,7 @@ The WSL host can run Windows exes directly:
   button bg when the glyph itself carries the color (e.g. green play, red minus).
 - Icons: gpui-component ships NO SVG files; `IconName` resolves to `icons/<name>.svg`
   loaded via the app's `AssetSource`. Without one, icon buttons render as blank
-  squares. We embed the (Lucide, MIT) SVGs we use in `crates/zdb-app/assets/icons/`
+  squares. We embed the (Lucide, MIT) SVGs we use in `crates/skimrow-app/assets/icons/`
   via `include_bytes!` in `src/assets.rs` and register `.with_assets(Assets)` in
   `main.rs`. Add a new `IconName` → add its SVG there too. (App `.ico` is separate:
   a Win32 resource via build.rs, unrelated to gpui icon rendering.)
@@ -550,7 +560,7 @@ The WSL host can run Windows exes directly:
   icon toggles (`.selected` + a `theme.blue` icon while open) for QUERY LOG / MESSAGES, persisted as
   `Settings.show_query_log` / `show_messages` (also in the palette), and TERMINAL (not
   persisted — starting a shell at launch unasked would be a side effect). With Messages hidden the
-  bar shows the latest status line. Hidden bottom = the `zdb-root` panel stays in the group with
+  bar shows the latest status line. Hidden bottom = the `skimrow-root` panel stays in the group with
   `.visible(false)` (its height survives the toggle) and the top panel's 1200px cap is lifted.
   The bar is pinned to `viewport_size().width` like the title bar.
 - **Pager** (`view.rs::render_pager`, `query.rs::go_page`): `« ‹ 501–1000 of N › »`. A page
@@ -615,7 +625,7 @@ The WSL host can run Windows exes directly:
     to WHERE in the table toolbar, Enter re-runs) is the single source of truth, and typing
     in it clears `sort_state` (header arrows off). Do NOT re-parse the previous SQL. Query /
     Scratch tabs sort arbitrary user SQL, so they still use `util::order_by_sql`'s
-    `SELECT * FROM (<base>) AS _zdb ORDER BY …` wrapper (LIMIT hoisted out).
+    `SELECT * FROM (<base>) AS _skimrow ORDER BY …` wrapper (LIMIT hoisted out).
   - The flat result fields were REMOVED from `Workspace`; every result/edit method takes a
     `tab_id` and looks up `tab_mut(id)`. Toolbar/action callers pass `active_id()`.
     `cell_input` stays SHARED on `Workspace` (only the active tab edits one cell at a time;
@@ -649,8 +659,8 @@ The WSL host can run Windows exes directly:
   - Opening a tab needs `&mut Window`; from windowless async contexts (the selftest) set
     `pending_open` and let `render()` consume it next frame.
 
-- **DB pool** (`zdb-db/src/actor.rs`). Postgres runs ONE statement at a time per
-  connection, and zdb used to have one connection: every tab, the tree, describe and the
+- **DB pool** (`skimrow-db/src/actor.rs`). Postgres runs ONE statement at a time per
+  connection, and skimrow used to have one connection: every tab, the tree, describe and the
   pager's count queued on it (a 30s count froze every other tab), and `cancel` hit whatever
   that connection happened to be running — often ANOTHER tab's query ("other tabs stop
   loading after a cancel"). Now each `ConnId` has a pool like Go's `database/sql`: a job
@@ -690,7 +700,7 @@ The WSL host can run Windows exes directly:
     per connection and reused by every dial and cancel (verifying modes load the OS trust
     store — slow on Windows).
   - **Connection setup** is PER CONNECTION (`ConnectionEntry.params` lines + `init_sql`,
-    edited in the connection form; `zdb_db::ConnSetup`, carried on `ConnectionConfig.setup`;
+    edited in the connection form; `skimrow_db::ConnSetup`, carried on `ConnectionConfig.setup`;
     the env connection has none). Params: libpq client keys (`application_name`,
     `connect_timeout`, `options`, keepalives…) set the tokio-postgres `Config`; ANY other key
     is a server GUC sent at startup as `-c key=value` in `options` (space/backslash
@@ -706,22 +716,22 @@ The WSL host can run Windows exes directly:
     reconnects instead.
   - UI side, Stop (`query.rs::cancel`) frees the tab at once (`running = false`,
     `run_gen` bumped so the late result is dropped). `describe` is queued AFTER the run.
-  Tests: `crates/zdb-db/tests/sessions.rs` (parallel sessions, pool cap, cancel isolation
+  Tests: `crates/skimrow-db/tests/sessions.rs` (parallel sessions, pool cap, cancel isolation
   + queued jobs, pinning across runs incl. aborted blocks, no SET/temp leaks incl. via a
   transaction, close rolls back). NOTE when reading `pg_stat_activity` while testing: an
   idle connection shows its LAST statement, which is often the describe's Parse of the
   user SQL or the `now() <> statement_timestamp()` check.
 
-- **Saved tabs per connection** (`workspace/session.rs`, `zdb-config/src/tabs.rs`).
+- **Saved tabs per connection** (`workspace/session.rs`, `skimrow-config/src/tabs.rs`).
   Each connection's tab set — order, active index, and per tab: title + kind +
   (Query: editor SQL) / (Table: schema, relation, WHERE, ORDER BY) — is written to
-  `<config>/zdb/tabs/<conn id>.json` (`"version": 1`, temp file + rename) and
+  `<config>/skimrow/tabs/<conn id>.json` (`"version": 1`, temp file + rename) and
   reopened on the next connect to it, so it survives both a restart and an
   A→B→A switch. Rows, cursor, widths and staged edits are NOT stored.
   - **Identity is `ConnectionEntry.id`** (uuid), not the name. `Settings::load`
     backfills entries from older files and writes them back once; the add form
     re-saving an existing NAME keeps that entry's id (`conn::conn_id_for`). The
-    keychain is still keyed by name. The env (`ZDB_HOST`) connection has no entry
+    keychain is still keyed by name. The env (`SKIMROW_HOST`) connection has no entry
     and uses the fixed key `session::ENV_CONN_KEY`. `Workspace.conn_key` holds
     whichever applies; ids are checked to be a plain file stem before they are
     joined into a path (settings.json is hand-editable).
@@ -733,7 +743,7 @@ The WSL host can run Windows exes directly:
     turned on mid-session doesn't start saving: restore never ran for this connect.
   - Restore needs `&mut Window`: a successful connect sets `pending_restore`,
     `render` consumes it. It replaces any tabs opened while not connected (no merge)
-    and is skipped under `ZDB_SELFTEST`.
+    and is skipped under `SKIMROW_SELFTEST`.
   - **Restored tabs don't query on connect.** A Table tab is built with
     `needs_load`; `render` → `load_restored_tab` runs it when it is the ACTIVE tab
     (render, not `activate_tab`, because `close_tab` & co. move `active` directly).
@@ -742,7 +752,7 @@ The WSL host can run Windows exes directly:
     the Query editor / WHERE / ORDER BY) debounces one write 500ms out; explicit
     flushes on connection switch and both window-close paths. `last_saved` skips
     writes that would change nothing.
-  - **Scratch is per connection** (`<config>/zdb/scratch/<conn id>.sql`), always
+  - **Scratch is per connection** (`<config>/skimrow/scratch/<conn id>.sql`), always
     saved regardless of the checkbox. The global `scratch.sql` remains the scratch
     for the not-connected state and seeds a connection that has none yet.
     `Tab::scratch` captures its key at creation — safe because every tab is closed
@@ -817,7 +827,7 @@ The WSL host can run Windows exes directly:
   - **Tab is ours, not gpui-component's.** Its `Root` binds `tab` → `window.focus_next()`
     over EVERY tab stop in the window — it walked into toolbar buttons (invisible focus)
     and behind open dialogs. We bind `tab`/`shift-tab` → `FocusNextField`/`PrevField` on
-    `"zdb"` (`modal.rs::step_focus`), opt the panes' Buttons out (`.tab_stop(false)`) and
+    `"skimrow"` (`modal.rs::step_focus`), opt the panes' Buttons out (`.tab_stop(false)`) and
     make the tree + grid handles tab stops, so Tab walks filter box → tree → editor |
     WHERE → ORDER BY → LIMIT → grid → (wraps) — INTO the grid and on OUT of it on the next
     press, never cell by cell (the user's call; landing on the grid puts the cursor on a
@@ -957,17 +967,17 @@ The WSL host can run Windows exes directly:
     `PopupMenuItem::new(..).on_click(..)` (Open / Copy name / schema Refresh).
   - Rows are uniform `h(px(24.))` (uniform_list measures the first row); `ListItem` hover/
     selected styling uses the same theme tokens as `Colors.hover/active`. pg_catalog queries +
-    types (`RelationDetail`/`SchemaObjects`/…) live in `zdb-db/src/introspect.rs` via `actor.rs`.
+    types (`RelationDetail`/`SchemaObjects`/…) live in `skimrow-db/src/introspect.rs` via `actor.rs`.
   - Tests: pure `flat_index_of`/`build_tree`/`sync_expansion` units + `#[gpui::test]` reveal &
     widget-toggle-kicks-load (simulate a toggle by mutating a retained item's shared Rc then
     notifying the `TreeState`).
 
-- **Result export** (`zdb-db/src/export.rs`, pure fns `to_csv`/`to_json`/`to_inserts`/`to_tsv`
+- **Result export** (`skimrow-db/src/export.rs`, pure fns `to_csv`/`to_json`/`to_inserts`/`to_tsv`
   + `ExportFormat`): CSV/JSON/SQL-INSERTs to a file via the native save dialog
   (`cx.prompt_for_new_path`), TSV to the clipboard (`cx.write_to_clipboard`). The format is
   chosen in Settings ONLY (the user's call — a ▾ format menu next to Export was removed): the
   toolbar Export button and the palette's single "Export result" entry = `export_default`
-  (`Settings.export_format`, a `zdb_config::ExportFormat`, CSV by default). Copy (TSV) is its
+  (`Settings.export_format`, a `skimrow_config::ExportFormat`, CSV by default). Copy (TSV) is its
   own toolbar button + palette entry. `export_active`/`copy_active_tsv`
   read the ACTIVE tab; build the bytes while the tab is borrowed, then drop the borrow before
   touching `self.status` (borrow-conflict trap). INSERT target = the Table tab's relation, else
@@ -1000,7 +1010,7 @@ The WSL host can run Windows exes directly:
     completion popup. We implement `SqlCompletion` and set it on every SQL editor's
     `EditorState` via `state.lsp_mut().completion_provider = Some(Rc::new(...))`.
   - `LspHandle` (mirrors `DbHandle`): spawns `sqls -config <tmpfile>` with a **blocking reader
-    thread** (no tokio in zdb-app) that parses `Content-Length`-framed JSON-RPC and completes a
+    thread** (no tokio in skimrow-app) that parses `Content-Length`-framed JSON-RPC and completes a
     `futures_channel::oneshot` per request; the provider `.await`s that in `cx.background_spawn`.
     Reader holds a `Weak<Inner>` so it never keeps the process alive (Drop kills the child →
     stdout EOF → reader exits — avoids a kill/EOF deadlock). Handshake is **pipelined** (don't
@@ -1022,15 +1032,15 @@ The WSL host can run Windows exes directly:
   - **Binary**: `scripts/build-sqls.sh` clones sqls and cross-builds all arches with Go
     (`CGO_ENABLED=0`) — must first drop the two CGO-only blank imports (`godror` Oracle,
     `mattn/go-sqlite3`); we only speak Postgres. Official releases are x86-64 only, hence
-    build-from-source (native Windows ARM64, the target). zdb finds `sqls[.exe]` next to its
+    build-from-source (native Windows ARM64, the target). skimrow finds `sqls[.exe]` next to its
     own exe, else on PATH; CI's Package step bundles `sqls.exe`.
   - **Version trap**: gpui-component pins `ropey = "=2.0.0-beta.1"` (its text engine —
     already in the tree for every input). Do NOT add a direct `ropey` dep (it's a beta): name
     the type via the re-export `gpui_component::Rope` in the `CompletionProvider` impl.
     `lsp-types = "=0.97.0"` (stable) must match gpui-component's exactly. `background_spawn`
     needs `use gpui::AppContext`.
-  - End-to-end test: `lsp::tests::completion_end_to_end`, gated on `ZDB_TEST_SQLS` (path to the
-    binary) + the `ZDB_TEST_*` Postgres env; polls the oneshot with `try_recv` (no executor).
+  - End-to-end test: `lsp::tests::completion_end_to_end`, gated on `SKIMROW_TEST_SQLS` (path to the
+    binary) + the `SKIMROW_TEST_*` Postgres env; polls the oneshot with `try_recv` (no executor).
   - **WHERE / ORDER BY complete columns too** (`SqlCompletion::clause`): alone, `id > 3 AND na`
     names no table, so sqls is shown `SELECT * FROM s.t <KW> ` + only the comma-separated item
     being typed (`list_item_start`: sqls loses the columns after `col DESC,`). Names stay
@@ -1044,7 +1054,7 @@ The WSL host can run Windows exes directly:
     open (`WHERE c` vs label `c1`), which PANICKED gpui (`is_char_boundary(run.end)`).
   - **sqls can die** — v0.2.47 overflowed its stack on any `CASE` without `END` (i.e. while
     typing one), after which every request hung and a stale menu froze on screen. Pinned
-    v0.2.48 (upstream fix). zdb also survives it: on stdout EOF the reader fails all pending
+    v0.2.48 (upstream fix). skimrow also survives it: on stdout EOF the reader fails all pending
     requests (dropped senders = no completions) and marks the handle dead; the next request
     `restart()`s it (not within `RESTART_BACKOFF` of its start), and editors re-`didOpen`
     per server generation.

@@ -1,6 +1,6 @@
 name: build
 
-# Build zdb natively on every OS × arch. GitHub now offers native runners for
+# Build skimrow natively on every OS × arch. GitHub now offers native runners for
 # all six combinations, so nothing is cross-compiled — each job builds on the
 # arch it targets (which sidesteps the macOS SDK / Apple-framework wall that
 # blocks cross-building macOS from Linux).
@@ -8,7 +8,7 @@ name: build
 # Runner labels used:
 #   linux  x64   -> ubuntu-latest        arm64 -> ubuntu-24.04-arm
 #   windows x64  -> windows-latest        arm64 -> windows-11-arm
-#   macos  arm64 -> macos-14 (Apple Silicon)
+#   macos  arm64 -> macos-15 (Apple Silicon)
 # The arm64 Linux/Windows runners are GA; a private repo needs them enabled.
 #
 # release.yml calls this workflow (`workflow_call`) to build the commit it is
@@ -56,7 +56,7 @@ jobs:
   # test suite on macOS, where that bug manifested.
   test-macos:
     name: test-macos
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -66,10 +66,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: test-macos
-      # Integration tests needing a live Postgres stay gated on ZDB_TEST_* (unset
+      # Integration tests needing a live Postgres stay gated on SKIMROW_TEST_* (unset
       # here) and self-skip; the connect/UI-thread regression test needs no DB.
       - name: Test
-        run: cargo test -p zdb-app -p zdb-config -p zdb-db
+        run: cargo test -p skimrow-app -p skimrow-config -p skimrow-db
 
   build:
     name: ${{ matrix.name }}
@@ -78,11 +78,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x64,     os: ubuntu-latest,    goos: linux,   goarch: amd64, sqls: sqls-linux-amd64,      bin: zdb }
-          - { name: linux-arm64,   os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, sqls: sqls-linux-arm64,      bin: zdb }
-          - { name: windows-x64,   os: windows-latest,   goos: windows, goarch: amd64, sqls: sqls-windows-amd64.exe, bin: zdb.exe }
-          - { name: windows-arm64, os: windows-11-arm,   goos: windows, goarch: arm64, sqls: sqls-windows-arm64.exe, bin: zdb.exe }
-          - { name: macos-arm64,   os: macos-14,         goos: darwin,  goarch: arm64, sqls: sqls-darwin-arm64,     bin: zdb }
+          - { name: linux-x64,     os: ubuntu-latest,    goos: linux,   goarch: amd64, sqls: sqls-linux-amd64,      bin: skimrow }
+          - { name: linux-arm64,   os: ubuntu-24.04-arm, goos: linux,   goarch: arm64, sqls: sqls-linux-arm64,      bin: skimrow }
+          - { name: windows-x64,   os: windows-latest,   goos: windows, goarch: amd64, sqls: sqls-windows-amd64.exe, bin: skimrow.exe }
+          - { name: windows-arm64, os: windows-11-arm,   goos: windows, goarch: arm64, sqls: sqls-windows-arm64.exe, bin: skimrow.exe }
+          - { name: macos-arm64,   os: macos-15,         goos: darwin,  goarch: arm64, sqls: sqls-darwin-arm64,     bin: skimrow }
 
     steps:
       # Full history + tags: build.rs names dev builds via `git describe`.
@@ -137,27 +137,27 @@ jobs:
         shell: bash
         run: bash scripts/build-sqls.sh
 
-      - name: Build zdb (release)
+      - name: Build skimrow (release)
         env:
-          ZDB_VERSION: ${{ inputs.version }}
-        run: cargo build -p zdb-app --release
+          SKIMROW_VERSION: ${{ inputs.version }}
+        run: cargo build -p skimrow-app --release
 
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          out="zdb-${{ matrix.name }}"
+          out="skimrow-${{ matrix.name }}"
           mkdir -p "dist/$out"
           if [ "${{ matrix.goos }}" = darwin ]; then
             # macOS ships a .app bundle, not a bare executable: Finder cannot
             # launch a Unix executable, so it opens Terminal to run it, and it
             # gets the generic icon. Ship it zipped by `ditto` — upload-artifact
             # does not preserve the exec bit or the bundle layout.
-            ZDB_SKIP_BUILD=1 ZDB_ZIP=1 bash scripts/package-macos.sh "${{ matrix.goarch }}"
-            mv "dist/zdb-macos-${{ matrix.goarch }}.zip" "dist/$out/zdb.app.zip"
+            SKIMROW_SKIP_BUILD=1 SKIMROW_ZIP=1 bash scripts/package-macos.sh "${{ matrix.goarch }}"
+            mv "dist/skimrow-macos-${{ matrix.goarch }}.zip" "dist/$out/skimrow.app.zip"
           else
             cp "target/release/${{ matrix.bin }}" "dist/$out/"
-            # sqls next to the executable (zdb finds it there).
+            # sqls next to the executable (skimrow finds it there).
             sqls_dst="sqls"; [ "${{ matrix.goos }}" = windows ] && sqls_dst="sqls.exe"
             cp "dist/sqls/${{ matrix.sqls }}" "dist/$out/$sqls_dst"
             chmod +x "dist/$out/$sqls_dst" || true
@@ -166,6 +166,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: zdb-${{ matrix.name }}
-          path: dist/zdb-${{ matrix.name }}
+          name: skimrow-${{ matrix.name }}
+          path: dist/skimrow-${{ matrix.name }}
           if-no-files-found: error
