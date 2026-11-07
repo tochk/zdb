@@ -115,18 +115,18 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          pattern: zdb-*
+          pattern: skimrow-*
           path: artifacts
 
-      # One zip per target, flat (zdb + sqls; macOS: the ditto'd zdb.app.zip).
+      # One zip per target, flat (skimrow + sqls; macOS: the ditto'd skimrow.app.zip).
       # Artifacts lose the exec bit, so restore it before zipping.
       - name: Zip
         run: |
           set -euo pipefail
           mkdir -p release
-          for dir in artifacts/zdb-*/; do
+          for dir in artifacts/skimrow-*/; do
             name="$(basename "$dir")"
-            case "$name" in zdb-linux-*) chmod +x "$dir/zdb" "$dir/sqls" ;; esac
+            case "$name" in skimrow-linux-*) chmod +x "$dir/skimrow" "$dir/sqls" ;; esac
             (cd "$dir" && zip -r -X "$GITHUB_WORKSPACE/release/$name.zip" .)
           done
           ls -l release

@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/zdb-app", "crates/zdb-db", "crates/zdb-config"]
+members = ["crates/skimrow-app", "crates/skimrow-db", "crates/skimrow-config"]
 
 [workspace.package]
 version = "0.8.0"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/tochk/zdb"
+repository = "https://github.com/tochk/skimrow"
 rust-version = "1.90"
 
 [workspace.dependencies]
@@ -31,7 +31,7 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 rustls-pemfile = "2.2"
 rustls-native-certs = "0.8.5"
 futures-util = "0.3.34"
-# SSH tunnels (`zdb-db/src/ssh.rs`). `ring`, like rustls, not the default aws-lc
+# SSH tunnels (`skimrow-db/src/ssh.rs`). `ring`, like rustls, not the default aws-lc
 # (needs cmake + nasm to build on Windows).
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa", "flate2"] }
 

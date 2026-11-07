@@ -1,0 +1,38 @@
+[package]
+name = "skimrow-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "skimrow"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui_platform.workspace = true
+gpui-component.workspace = true
+alacritty_terminal.workspace = true
+flume.workspace = true
+portable-pty.workspace = true
+skimrow-db = { path = "../skimrow-db" }
+skimrow-config = { path = "../skimrow-config" }
+anyhow.workspace = true
+sqlformat.workspace = true
+# lsp-types 0.97.0 (stable) matches gpui-component's, so our CompletionProvider
+# impl names the same types. The Rope type comes via gpui-component's re-export
+# (`gpui_component::Rope`) so we don't declare its beta `ropey` ourselves.
+lsp-types = "=0.97.0"
+serde_json.workspace = true
+futures-channel = "0.3.34"
+
+[build-dependencies]
+embed-resource = "3.0.12"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+# Enables `secret::probe` so the connect regression test can assert the keychain
+# read is deferred off the UI thread. Dev-only: absent from the release binary.
+skimrow-config = { path = "../skimrow-config", features = ["test-probe"] }

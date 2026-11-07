@@ -7135,6 +7135,55 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
 
 [[package]]
+name = "skimrow-app"
+version = "0.8.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "embed-resource",
+ "flume",
+ "futures-channel",
+ "gpui-component",
+ "gpui-pre",
+ "gpui-pre-platform",
+ "lsp-types",
+ "portable-pty",
+ "serde_json",
+ "skimrow-config",
+ "skimrow-db",
+ "sqlformat",
+]
+
+[[package]]
+name = "skimrow-config"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "directories",
+ "keyring",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "skimrow-db"
+version = "0.8.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "russh",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pemfile",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+]
+
+[[package]]
 name = "skrifa"
 version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9814,55 +9863,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d1afec51604565183aeb5c54c20aeab286120d4e4460f7f76e3e8bb8c0d99473"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "zdb-app"
-version = "0.8.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "embed-resource",
- "flume",
- "futures-channel",
- "gpui-component",
- "gpui-pre",
- "gpui-pre-platform",
- "lsp-types",
- "portable-pty",
- "serde_json",
- "sqlformat",
- "zdb-config",
- "zdb-db",
-]
-
-[[package]]
-name = "zdb-config"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "directories",
- "keyring",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "zdb-db"
-version = "0.8.0"
-dependencies = [
- "anyhow",
- "futures-util",
- "russh",
- "rustls",
- "rustls-native-certs",
- "rustls-pemfile",
- "serde",
- "thiserror 2.0.21",
- "tokio",
- "tokio-postgres",
- "tokio-postgres-rustls",
 ]
 
 [[package]]

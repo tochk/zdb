@@ -1,6 +1,6 @@
 # Cross-compilation to Windows (x86_64) from Linux using the mingw-w64 toolchain.
 # gpui's Windows backend may not build under GNU/mingw (it targets MSVC); the
-# data layer (zdb-db) cross-compiles cleanly here regardless.
+# data layer (skimrow-db) cross-compiles cleanly here regardless.
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
